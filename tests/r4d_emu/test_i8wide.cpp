@@ -30,6 +30,7 @@ extern "C" int64_t r4d_rad_gemm_i8a8_m16_scratch(const RadArgs*);
 extern "C" int r4d_rad_gemm_i8a8_m16_dec(const RadArgs*, RadStream);
 extern "C" int64_t r4d_rad_gemm_i8a8_m16_dec_scratch(const RadArgs*);
 extern "C" int r4d_rad_gemm_i8a8_tiled(const RadArgs*, RadStream);
+extern "C" void r4d_gemm_fp8a8_pin_pp(int);   /* lever F8P (Qwen loop round 37): -1 env, 0 today, 1 the twin */
 
 static int g_fail = 0;
 static void ok(const std::string& what, bool c, const std::string& d = "") {
@@ -145,6 +146,30 @@ static void shape_case(const Shape& s, const std::vector<int64_t>& Ms, bool cont
     }
 }
 
+/* lever F8P (Qwen loop round 37, QUEUE Q66): gemm_nt_q_dec with two weight K tiles in flight a wave (the twin kernel) against
+ * today's, every element at each height; shapes cover 1 / 2 / 3 / 5 / 6 / 10 K tiles a block, FK 256 and 128, split K (k/v: a
+ * slice of 2 tiles starting past 0) and the 64-token groups on grid.y. R4D_EMU_F8P_MUTATE=1 (the twin skips its refill) must
+ * FAIL every shape with 3 or more tiles a block: the check sees the twin's own loop. */
+static void f8p_case(const Shape& s, const std::vector<int64_t>& Ms) {
+    const int64_t Mx = *std::max_element(Ms.begin(), Ms.end());
+    Case c(Mx, s.N, s.K, 0x9e37u + (uint32_t)s.N + (uint32_t)s.K);
+    const std::string tag = std::string("F8P ") + s.name + " N=" + std::to_string(s.N) + " K=" + std::to_string(s.K);
+    for (int64_t M : Ms) {
+        std::vector<uint16_t> y0((size_t)(Mx * s.N), 0xffff), y1((size_t)(Mx * s.N), 0xfffe);
+        r4d_gemm_fp8a8_pin_pp(0);
+        const int rc0 = c.go(r4d_rad_gemm_i8a8_m16_dec, r4d_rad_gemm_i8a8_m16_dec_scratch, 0, M, y0.data());
+        const char* k0 = emu_last_kernel;
+        r4d_gemm_fp8a8_pin_pp(1);
+        const int rc1 = c.go(r4d_rad_gemm_i8a8_m16_dec, r4d_rad_gemm_i8a8_m16_dec_scratch, 0, M, y1.data());
+        const char* k1 = emu_last_kernel;
+        r4d_gemm_fp8a8_pin_pp(-1);
+        if (rc0 || rc1) { ok(tag + " M=" + std::to_string(M), false, "rc " + std::to_string(rc0) + " / " + std::to_string(rc1)); continue; }
+        const size_t d = ndiff(y0.data(), y1.data(), (size_t)(M * s.N));
+        ok(tag + " M=" + std::to_string(M) + " twin == today", d == 0,
+           std::to_string(d) + " of " + std::to_string(M * s.N) + " differ (" + (k1 ? k1 : "?") + " vs " + (k0 ? k0 : "?") + ")");
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string only = argc > 1 ? argv[1] : "";
     /* every height 1..132 on a split shape (N 256, K 512: two K slices) */
@@ -165,6 +190,16 @@ int main(int argc, char** argv) {
             { "gdn in (MW 16)", 4096, 2560 },
         };
         for (const Shape& s : sh) shape_case(s, Ms, true, false);
+    }
+    if (only.empty() || only == "f8p" || only == "f8pq") {
+        const bool q = only == "f8pq";
+        const std::vector<int64_t> Ms = q ? std::vector<int64_t>{ 5, 33, 65 } : std::vector<int64_t>{ 1, 5, 16, 17, 33, 48, 64, 65, 100, 128 };
+        const Shape sh[] = {
+            { "one tile", 256, 256 }, { "three 128-wide tiles", 256, 384 }, { "three tiles", 512, 768 },
+            { "k/v (split 5)", 256, 2560 }, { "shared down (K 640, 5 x 128)", 2560, 640 },
+            { "attn out / gdn out (6 tiles)", 2560, 1536 }, { "gdn in (MW 16, 10 tiles)", 4096, 2560 },
+        };
+        for (const Shape& s : sh) f8p_case(s, Ms);
     }
     std::printf("%s (%d failure(s))\n", g_fail ? "FAIL" : "PASS", g_fail);
     return g_fail ? 1 : 0;

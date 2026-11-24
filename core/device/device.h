@@ -167,6 +167,15 @@ extern "C" int     rad_stream_gate(RadStream s, void** gate);
 extern "C" int     rad_gate_open(void* gate);
 extern "C" int64_t rad_gate_room(RadStream s);
 
+/* qfn-on-ds F65 (lever BGL stage 2b, Qwen loop round 25): leave `keep_cus` compute units of the card to the process's other
+ * queues -- the stream's queue dispatches only to the card's first n_cu - keep_cus CUs (hsa_amd_queue_cu_set_mask; rounded
+ * up to whole WGPs, two CUs, since a WGP-mode workgroup needs both). For a second engine's queues on one card: two queues
+ * whose kernels spin on peer cards (collectives, chained launches' waits) can fill a card with spinners whose twins wait
+ * behind the other queue on the peer card; a region one of them cannot enter breaks that cycle. Before the first dispatch
+ * on `s`; 0 = the whole card. `out_cus` (may be null) takes the CUs the queue may use. RAD_E_UNSUPPORTED on a backend
+ * without CU masks (the host backend: no CUs). */
+extern "C" int     rad_stream_cu_keep(RadStream s, int keep_cus, int* out_cus);
+
 namespace rad {
 
 /* A recorded pass, owned by the backend that recorded it. See DeviceBackend::tape_begin. */
@@ -367,6 +376,9 @@ struct DeviceBackend {
      * its acquire where tape_set_noacq's bit 1 is set (Ctx::haz_mark: no line it reads can be stale in a scalar
      * cache). Null on a backend without it. */
     int     (*tape_rec_ika)(RadTape t, int i);
+    /* qfn-on-ds F65: see rad_stream_cu_keep (last, so the positional initializers leave it null). Null on a backend without
+     * CU masks. */
+    int     (*stream_cu_keep)(RadStream s, int keep_cus, int* out_cus);
 };
 
 

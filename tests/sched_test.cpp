@@ -796,6 +796,566 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     rad::fn4::apply_pending(1, da);
 }
 
+/* Qwen loop round 59 lever AHA (fn4 sched_ahead_all, QUEUE Q119): a step issued ahead carries the in-flight step's sequences
+ * only. Under BI chunking 5 a request's LAST piece runs in a lone step and produces a token; the step issued ahead of it then
+ * carries that request's decode ALONE, and so does every step issued ahead after it, while the other decoders wait (agx21:
+ * 105 runs after the same slot's lone piece, 6,804 one-sequence steps, 82 s; the longest 485 steps). 0 = today (the defect:
+ * one sequence issued ahead, d left out); 1 = no step issued ahead there, the full step takes c and d, and an ordinary decode
+ * step with nobody left out is still issued ahead (positive control). Chunking 6 has its own guard (bi6_plan_lone_; with
+ * speculation_fixed set, as the engine sets it, so this case reaches that guard). */
+TEST(qwen_round59_aha_no_step_issued_ahead_leaves_a_decoder_out_after_a_lone_step) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    for (const int chunking : {5, 6})
+        for (const int on : {0, 1}) {
+            CHECK(rad::fn4::request("sched_bi_chunk", chunking, &err));
+            CHECK(rad::fn4::request("sched_ahead_all", on, &err));
+            rad::fn4::apply_pending(0, da);
+            Fixture f;
+            f.build();
+            f.cfg.prefill_span = 2;
+            CHECK_OK(f.start());
+            auto rd = f.request(100, 300);
+            for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;
+            rd->ignore_eos = true;
+            rd->speculation_fixed = true;
+            const uint64_t d = f.add(std::move(rd));
+            for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+            auto rc = f.request(256, 40);
+            rc->speculation_fixed = true;
+            const uint64_t c = f.add(std::move(rc));
+            bool c_lone = false;
+            int ahead_n = -1;
+            for (int k = 0; k < 8 && f.sch.step(); ++k) {
+                const StepPlan& p = f.sch.plan();
+                const bool lone_c = p.e.size() == 1 && p.e[0].seq == c && p.e[0].is_prefill;
+                if (lone_c) {
+                    c_lone = true;
+                    const RadBatch* nb = f.sch.step_next();
+                    ahead_n = nb ? (int)nb->n_seq : 0;
+                    if (nb) break;                 /* the defect's first step issued ahead: c alone */
+                }
+                f.commit_plain();
+                if (lone_c) break;
+            }
+            CHECK(c_lone);
+            if (chunking == 5 && on == 0) {
+                CHECK_EQ(ahead_n, 1);              /* today: c's decode issued ahead alone, d left out */
+            } else {
+                CHECK_EQ(ahead_n, 0);              /* no step issued ahead behind the lone step */
+            }
+            if (chunking == 5 && on == 1) {
+                /* the full step after the lone one carries both decoders; the step issued ahead of it too */
+                REQUIRE(f.sch.step() != nullptr);
+                const StepPlan& p = f.sch.plan();
+                bool has_c = false, has_d = false;
+                for (const StepEntry& e : p.e) {
+                    if (e.seq == c && !e.is_prefill) has_c = true;
+                    if (e.seq == d && !e.is_prefill) has_d = true;
+                }
+                CHECK(has_c && has_d);
+                const RadBatch* nb = f.sch.step_next();
+                CHECK(nb != nullptr);
+                CHECK_EQ(nb ? (int)nb->n_seq : 0, 2);
+                CHECK(f.sch.ahead_all_count() >= 1);
+            }
+            if (on == 0) CHECK_EQ(f.sch.ahead_all_count(), (int64_t)0);
+            CHECK(rad::fn4::request("sched_ahead_all", 0, &err));
+            CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+            rad::fn4::apply_pending(1, da);
+        }
+}
+
+/* Qwen loop round 60 lever TLR (fn4 sched_bi_ride, QUEUE Q120): under BI chunking 5 every prefill piece takes a lone step and the
+ * decode rows the step after it; with sched_bi_ride N a prompt's LAST piece of at most N rows rides the decode rows' turn instead
+ * (agx23: 416 lone pieces of <= 2,047 rows a window at 91-241 ms each, ~70 ms of it fixed at ~64k of history, each followed by
+ * a decode step). The piece is its alone piece (position, rows, snapshot row = an idle engine's), non-last pieces never ride,
+ * one ride a turn. Arms: 0 = today (every piece lone, nothing mixed); N = the last piece's rows (it rides beside d's row, the
+ * others stay lone); N - 1 (NEGATIVE CONTROL: over N -> its lone step, counted as left); the same under arm TG256's grid 256 /
+ * inner 4; chunking 6 with the switch on = 6's own plan (the switch acts only in BI5's turn). */
+TEST(qwen_round60_tlr_a_prompts_last_piece_rides_bi5s_decode_turn) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    const int len = 868;   /* interval 256: alone's pieces end at 768, the last one is [768, 868) */
+    auto fixture = [&](Fixture& f) {
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+    };
+    auto pieces_alone = [&]() {
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.submit(len, 2);
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) { pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok); }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    struct Out { std::vector<int32_t> got; int mixed = 0, mixed_last = 0, mixed_other = 0, lone = 0; int64_t rode = 0, left = 0; };
+    auto run = [&](int bic, int ride) {
+        CHECK(rad::fn4::request("sched_bi_chunk", bic, &err));
+        CHECK(rad::fn4::request("sched_bi_ride", ride, &err));
+        rad::fn4::apply_pending(0, da);
+        CHECK_EQ(rad::fn4::sched_bi_ride(), ride);
+        Out o;
+        Fixture f;
+        fixture(f);
+        auto rd = f.request(100, 300);
+        for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
+        rd->ignore_eos = true;
+        const uint64_t d = f.add(std::move(rd));
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+        const uint64_t a = f.submit(len, 2);
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            bool has_d = false;
+            const StepEntry* pa = nullptr;
+            for (const StepEntry& e : p.e) {
+                if (e.seq == d && !e.is_prefill) has_d = true;
+                if (e.seq == a && e.is_prefill) pa = &e;
+            }
+            if (pa) {
+                o.got.push_back(pa->ctx_len); o.got.push_back(pa->n_tokens); o.got.push_back(pa->ckpt_tok);
+                if (has_d) {
+                    ++o.mixed;
+                    if (pa->ctx_len + pa->n_tokens == len) ++o.mixed_last; else ++o.mixed_other;
+                } else if (p.e.size() == 1) {
+                    ++o.lone;
+                }
+            }
+            f.commit_plain();
+        }
+        o.rode = f.sch.tail_ride_count(0);
+        o.left = f.sch.tail_ride_count(1);
+        CHECK(rad::fn4::request("sched_bi_ride", 0, &err));
+        CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+        rad::fn4::apply_pending(1, da);
+        return o;
+    };
+    for (const int gt : { 0, 256 * 1000 + 4 }) {
+        CHECK(rad::fn4::request("resume_cold", gt ? 2 : 0, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", gt / 1000, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", gt % 1000, &err));
+        rad::fn4::apply_pending(0, da);
+        const std::vector<int32_t> ref = pieces_alone();
+        REQUIRE(ref.size() >= 6);                         /* two pieces or more: (position, rows, snapshot row) each */
+        const int32_t last_rows = ref[ref.size() - 2];
+        CHECK_EQ(ref[ref.size() - 3] + last_rows, len);  /* the last piece ends at the prompt's end */
+        CHECK(last_rows > 1 && last_rows < 200);          /* it fits the shared budget (256) beside d's row */
+        const Out off = run(5, 0);
+        CHECK(off.got == ref);                            /* today: alone's pieces ... */
+        CHECK_EQ(off.mixed, 0);                           /* ... each in a lone step */
+        CHECK_EQ(off.rode, (int64_t)0);
+        const Out on = run(5, last_rows);
+        CHECK(on.got == ref);                             /* the same pieces (positions, rows, snapshot rows) */
+        CHECK_EQ(on.mixed_last, 1);                       /* the last one beside d's decode row */
+        CHECK_EQ(on.mixed_other, 0);                      /* a non-last piece never rides */
+        CHECK_EQ(on.lone, (int)ref.size() / 3 - 1);       /* the others in lone steps */
+        CHECK_EQ(on.rode, (int64_t)1);
+        const Out neg = run(5, last_rows - 1);            /* NEGATIVE CONTROL: one row short of the piece */
+        CHECK(neg.got == ref);
+        CHECK_EQ(neg.mixed, 0);
+        CHECK_EQ(neg.rode, (int64_t)0);
+        CHECK(neg.left >= 1);
+        const Out six = run(6, last_rows);                /* chunking 6: its own plan, the switch never acts */
+        const Out six0 = run(6, 0);
+        CHECK(six.got == six0.got);
+        CHECK_EQ(six.mixed, six0.mixed);
+        CHECK_EQ(six.rode, (int64_t)0);
+    }
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
+/* Qwen loop round 51 (AgentX c32 arm BI5, READY 'AGX ARMS addendum 2'): under BI chunking 5 no step carries a prefill piece
+ * beside a decode row. With a streamed KV group a step that does is a staged pass (kvstream/bind.cpp kv_pass_view: n_tok >
+ * decode rows) and kvstream_step_runs stages EVERY sequence's history one layer at a time from the host mirror -- agx4's
+ * MIXED steps (a ~1k-row tail beside 31 decoding sequences) took 1.27 s each. The same scenario as the chunking-6 case above:
+ * under 5 the prompt runs in alone's pieces, every piece in a step of its own (the one that fits beside the decode rows
+ * under 6 included), the decode rows the step after each, and a short newcomer that fits beside them is admitted alone too;
+ * each piece's position, rows and snapshot row = alone's, also under the AgentX forms' tail levers (the hero's grid 0 / inner 3,
+ * arm TG256's grid 256 / inner 4 with lever TI's snapshot inside the last chunk; resume_cold 2) on a 1700-token prompt.
+ * CONTROL: chunking 6 in the same run, where that piece and the newcomer share the decode rows' step. */
+TEST(fn4_bi_chunk_5_never_puts_a_prefill_piece_beside_a_decode_row) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    /* the tail levers as the AgentX forms set them: the hero's grid 0 / inner 3 and arm TG256's grid 256 / inner 4 (lever TI's
+     * snapshot inside a last chunk that then runs whole), under resume_cold 2 */
+    int len = 1000;
+    auto tails = [&](int grid, int ti) {
+        CHECK(rad::fn4::request("resume_cold", grid || ti ? 2 : 0, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", grid, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+    };
+    auto fixture = [&](Fixture& f) {
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+    };
+    auto pieces_alone = [&]() {
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.submit(len, 2);
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {   /* position, rows and the snapshot row of each piece */
+                    pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok);
+                }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    struct Out { std::vector<int32_t> got; int lone = 0, shared = 0, mixed = 0, d_steps = 0, after_lone_d = 0, c_shared = 0;
+                 bool c_done = false; };
+    auto run = [&](int bic) {
+        CHECK(rad::fn4::request("sched_bi_chunk", bic, &err));
+        rad::fn4::apply_pending(0, da);
+        CHECK_EQ(rad::fn4::sched_bi_chunk(), bic);
+        Out o;
+        Fixture f;
+        fixture(f);
+        auto rd = f.request(100, 300);
+        for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
+        rd->ignore_eos = true;
+        const uint64_t d = f.add(std::move(rd));
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+        const uint64_t a = f.submit(len, 2);
+        bool last_lone = false;
+        uint64_t c = 0;
+        for (int k = 0; k < 80 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            int32_t a_tok = 0;
+            bool has_d = false, any_pf = false, any_dec = false, has_c = false;
+            for (const StepEntry& e : p.e) {
+                if (e.seq == a && e.is_prefill) a_tok = e.n_tokens;
+                if (e.seq == d) has_d = true;
+                if (c && e.seq == c && e.is_prefill) has_c = true;
+                if (e.is_prefill) any_pf = true; else any_dec = true;
+            }
+            o.mixed += any_pf && any_dec;    /* a prefill piece beside a decode row: a staged pass of every sequence */
+            for (const StepEntry& e : p.e)
+                if (e.seq == a && e.is_prefill) {
+                    o.got.push_back(e.ctx_len); o.got.push_back(e.n_tokens); o.got.push_back(e.ckpt_tok);
+                }
+            if (a_tok > 0) {
+                if (p.e.size() == 1) ++o.lone; else ++o.shared;
+            }
+            if (has_c && p.e.size() > 1) ++o.c_shared;
+            if (has_c) o.c_done = true;
+            if (has_d) { ++o.d_steps; if (last_lone) ++o.after_lone_d; }
+            last_lone = (a_tok > 0 || has_c) && p.e.size() == 1;
+            f.commit_plain();
+            /* a short newcomer once a's prompt is done: it fits beside d's row under 6 */
+            if (!c && o.got.size() >= 9 && !a_tok) {
+                auto rc = f.request(100, 2);
+                for (int i = 0; i < 100; ++i) rc->prompt[(size_t)i] = 50000 + i;
+                c = f.add(std::move(rc));
+            }
+        }
+        CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+        rad::fn4::apply_pending(1, da);
+        return o;
+    };
+    const std::vector<int32_t> ref = pieces_alone();
+    CHECK(ref.size() >= 9);               /* three pieces or more: (position, rows, snapshot row) each */
+    const Out six = run(6);
+    const Out five = run(5);
+    CHECK(six.got == ref);                /* the control: alone's pieces (positions, rows, snapshots) under 6 ... */
+    CHECK(six.shared >= 1);               /* ... one of them beside d's row */
+    CHECK(six.mixed >= 1);
+    CHECK(six.c_done && six.c_shared >= 1);   /* the newcomer beside d's row */
+    CHECK(five.got == ref);               /* 5: the same pieces (alone's), snapshot rows included */
+    CHECK_EQ(five.shared, 0);             /* every piece in a step of its own */
+    CHECK_EQ(five.mixed, 0);              /* no step ever mixes a prefill piece with a decode row */
+    CHECK(five.c_done);
+    CHECK_EQ(five.c_shared, 0);           /* the newcomer alone too */
+    CHECK_EQ(five.after_lone_d, five.lone + 1);   /* every lone step (a's + c's) is followed by the decode rows' */
+    CHECK(five.d_steps >= 10);
+    /* The same under the tail levers (a 1700-token prompt: its last chunk [1280, 1700) runs whole with a snapshot inside under
+     * inner 3 / 4): 5 = alone's pieces and snapshot rows, nothing mixed; 6 = alone's too (the control for the pieces). */
+    for (const int gt : { 0 * 1000 + 3, 256 * 1000 + 4 }) {
+        tails(gt / 1000, gt % 1000);
+        len = 1700;
+        const std::vector<int32_t> rt = pieces_alone();
+        CHECK(rt.size() >= 9);
+        bool inner = false;               /* grid 256: the case covers lever TI, a snapshot inside a piece (grid 0 takes none) */
+        for (size_t q = 0; q + 2 < rt.size(); q += 3) inner = inner || (rt[q + 2] >= 0 && rt[q + 2] < rt[q + 1] - 1);
+        CHECK_EQ(inner, gt / 1000 > 0);
+        const Out s6 = run(6);
+        const Out s5 = run(5);
+        CHECK(s6.got == rt);
+        CHECK(s5.got == rt);
+        CHECK_EQ(s5.shared, 0);
+        CHECK_EQ(s5.mixed, 0);
+        CHECK_EQ(s5.c_shared, 0);
+        CHECK(s5.c_done);
+        CHECK_EQ(s5.after_lone_d, s5.lone + 1);
+    }
+    tails(0, 0);
+    len = 1000;
+}
+
+/* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58, QUEUE Q113; the AgentX c32 budget: a follow-up turn waits behind
+ * every earlier prompt's whole prefill under BI5). Under sched_bi_chunk 5 with a decoding request d: a long prompt L runs, a
+ * short prompt S arrives. CONTROL (sched_bi_srpt 0 = today): S is admitted only after L's last piece. SRB 1: S is admitted at the
+ * next lone step and finishes its prompt before L's next piece; every piece of L and of S = its ALONE piece (position, rows,
+ * snapshot row) in both arms -- only when pieces run changes; no step mixes a piece with a decode row; every lone step is
+ * followed by d's decode step. Age bound (sched_bi_srpt N >= 2, the test clock): a stream of short prompts cannot hold L past
+ * N ms. Probe: a waiting prompt whose cache probe leaves fewer rows than L has left is admitted ahead of L's next piece. */
+TEST(srb_bi5_lone_step_goes_to_the_prompt_with_the_fewest_rows_left) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    auto setsw = [&](const char* n, int v) {
+        CHECK(rad::fn4::request(n, v, &err));
+        rad::fn4::apply_pending(0, da);
+    };
+    auto fixture = [&](Fixture& f) {
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+    };
+    auto distinct = [&](Fixture& f, int n, int max_tokens, int base) {
+        auto r = f.request(n, max_tokens);
+        for (int i = 0; i < n; ++i) r->prompt[(size_t)i] = base + i;
+        return r;
+    };
+    /* each prompt's pieces alone: (position, rows, snapshot row) */
+    auto alone = [&](int n, int base) {
+        setsw("sched_bi_srpt", 0);
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.add(distinct(f, n, 2, base));
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) { pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok); }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    setsw("sched_bi_chunk", 5);
+    CHECK_EQ(rad::fn4::sched_bi_chunk(), 5);
+    const std::vector<int32_t> refL = alone(3000, 20000), refS = alone(300, 50000);
+    CHECK(refL.size() >= 3 * 4);
+    CHECK(refS.size() >= 3);
+    struct Out { std::vector<int32_t> gl, gs; int s_first = -1, s_done = -1, l_last = -1, l_pieces_before_s = 0, mixed = 0,
+                 lone = 0, after_lone_d = 0; int64_t c[Scheduler::kSrbN] = {}; };
+    auto run = [&](int srpt) {
+        setsw("sched_bi_srpt", srpt);
+        CHECK_EQ(rad::fn4::sched_bi_srpt(), srpt);
+        Out o;
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();   /* d decodes */
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t sid = 0;
+        int l_pieces = 0;
+        bool last_lone = false;
+        for (int k = 0; k < 120 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            bool any_pf = false, any_dec = false, has_d = false, lone = false;
+            for (const StepEntry& e : p.e) {
+                if (e.is_prefill) any_pf = true; else any_dec = true;
+                if (e.seq == d) has_d = true;
+                if (e.seq == l && e.is_prefill) {
+                    o.gl.push_back(e.ctx_len); o.gl.push_back(e.n_tokens); o.gl.push_back(e.ckpt_tok);
+                    ++l_pieces; o.l_last = k;
+                    if (sid && o.s_done < 0) ++o.l_pieces_before_s;
+                }
+                if (sid && e.seq == sid && e.is_prefill) {
+                    o.gs.push_back(e.ctx_len); o.gs.push_back(e.n_tokens); o.gs.push_back(e.ckpt_tok);
+                    if (o.s_first < 0) o.s_first = k;
+                    if (e.ctx_len + e.n_tokens >= 300) o.s_done = k;
+                }
+            }
+            lone = any_pf && p.e.size() == 1;
+            o.mixed += any_pf && any_dec;
+            o.lone += lone;
+            if (has_d && last_lone) ++o.after_lone_d;
+            last_lone = lone;
+            f.commit_plain();
+            if (!sid && l_pieces == 2) sid = f.add(distinct(f, 300, 2, 50000));   /* S arrives after L's second piece */
+        }
+        f.sch.srb_counts(o.c);
+        return o;
+    };
+    const Out c0 = run(0), c1 = run(1);
+    /* CONTROL: today S waits for L's whole prefill */
+    CHECK(c0.gl == refL);
+    CHECK(c0.gs == refS);
+    CHECK(c0.s_first > c0.l_last);
+    CHECK_EQ(c0.c[Scheduler::kSrbSteps], (int64_t)0);
+    /* SRB: S ahead of L's next piece, the same pieces */
+    CHECK(c1.gl == refL);
+    CHECK(c1.gs == refS);
+    CHECK(c1.s_done >= 0 && c1.s_done < c1.l_last);
+    CHECK_EQ(c1.l_pieces_before_s, 0);        /* no piece of L between S's admission and S's last piece */
+    CHECK(c1.c[Scheduler::kSrbAdmitAhead] >= 1);
+    CHECK(c1.c[Scheduler::kSrbSteps] >= 4);
+    for (const Out* o : { &c0, &c1 }) {
+        CHECK_EQ(o->mixed, 0);
+        CHECK_EQ(o->after_lone_d, o->lone);   /* every lone step is followed by d's decode step */
+    }
+
+    /* Age bound: shorts keep arriving (one each time a short finishes its prompt); with sched_bi_srpt 1 L gets no piece until
+     * they stop, with 40 (ms; the test clock moves 10 ms a step) L gets pieces in between */
+    auto starve = [&](int srpt) {
+        setsw("sched_bi_srpt", srpt);
+        Fixture f;
+        fixture(f);
+        int64_t clk = 1000000;
+        f.sch.set_srb_clock([&clk] { return clk; });
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 600, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) { f.commit_plain(); clk += 10000; }
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        int l_pieces = 0, shorts = 0, l_during = 0;
+        uint64_t cur = 0;
+        for (int k = 0; k < 160 && f.sch.step(); ++k) {
+            bool cur_done = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) { ++l_pieces; if (shorts > 0 && shorts < 8) ++l_during; }
+                if (cur && e.seq == cur && e.is_prefill && e.ctx_len + e.n_tokens >= 200) cur_done = true;
+            }
+            f.commit_plain();
+            clk += 10000;
+            if (l_pieces >= 1 && shorts < 8 && (cur == 0 || cur_done)) {
+                cur = f.add(distinct(f, 200, 2, 40000 + 300 * shorts));
+                ++shorts;
+            }
+        }
+        int64_t c[Scheduler::kSrbN] = {};
+        f.sch.srb_counts(c);
+        if (srpt == 1) CHECK_EQ(c[Scheduler::kSrbProbe], (int64_t)(2 + shorts));   /* d, L and every short probed once: a short on
+                                                   * a recycled slot carries no estimate of the short before it */
+        return std::make_pair(l_during, c[Scheduler::kSrbAged]);
+    };
+    const auto s1 = starve(1), s40 = starve(40);
+    CHECK_EQ(s1.first, 0);                    /* without the bound the shorts hold L the whole time */
+    CHECK_EQ(s1.second, (int64_t)0);
+    CHECK(s40.first >= 1);                    /* with it L runs pieces while shorts still arrive */
+    CHECK(s40.second >= 1);
+
+    /* Probe: W's whole prompt (2,600) is longer than L's rows left, its probe leaves 100 -> admitted ahead of L's next piece;
+     * the same W without a probe hit (-1: whole prompt) waits for L */
+    auto probe_case = [&](bool hit) {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t w = 0;
+        int l_pieces = 0, w_first = -1, l_last = -1;
+        for (int k = 0; k < 120 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) { ++l_pieces; l_last = k; }
+                if (w && e.seq == w && e.is_prefill && w_first < 0) w_first = k;
+            }
+            f.commit_plain();
+            if (!w && l_pieces == 2) {
+                auto r = distinct(f, 2600, 2, 5000);
+                const uint64_t id = r->id;
+                if (hit) f.pc.probe_hit[id] = 2500;
+                w = f.add(std::move(r));
+            }
+        }
+        (void)d;
+        int64_t c[Scheduler::kSrbN] = {};
+        f.sch.srb_counts(c);
+        return std::make_tuple(w_first < l_last, c[Scheduler::kSrbProbe], f.pc.probes);
+    };
+    const auto ph = probe_case(true), pn = probe_case(false);
+    CHECK(std::get<0>(ph));                   /* admitted ahead on its probe */
+    CHECK(std::get<1>(ph) >= 1);
+    CHECK(!std::get<0>(pn));                  /* whole prompt 2,600 > L's rows left: L first */
+    CHECK(std::get<1>(pn) >= 1);
+    CHECK_EQ(std::get<2>(ph), std::get<1>(ph));   /* one probe a request: the scheduler's count = the cache's */
+
+    /* The choice is one step's: a POST of sched_bi_chunk 6 right after a step that admitted ahead leaves no stale choice --
+     * a newcomer T is admitted under 6 as today (the walk asks every waiting prompt again) */
+    {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t sid = 0, tid = 0;
+        int l_pieces = 0, t_steps = -1;
+        bool switched = false;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            bool s_in = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) ++l_pieces;
+                if (sid && e.seq == sid && e.is_prefill) s_in = true;
+                if (tid && e.seq == tid && e.is_prefill && t_steps < 0) t_steps = k;
+            }
+            f.commit_plain();
+            if (!sid && l_pieces == 2) sid = f.add(distinct(f, 300, 2, 50000));
+            if (s_in && !switched) {                  /* the step that admitted S ahead: switch to 6, T arrives */
+                setsw("sched_bi_chunk", 6);
+                switched = true;
+                tid = f.add(distinct(f, 100, 2, 40000));
+            }
+        }
+        CHECK(switched);
+        CHECK(t_steps >= 0);                          /* T admitted under 6 */
+        setsw("sched_bi_chunk", 5);
+    }
+    /* A recycled slot: A (a short) is admitted ahead and FINISHES, then B takes its slot -- B is probed for itself (the
+     * cache's probe count + 1), not ordered by A's estimate */
+    {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 600, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t a = 0, b = 0;
+        int l_pieces = 0, b_first = -1;
+        int64_t p0 = -1;
+        for (int k = 0; k < 80 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) ++l_pieces;
+                if (b && e.seq == b && e.is_prefill && b_first < 0) b_first = k;
+            }
+            f.commit_plain();
+            if (!a && l_pieces == 2) a = f.add(distinct(f, 300, 2, 50000));
+            if (a && !b) {
+                const Request* ra = f.sch.find(a);
+                if (ra && ra->state == ReqState::Finished) {   /* A finished: reaped, its slot is free for B */
+                    CHECK_OK(f.sch.reap(a));
+                    p0 = f.pc.probes;
+                    b = f.add(distinct(f, 300, 2, 45000));
+                }
+            }
+        }
+        CHECK(b != 0);
+        CHECK(b_first >= 0);
+        CHECK_EQ(f.pc.probes, p0 + 1);
+    }
+    setsw("sched_bi_srpt", 0);
+    setsw("sched_bi_chunk", 0);
+}
+
 /* qfn-on-ds Q18 (Qwen loop round 4, FINDINGS F11): RADIANCE_SCHED_BI_ONE_PF=1 under BI chunking 6. Two short prompts that both
  * fit beside a decoding request's rows: without the env (the control) they share a step; with it no step carries two prefill
  * sequences, both prompts still finish, each in its alone pieces (one piece of 100 rows here), and the decoding request keeps
@@ -1066,7 +1626,7 @@ TEST(lever_gpf_tail_inner_2_and_resume_cold_3_take_any_piece_start) {
     CHECK_EQ(h3m.resumed, (int64_t)1024);
     const Run s1 = go(2, 3, 0, 1556);                      /* tail on the chunk start: nothing inside */
     CHECK_EQ(s1.inner, (int64_t)-1);
-    CHECK(rad::fn4::request("sched_tail_inner", 4, &err) == false);   /* range 0..3 (3: lever TIF, round 23) */
+    CHECK(rad::fn4::request("sched_tail_inner", 5, &err) == false);   /* range 0..4 (3: lever TIF, round 23; 4: F71, round 26) */
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));
@@ -1151,6 +1711,89 @@ TEST(lever_tif_takes_the_fine_tail_inside_the_last_piece_and_resumes_there) {
     CHECK_EQ(hs.pc.front().second, (int32_t)236);
     const Run hx = go(3, 2, 1728, 1792);
     CHECK_EQ(hx.resumed, (int64_t)1536);
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
+/* F71 (qfn-on-ds, Qwen loop round 26; sched_tail_inner 4): on the card a lone resume step of exactly 128 rows took the
+ * BI-wide forms (fused router / prologues up to AND including 128 rows) where the cold run's same rows ran inside a wider
+ * piece -- u7s1 t9's hit at its own TIF tail (128 rows) != cold, a 142-row one = cold. Under 4 every TIF inside snapshot
+ * leaves more than 128 rows, and every hit the scheduler resumes at a point that is not a step start of the cold run runs
+ * a first step of more than 128 rows -- over every prompt length 1,281 .. 2,600 (tails 1 .. 2,048 rows past the first
+ * interval). Negative control: under 3 the same sweep finds the 128-row inside tails (1,792 here: TIF's own case). */
+TEST(f71_tif_strict_leaves_every_lone_resume_step_more_than_128_rows) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    struct Run { std::vector<std::pair<int64_t, int32_t>> pc; int64_t resumed = -1; int64_t inner = -1; };
+    auto go = [&](int ti, int64_t lin, int n) {
+        CHECK(rad::fn4::request("resume_cold", 2, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", 128, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", ti, &err));
+        rad::fn4::apply_pending(0, da);
+        Fixture f;
+        f.build(4096, 64, 1024);          /* interval 256, budget 1024 */
+        f.cfg.prefill_span = 4;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+        if (lin > 0) {
+            f.pc.seed(n);
+            f.pc.lin = lin;
+            f.pc.src = 3;
+        }
+        const uint64_t a = f.submit(n, 2);
+        Run o;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) {
+                    if (o.resumed < 0) o.resumed = e.ctx_len;
+                    o.pc.push_back({ (int64_t)e.ctx_len, e.n_tokens });
+                    if (e.ckpt_tok >= 0 && e.ckpt_tok < e.n_tokens - 1) o.inner = e.ctx_len + e.ckpt_tok + 1;
+                }
+            f.commit_plain();
+        }
+        return o;
+    };
+    int inside4 = 0, short4 = 0, hits4 = 0, bad4 = 0, short3 = 0, bad3 = 0;
+    for (int n = 1281; n <= 2600; ++n) {
+        const Run c = go(4, 0, n);
+        if (c.inner >= 0) { ++inside4; if (n - c.inner <= 128) ++short4; }
+        const Run c3 = go(3, 0, n);
+        if (c3.inner >= 0 && n - c3.inner <= 128) ++short3;
+        if (n % 5) continue;
+        /* hits at every 128-grid point of the prompt's last 640 rows */
+        for (int64_t lin = ((n - 640) / 128 + 1) * 128; lin < n; lin += 128) {
+            if (lin <= 0) continue;
+            const Run h = go(4, lin, n);
+            if (h.resumed != lin || h.pc.empty()) continue;
+            ++hits4;
+            bool cold_start = false;
+            for (const auto& st : c.pc) cold_start |= st.first == lin;
+            if (!cold_start && h.pc.front().second <= 128) ++bad4;
+        }
+        /* the same hits under 3 (negative control of the hit check) */
+        for (int64_t lin = ((n - 640) / 128 + 1) * 128; lin < n; lin += 128) {
+            if (lin <= 0) continue;
+            const Run h = go(3, lin, n);
+            if (h.resumed != lin || h.pc.empty()) continue;
+            bool cold_start = false;
+            for (const auto& st : c3.pc) cold_start |= st.first == lin;
+            if (!cold_start && h.pc.front().second <= 128) ++bad3;
+        }
+    }
+    CHECK(inside4 > 100);      /* the rule still takes inside tails */
+    CHECK_EQ(short4, 0);       /* none leaves 128 rows or fewer */
+    CHECK(hits4 > 100);
+    CHECK_EQ(bad4, 0);         /* no hit off a cold step start runs a first step of <= 128 rows */
+    CHECK(short3 > 0);         /* negative control: sched_tail_inner 3 has them (1,792 -> 1,664, 128 rows) */
+    CHECK(bad3 > 0);           /* ... and hits of 128 rows off a cold step start */
+    fprintf(stderr, "f71: inside 4 %d (<= 128 left: %d), hits 4 %d (<= 128-row first step off a cold start: %d); under 3: "
+                    "inside <= 128 left %d, such hits %d\n", inside4, short4, hits4, bad4, short3, bad3);
+    const Run x = go(4, 0, 1792);
+    CHECK_EQ(x.inner, (int64_t)1536);   /* 256 rows left, not 128 */
     CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
     CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
     CHECK(rad::fn4::request("resume_cold", 0, &err));
@@ -2660,6 +3303,39 @@ TEST(the_cache_trim_over_mixed_block_sizes_asks_for_entries) {
     CHECK_EQ(f.pc.trims[0], 8ll);
 }
 
+/* qfn-on-ds lever PCR (Qwen loop round 58; the DS line's RADIANCE_PC_KEEP reserve part, value / 4): the publish trim's free reserve
+ * as a share of the pool -- the case above (group 3 full, 64 blocks of 8, entries of 2 blocks) asks for 8 entries at a quarter
+ * (unset and 0..3 = today), 4 at an eighth (4), 2 at a sixteenth (8), 1 at a thirty-second (12) and makes no trim at none (16). */
+TEST(pcr_the_publish_trims_reserve_follows_rad_pc_keep) {
+    for (const int v : { -1, 0, 3, 4, 8, 12, 16, 19 }) {
+        if (v < 0) unsetenv("RADIANCE_PC_KEEP"); else setenv("RADIANCE_PC_KEEP", std::to_string(v).c_str(), 1);
+        Fixture f;
+        f.build(/*blocks=*/64, /*states=*/64);
+        KVGroupInfo k;
+        k.name = "fine";
+        k.decl.kind = RAD_KV_FULL;
+        k.block_size = 8;
+        f.prog.kv_groups.push_back(k);
+        f.kv.setup(f.prog.kv_groups, f.cfg.max_ctx, 64, 64);
+        f.pc.groups = { 0, 3 };
+        CHECK_OK(f.start());
+        f.pc.evict_grant = 1 << 20;
+        f.submit(160, /*max_tokens=*/1);
+        f.submit(176, /*max_tokens=*/64);
+        f.submit(176, /*max_tokens=*/64);
+        REQUIRE(f.sch.step() != nullptr);
+        f.commit_plain();
+        const int sel = v > 0 ? std::min(v / 4, 4) : 0;
+        if (sel == 4) {
+            CHECK_EQ((int)f.pc.trims.size(), 0);
+        } else {
+            REQUIRE(f.pc.trims.size() == 1u);
+            CHECK_EQ(f.pc.trims[0], (int64_t)(8 >> sel));
+        }
+    }
+    unsetenv("RADIANCE_PC_KEEP");
+}
+
 /* A request whose media is not encoded yet waits, and only it does: it is not admitted without
  * its rows, and the request behind it is asked and runs. Once its items are encoded it is
  * admitted where it stood. */
@@ -2798,6 +3474,100 @@ TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
     (void)slot_a;
     CHECK(rad::fn4::request("preempt_keep", 0, &err));
     rad::fn4::apply_pending(1, da);
+}
+
+/* Qwen loop round 59 (FINDINGS TEST note 08:20, QUEUE Q118; gpu02 kow30 stalled 7 min 54 s with 0 running / 2 waiting): two
+ * kept requests, S ahead of A, nothing running. The cache lost S's chain (its hit 0) and holds other entries, so the pool is
+ * one block short of S's rejoin; A's whole chain is cached and A fits. Before the fix the step's overdue reclaim stops at A
+ * (ANY overdue waiter fits) and the admission walk stops at S (the first one, overdue, no reclaim): no step, ever -- the
+ * negative control (RADIANCE_SCHED_KEEP_RECLAIM=0) asserts that stall. With the fix S's walk evicts the cache's LRU entries
+ * until it fits, falls back to a recompute (its chain is gone) and A rejoins at its own position behind it. */
+TEST(qwen_round59_an_overdue_kept_request_reclaims_and_the_kept_one_behind_it_rejoins) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    for (const int fix : {0, 1}) {
+        CHECK(rad::fn4::request("preempt_keep", 1, &err));
+        rad::fn4::apply_pending(0, da);
+        if (!fix) setenv("RADIANCE_SCHED_KEEP_RECLAIM", "0", 1);
+        else unsetenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        Fixture f;
+        f.build(/*blocks=*/20, /*states=*/64);
+        f.cfg.preempt_wait_ms = 0;
+        CHECK_OK(f.start());
+        const uint64_t s3 = f.submit(80, 100, /*priority=*/0);
+        const uint64_t a = f.submit(32, 64, /*priority=*/0);
+        const uint64_t b = f.submit(112, 120, /*priority=*/5);
+        REQUIRE(s3 && a && b);
+        /* B squeezes A, then S, off the pool (both decoding: kept); B decodes to its end */
+        for (int k = 0; k < 300; ++k) {
+            const Request* rb = f.sch.find(b);
+            if (!rb || rb->state == ReqState::Finished) break;
+            if (f.sch.step()) f.commit_plain();
+        }
+        REQUIRE(!f.sch.find(b) || f.sch.find(b)->state == ReqState::Finished);
+        REQUIRE(f.kv.kept.count(s3) == 1 && f.kv.kept.count(a) == 1);
+        REQUIRE((int)f.sch.find(s3)->state == (int)ReqState::Preempted);
+        REQUIRE((int)f.sch.find(a)->state == (int)ReqState::Preempted);
+        const int64_t keep_s = f.kv.kept[s3], keep_a = f.kv.kept[a];
+        const int64_t n_s = f.sch.find(s3)->n_computed, n_a = f.sch.find(a)->n_computed;
+        CHECK_EQ(n_s, keep_s);
+        CHECK_EQ(n_a, keep_a);
+        /* the cache: S's chain gone, A's whole, other entries holding the pool one block short of S's next verify */
+        const int64_t need_s = (n_s + 5 + 15) / 16 - (int64_t)f.kv.block_table(s3, 0).size();
+        const int64_t free0 = f.kv.available_blocks(0);
+        REQUIRE(free0 >= need_s && free0 - (need_s - 1) >= keep_a / 16);
+        f.pc.seed((int32_t)((free0 - (need_s - 1)) * 16));
+        REQUIRE(f.kv.available_blocks(0) == need_s - 1);
+        f.pc.attn_by[s3] = 0;
+        f.pc.attn_by[a] = (int32_t)keep_a;
+        f.pc.evict_frees = true;
+        f.pc.evict_grant = 2;                  /* two entries: one makes S's room, the other is spare */
+        bool s_prefill = false, a_rejoin_at = false, a_prefill = false;
+        int planned = 0;
+        /* the step the stall sat on: fix 0 = 40 steps of it; fix 1 = the steps that seat S (recompute) and A (rejoin) */
+        for (int j = 0; j < (fix ? 3 : 40); ++j) {
+            if (f.sch.step()) {
+                for (const StepEntry& e : f.sch.plan().e) {
+                    ++planned;
+                    if (e.seq == s3 && e.is_prefill) s_prefill = true;
+                    if (e.seq == a && e.is_prefill) a_prefill = true;
+                    if (e.seq == a && !e.is_prefill && e.ctx_len == n_a) a_rejoin_at = true;
+                }
+                f.commit_plain();
+            }
+        }
+        if (!fix) {
+            /* the stall: nothing planned in 40 steps, both still kept, no reclaim */
+            CHECK_EQ(planned, 0);
+            CHECK((int)f.sch.find(s3)->state == (int)ReqState::Preempted);
+            CHECK((int)f.sch.find(a)->state == (int)ReqState::Preempted);
+            CHECK(f.kv.kept.count(s3) == 1 && f.kv.kept.count(a) == 1);
+            CHECK_EQ(f.sch.keep_reclaim_counts()[0], (int64_t)0);
+            CHECK_EQ(f.pc.evicted, (int64_t)0);  /* nothing given back: the grant of 2 stands */
+            CHECK_EQ(f.pc.evict_grant, (int64_t)2);
+        } else {
+            CHECK(s_prefill);                      /* S: its chain was gone -- a recompute */
+            CHECK(a_rejoin_at);                    /* A: decodes on from its own position */
+            CHECK(!a_prefill);                     /* nothing replayed for A */
+            CHECK_EQ(f.sch.keep_reclaim_counts()[0], (int64_t)1);
+            CHECK_EQ(f.sch.keep_reclaim_counts()[1], (int64_t)0);   /* the reclaim made the room: no idle drop */
+            CHECK_EQ(f.pc.evicted, (int64_t)2);
+            CHECK_EQ(f.sch.preempt_keep_counts()[1], (int64_t)1);  /* A's rejoin */
+            /* and both run to their ends (the cache gives back what the later squeezes ask) */
+            f.pc.evict_grant = 1 << 30;
+            for (int j = 0; j < 2000; ++j) {
+                const Request* rs = f.sch.find(s3);
+                const Request* ra = f.sch.find(a);
+                if ((!rs || rs->state == ReqState::Finished) && (!ra || ra->state == ReqState::Finished)) break;
+                if (f.sch.step()) f.commit_plain();
+            }
+            CHECK(!f.sch.find(s3) || f.sch.find(s3)->state == ReqState::Finished);
+            CHECK(!f.sch.find(a) || f.sch.find(a)->state == ReqState::Finished);
+        }
+        unsetenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        CHECK(rad::fn4::request("preempt_keep", 0, &err));
+        rad::fn4::apply_pending(1, da);
+    }
 }
 
 /* ================================================================== the step batch */
@@ -14126,8 +14896,8 @@ struct TiSwitch {
  * round 23: 3 = 2 and lever TIF, the fine tail inside a pipelined last chunk's last piece) */
 TEST(lever_ti_the_switch_takes_0_and_1_and_starts_off) {
     std::string err;
-    for (int v : { 0, 1, 2, 3 }) CHECK(fn4::check("sched_tail_inner", v, &err));
-    for (int v : { -1, 4, 512 }) {
+    for (int v : { 0, 1, 2, 3, 4 }) CHECK(fn4::check("sched_tail_inner", v, &err));   /* 4: F71 (Qwen loop round 26) */
+    for (int v : { -1, 5, 512 }) {
         CHECK(!fn4::check("sched_tail_inner", v, &err));
         CHECK(err.find("sched_tail_inner takes 0") != std::string::npos);
     }
@@ -17372,4 +18142,166 @@ TEST(d55_pub_prompt_publishes_at_the_last_chunk_and_d55b_holds_a_sibling_for_its
     held_steps(nullptr, "60000", &held, &at);   /* the hold needs a publish rule (else it would only delay): off */
     fprintf(stderr, "    hold, PUB_PROMPT unset (the hold is off): B planned with A's computed end at %lld, after %d step(s)\n", (long long)at, held);
     CHECK(at < 299);
+}
+
+/* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE; FINDINGS F78, AgentX c32 agx3): at the pool's ceiling every waiting
+ * fresh prompt was restored from the host tier and THEN refused at the prefill room gate, whose evict rounds dropped the
+ * cache's blocks for a room that could not be made -- every waiting request, every step, nothing admitted. A runner holds
+ * 21 of 40 blocks, the cache 4 more (cache-only, lendable), three 400-token prompts wait (26 blocks each + the runner's
+ * headroom: no eviction can seat one). Unset: 3 restores a step and the gate's evictions. Bit 1: the room counted first
+ * -- no restore, no eviction, the same plan. Bit 2 (3): the walk ends at the first refused prompt (asked once a step).
+ * Controls: a prompt the cache's blocks CAN seat is still restored, evicted for and admitted under bit 1 (the same as
+ * unset); bit 2 keeps a small prompt behind a refused one waiting where unset admits it (the policy, first come first
+ * seated). */
+TEST(agr_a_prompt_no_eviction_can_seat_is_neither_restored_nor_evicted_for) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_ADMIT_GATE"); unsetenv("RADIANCE_LOG_STEP_HOST"); } } env;
+    struct Out { int64_t restores = 0, evict_calls = 0, evicted = 0, asked = 0, refused = 0, stops = 0, plan_rows = 0;
+                 int b_state = -1, e_state = -1; };
+    /* b_tokens: the waiting prompts' length; small: one more 48-token prompt queued behind them */
+    auto run = [&](const char* mode, int b_tokens, int seed_tokens, bool small, Out* o) {
+        if (mode) setenv("RADIANCE_SCHED_ADMIT_GATE", mode, 1); else unsetenv("RADIANCE_SCHED_ADMIT_GATE");
+        setenv("RADIANCE_LOG_STEP_HOST", "0", 1);
+        Fixture f;
+        f.build(/*blocks=*/40, /*states=*/64);   /* 40 x 16 = 640 tokens */
+        f.cfg.max_seqs = 8;
+        f.cfg.prefill_room_gate = true;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(320, /*max_tokens=*/200, /*priority=*/5);
+        REQUIRE(f.sch.step() != nullptr);           /* A: 320 tokens, one chunk */
+        CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+        f.commit_plain();
+        f.pc.seed(seed_tokens);                      /* cache-only blocks (refcount one): what the gate could evict */
+        f.pc.held = seed_tokens;
+        f.pc.evict_grant = 1 << 20;
+        f.pc.evict_frees = true;
+        f.pc.restores.clear();
+        const uint64_t b = f.submit(b_tokens, 16);
+        uint64_t e = 0;
+        if (b_tokens > 300) { f.submit(b_tokens, 16); f.submit(b_tokens, 16); }
+        if (small) e = f.submit(48, 16);
+        const int64_t ev0 = f.pc.evict_calls;
+        for (int k = 0; k < 4; ++k) {
+            REQUIRE(f.sch.step() != nullptr);
+            o->asked += f.sch.host_note().asked;
+            o->plan_rows += (int64_t)f.sch.plan().e.size();
+            f.commit_plain();
+        }
+        o->restores = (int64_t)f.pc.restores.size();
+        o->evict_calls = f.pc.evict_calls - ev0;
+        o->evicted = f.pc.evicted;
+        o->refused = f.sch.host_note().agr[0];
+        o->stops = f.sch.host_note().agr[1];
+        o->b_state = f.sch.find(b) ? (int)f.sch.find(b)->state : -1;
+        o->e_state = e && f.sch.find(e) ? (int)f.sch.find(e)->state : -1;
+    };
+    Out u, g1, g3;
+    run(nullptr, 400, 64, false, &u);
+    run("1", 400, 64, false, &g1);
+    run("3", 400, 64, false, &g3);
+    fprintf(stderr, "    ceiling, 3 x 400 waiting, 4 steps: unset %lld restores / %lld evict calls / %lld asked; bit 1 %lld / %lld / %lld "
+                    "(refused %lld); 3 %lld / %lld / %lld (stops %lld)\n",
+            (long long)u.restores, (long long)u.evict_calls, (long long)u.asked, (long long)g1.restores,
+            (long long)g1.evict_calls, (long long)g1.asked, (long long)g1.refused, (long long)g3.restores,
+            (long long)g3.evict_calls, (long long)g3.asked, (long long)g3.stops);
+    CHECK_EQ(u.restores, 12);                        /* today: every waiting prompt, every step */
+    CHECK(u.evict_calls >= 12);
+    CHECK_EQ(u.evicted, 4);                           /* the cache's 4 blocks went for nothing */
+    CHECK_EQ(u.b_state, (int)ReqState::Waiting);
+    CHECK_EQ(g1.restores, 0);
+    CHECK_EQ(g1.evict_calls, 0);
+    CHECK_EQ(g1.evicted, 0);                          /* the cache keeps them */
+    CHECK_EQ(g1.refused, 12);
+    CHECK_EQ(g1.b_state, (int)ReqState::Waiting);
+    CHECK_EQ(g1.plan_rows, u.plan_rows);              /* the same steps planned */
+    CHECK_EQ(g3.restores, 0);
+    CHECK_EQ(g3.asked, 4);                            /* one prompt asked a step */
+    CHECK_EQ(g3.stops, 4);
+    CHECK_EQ(g3.plan_rows, u.plan_rows);
+
+    /* control: 256 tokens need 17 + 2 blocks; 12 free + the cache's 8 seat it -- restored, evicted for, admitted */
+    Out cu, c1;
+    run(nullptr, 256, 128, false, &cu);
+    run("1", 256, 128, false, &c1);
+    fprintf(stderr, "    seatable 256 (8 cache blocks): unset %lld restores / %lld evicted / state %d; bit 1 %lld / %lld / %d\n",
+            (long long)cu.restores, (long long)cu.evicted, cu.b_state, (long long)c1.restores, (long long)c1.evicted, c1.b_state);
+    CHECK_EQ(cu.b_state, (int)ReqState::Running);
+    CHECK_EQ(c1.b_state, (int)ReqState::Running);
+    CHECK_EQ(c1.restores, cu.restores);
+    CHECK_EQ(c1.evicted, cu.evicted);
+    CHECK(c1.evicted > 0);
+    CHECK_EQ(c1.plan_rows, cu.plan_rows);
+
+    /* control: a 48-token prompt queued behind the three refused ones -- admitted past them unset and under bit 1, waits
+     * under bit 2 */
+    Out su, s1, s3;
+    run(nullptr, 400, 64, true, &su);
+    run("1", 400, 64, true, &s1);
+    run("3", 400, 64, true, &s3);
+    fprintf(stderr, "    48 tokens behind them: unset state %d, bit 1 %d, 3 %d\n", su.e_state, s1.e_state, s3.e_state);
+    CHECK_EQ(su.e_state, (int)ReqState::Running);
+    CHECK_EQ(s1.e_state, (int)ReqState::Running);
+    CHECK_EQ(s3.e_state, (int)ReqState::Waiting);
+}
+
+/* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80, AgentX agx8 / agx11: a seatable prompt's room-gate
+ * evictions held single steps 1-17 s, 221 calls of 256 entries for 56,576): the gate asks the prefix cache for the entries the
+ * prompt is short in ONE call instead of 256 a round. A runner holds 20 of 2,000 blocks, the cache 1,900 (cache-only), a
+ * 16,000-token prompt needs 1,001 + the runner's headroom: unset = ceil(short / 256) calls of 256 (and up to 255 entries more
+ * than it needs), bit 4 = one call of exactly the shortfall; the prompt admitted in both, the same steps planned. Control: a
+ * prompt that fits asks nothing in either mode. */
+TEST(gev_the_room_gate_asks_the_cache_for_its_shortfall_in_one_call) {
+    struct Env { ~Env() { unsetenv("RADIANCE_SCHED_ADMIT_GATE"); } } env;
+    struct Out { int64_t evict_calls = 0, evicted = 0, plan_rows = 0; int b_state = -1; };
+    auto run = [&](const char* mode, int b_tokens, Out* o) {
+        if (mode) setenv("RADIANCE_SCHED_ADMIT_GATE", mode, 1); else unsetenv("RADIANCE_SCHED_ADMIT_GATE");
+        Fixture f;
+        f.build(/*blocks=*/2000, /*states=*/64, /*max_tok=*/512, /*max_ctx=*/32768);   /* 2,000 x 16 = 32,000 tokens */
+        f.prog.meta.n_ctx_train = 32768;            /* the fixture's 4,096 would refuse the 16,000-token prompt */
+        f.cfg.max_seqs = 8;
+        f.cfg.prefill_room_gate = true;
+        CHECK_OK(f.start());
+        const uint64_t a = f.submit(320, /*max_tokens=*/200, /*priority=*/5);
+        REQUIRE(f.sch.step() != nullptr);
+        CHECK_EQ((int)f.sch.find(a)->state, (int)ReqState::Running);
+        f.commit_plain();
+        f.pc.seed(1900 * 16);                       /* cache-only blocks the gate can evict */
+        f.pc.held = 1900 * 16;
+        f.pc.evict_grant = 1 << 20;
+        f.pc.evict_frees = true;
+        const uint64_t b = f.submit(b_tokens, 16);
+        const int64_t ev0 = f.pc.evict_calls;
+        for (int k = 0; k < 2; ++k) {
+            REQUIRE(f.sch.step() != nullptr);
+            o->plan_rows += (int64_t)f.sch.plan().e.size();
+            f.commit_plain();
+        }
+        o->evict_calls = f.pc.evict_calls - ev0;
+        o->evicted = f.pc.evicted;
+        o->b_state = f.sch.find(b) ? (int)f.sch.find(b)->state : -1;
+    };
+    Out u, g4, g7;
+    run(nullptr, 16000, &u);
+    run("4", 16000, &g4);
+    run("7", 16000, &g7);
+    fprintf(stderr, "    16,000-token prompt at the ceiling: unset %lld evict calls / %lld entries evicted / state %d; bit 4 %lld / %lld / %d; "
+                    "7 %lld / %lld / %d\n", (long long)u.evict_calls, (long long)u.evicted, u.b_state, (long long)g4.evict_calls,
+            (long long)g4.evicted, g4.b_state, (long long)g7.evict_calls, (long long)g7.evicted, g7.b_state);
+    CHECK_EQ(u.b_state, (int)ReqState::Running);
+    CHECK_EQ(g4.b_state, (int)ReqState::Running);
+    CHECK_EQ(g7.b_state, (int)ReqState::Running);
+    CHECK(u.evict_calls >= 3);                       /* today: rounds of 256 */
+    CHECK_EQ(u.evicted % 256, 0);
+    CHECK_EQ(g4.evict_calls, 1);                     /* one call of the shortfall */
+    CHECK(g4.evicted < u.evicted);                   /* no round-up past the need */
+    CHECK(g4.evicted > u.evicted - 256);
+    CHECK_EQ(g7.evict_calls, 1);
+    CHECK_EQ(g7.evicted, g4.evicted);
+    CHECK_EQ(g4.plan_rows, u.plan_rows);             /* the same steps planned */
+    /* control: a prompt that fits beside the cache asks nothing */
+    Out cu, c4;
+    run(nullptr, 1000, &cu);
+    run("4", 1000, &c4);
+    CHECK_EQ(cu.evict_calls, 0);
+    CHECK_EQ(c4.evict_calls, 0);
+    CHECK_EQ(c4.b_state, (int)ReqState::Running);
 }

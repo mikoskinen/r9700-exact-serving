@@ -55,6 +55,12 @@ Server::Server(const Deps& d, const ServerOptions& o)
 
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
+    if (const char* e = std::getenv("RADIANCE_RPF"); e && std::atoi(e) == 1) {
+        rpf_ = true;
+        RAD_INFO("lever RPF (RADIANCE_RPF=1): after every OpenAI chat reply of one choice that ends in tool calls, a 1-token "
+                 "request of the history through the reply + its tool-result headers (empty) is served in-process at once "
+                 "(the client form of row cc21x moved into the server)");
+    }
     register_routes();
 }
 
@@ -381,9 +387,39 @@ std::string Server::check_thinking_budget() const {
 void Server::stop() {
     stopping_.store(true);
     transport_.stop();
+    /* lever RPF: the warm requests in flight see stopping_ as a closed peer and cancel; wait for their threads, which hold
+     * `this` (bounded: a step in flight finishes first) */
+    for (int i = 0; i < 6000 && rpf_live_.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
     stop_videos();
     stop_shapes();
     drain_graveyard(2000);
+}
+
+/* ------------------------------------------------------------------ lever RPF (server.h) */
+
+void Server::rpf_after(const std::string& body, const ParsedMessage& m, const std::string& rid) {
+    if (!rpf_ || stopping_.load()) return;
+    std::string wb;
+    if (rpf_warm_body(body, m, &wb) < 0) return;
+    rpf_live_.fetch_add(1);
+    const int64_t k = rpf_sent_.fetch_add(1) + 1;
+    std::thread([this, wb = std::move(wb), rid, k] {
+        HttpRequest q;
+        q.method = "POST";
+        q.path = "/v1/chat/completions";
+        q.body = wb;
+        q.peer = "rpf";
+        q.t_received_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch()).count();
+        q.closed = [this] { return stopping_.load(); };
+        const auto t0 = std::chrono::steady_clock::now();
+        const HttpResponse res = handle_chat(q);
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (k <= 3 || res.status != 200)
+            RAD_INFO("lever RPF: warm request %lld after %s: status %d in %.3f s%s", (long long)k, rid.c_str(), res.status,
+                     s, k == 3 ? " (later ones only if not 200)" : "");
+        rpf_live_.fetch_sub(1);
+    }).detach();
 }
 
 /* ------------------------------------------------------------------ admission */
@@ -865,6 +901,9 @@ TimingsOut Server::timings_of(const Sink* const* sinks, size_t n, int64_t receiv
         t.predicted_n      += produced;
         t.draft_n          += s.n_drafted();
         t.draft_n_accepted += s.n_draft_accepted();
+        t.spec_steps       += s.n_spec_steps();
+        t.spec_max          = std::max(t.spec_max, s.n_spec_max());
+        for (int j = 0; j < Sink::kSpecHist; ++j) t.spec_hist[j] += s.n_spec_hist(j);
         const int64_t tf = s.t_first_token_ns();
         if (tf < 0) continue;
         t.valid = true;
@@ -1049,6 +1088,9 @@ HttpResponse Server::blocking_completion(const HttpRequest& req, OaiRequest& r) 
     record(r, gens, overall);
     retire(gens);
     release(r.n_choices());
+    if (rpf_ && r.endpoint == Endpoint::Chat && r.shape == ApiShape::OpenAI && choices.size() == 1 &&
+        choices.front().finish == Finish::ToolCalls)
+        rpf_after(req.body, choices.front().msg, r.id);   /* lever RPF */
 
     const TimingsOut timings = timings_of(gens, r.t_received_ns);
     if (r.shape == ApiShape::LlamaNative) {
@@ -1218,6 +1260,8 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
     auto st = std::make_shared<StreamState>();
     st->r = r;
     st->peer_closed = req.closed;
+    if (rpf_ && r.endpoint == Endpoint::Chat && r.shape == ApiShape::OpenAI && r.n_choices() == 1)
+        st->rpf_body = req.body;   /* lever RPF */
 
     ApiError err;
     if (submit_all(st->r, &st->gens, &err) < 0) {
@@ -1381,6 +1425,10 @@ HttpResponse Server::streaming_completion(const HttpRequest& req, OaiRequest& r)
                     } else {
                         out += g.delta->final_chunk(g.finish, gt, u);
                         overall = outcome(overall, g.delta->adjusted_finish(g.finish));
+                        /* lever RPF: the parsed reply carries the call ids the client was sent */
+                        if (!st->rpf_body.empty() && st->gens.size() == 1 &&
+                            g.delta->adjusted_finish(g.finish) == Finish::ToolCalls)
+                            self->rpf_after(st->rpf_body, g.delta->parsed(), st->r.id);
                     }
                 } else if (st->r.shape == ApiShape::LlamaNative) {
                     out += sse_event(json_dump(self->native_result(st->r, g, "")));

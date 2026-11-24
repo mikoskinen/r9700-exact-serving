@@ -869,6 +869,11 @@ void Engine::pp_on_build(const RadBatch* b, int lane) {
     pp_draft_q_.emplace_back(b->step, lane, std::move(fr));
 }
 
+bool Engine::pp_head_now() const {   /* qfn-on-ds Qwen tp8 S7b */
+    return pp_leader() && pp_g().part.load(std::memory_order_relaxed) == RAD_PP_PART_HEAD &&
+           pp_g().seg_l1.load(std::memory_order_relaxed) == 0;
+}
+
 void Engine::pp_set_pass(int lane, int part, int seg_l0, int seg_l1, int band, int lflags, int tband, int rband, int rkeys) {
     PpGlobal& g = pp_g();
     g.lane.store(lane, std::memory_order_relaxed);

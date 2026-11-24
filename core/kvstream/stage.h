@@ -91,12 +91,17 @@ void kvstream_runs(const std::vector<const std::vector<int32_t>*>& tables, int64
  * pass stages; otherwise [0, held_top_blocks) of `kv` (rank 0's manager, which hands out the
  * ids). The vectors are refilled in place. */
 void kvstream_step_runs(const KVManager& kv, const RadBatch* b, const std::vector<uint64_t>* seqs,
-                        std::vector<std::vector<KVStageRun>>* runs);
+                        std::vector<std::vector<KVStageRun>>* runs,
+                        std::vector<std::vector<KVStageRun>>* ride_runs = nullptr);
+/* lever RIDE: whether the step `b` is one whose trunk pass rides (a MIXED pass with decode rows, not a draft pass, exactly
+ * one streamed group); `ride_runs` (kvstream_step_runs) then holds the prefill sequences' ranges. */
+bool kvstream_ride_step(const RadBatch* b);
 
 /* Install `runs` (kvstream_step_runs) as the step's stage ranges of every streamed group of `c`.
  * Called for every rank from Engine::prepare_release, with the ranks parked and the step's blocks
  * ensured. */
-void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs);
+void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs,
+                         const std::vector<std::vector<KVStageRun>>* ride_runs = nullptr);
 
 /* The driver, also re-run by a recorded pass (Ctx::tape_kv_stage). `after` is the call after the
  * layer's attention (rad_kv_stage_next) rather than before its store. */

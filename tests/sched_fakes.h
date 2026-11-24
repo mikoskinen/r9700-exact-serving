@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <map>
 #include <vector>
 
 #ifndef SCHED_FAKES_KV_ONLY
@@ -417,6 +418,7 @@ struct FakeKV : IKVManager {
     int release_idle_states() override {
         int n = 0;
         for (auto& kv : seqs) {
+            if (kept.count(kv.first)) continue;   /* as KVManager: a kept request's states are its decode position */
             for (size_t i = 0; i < gs.size(); ++i) {
                 if (geom.g[i].paged || kv.second.state[i] < 0) continue;
                 state_free[i].push_back(kv.second.state[i]);
@@ -429,6 +431,9 @@ struct FakeKV : IKVManager {
             std::vector<char> seen((size_t)n_state_slots[i], 0);
             for (int32_t s : state_free[i])
                 if (s >= 0 && s < n_state_slots[i]) seen[(size_t)s] = 1;
+            for (const auto& kv : seqs)
+                if (kept.count(kv.first) && kv.second.state[i] >= 0 && kv.second.state[i] < n_state_slots[i])
+                    seen[(size_t)kv.second.state[i]] = 1;
             for (int64_t s = 0; s < n_state_slots[i]; ++s) {
                 if (seen[(size_t)s]) continue;
                 state_free[i].push_back((int32_t)s);
@@ -580,15 +585,24 @@ struct FakePC : IPrefixCache {
      * linear state at the deepest checkpoint under that (checkpoints at multiples of `interval`,
      * none below `ckpt_lo`), and the whole hit stands if that gives back too much. */
     int64_t ckpt_lo = 0;
-    CacheHit lookup(const Request&, std::vector<std::vector<int32_t>>* out,
+    /* Qwen loop round 59: a test's per-request attention hit (tokens, a block multiple) in place of `attn` -- the blocks
+     * handed are the seeded ones cut to it */
+    std::map<uint64_t, int32_t> attn_by;
+    CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* out,
                     const HitCap* cap) const override {
         ++lookups;
+        const auto ab = attn_by.find(r.id);
         if (out) {
             out->resize(groups.size());
-            for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i)
+            for (size_t i = 0; i < groups.size() && i < seeded.size(); ++i) {
                 (*out)[i] = seeded[i];
+                if (ab != attn_by.end()) {
+                    const int64_t nb = ab->second / kv->geom.g[(size_t)groups[i]].block_size;
+                    if ((int64_t)(*out)[i].size() > nb) (*out)[i].resize((size_t)nb);
+                }
+            }
         }
-        CacheHit h{ attn, lin, src };
+        CacheHit h{ ab != attn_by.end() ? ab->second : attn, lin, src };
         h.branch_at = branch_at;
         /* fn4 resume_cold (HitCap::resume_at): the deepest allowed position at or below the snapshot where one is held
          * -- this fake holds one at `lin` and at every multiple of `interval` below it (from ckpt_lo) */
@@ -615,6 +629,14 @@ struct FakePC : IPrefixCache {
             }
         }
         return h;
+    }
+    /* qfn-on-ds lever SRB (round 58): IPrefixCache::probe -- the hit a test sets per request id (-1 = the cache cannot say) */
+    std::map<uint64_t, int64_t> probe_hit;
+    mutable int64_t probes = 0;
+    int64_t probe(const Request& r) const override {
+        ++probes;
+        const auto it = probe_hit.find(r.id);
+        return it == probe_hit.end() ? -1 : it->second;
     }
     const std::vector<int32_t>& cached_groups() const override { return groups; }
     void set_drafter_floor(int64_t tokens) override { drafter_floor = tokens; }

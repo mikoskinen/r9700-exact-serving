@@ -306,6 +306,50 @@ void Engine::pf1_finish(const RadBatch* b, uint64_t t_collect, bool tok) {
 void Engine::lane_select(int l) {
     cur_sched_ = &sched_of(l);
     issue_sched_.store(cur_sched_, std::memory_order_release);
+    /* qfn-on-ds lever BGL stage 2: lane 1's steps on each rank's second Ctx / sampler (the ranks are parked here) */
+    if (bgl1m_)
+        for (auto& rk : ranks_) rk->use_bg = l == 1 && rk->bg_ready;
+    /* stage 2b: the per-step single copies follow the lane (Engine::BgLaneIO) */
+    if (bgl2b_ && (l == 1) != bgio_in_) {
+        std::swap(step_end_, bgio_.step_end);
+        std::swap(tok_end_, bgio_.tok_end);
+        std::swap(readback_.p, bgio_.rb_p);
+        std::swap(readback_.n, bgio_.rb_n);
+        std::swap(slots_host_, bgio_.slots_host);
+        std::swap(serial_row_, bgio_.serial_row);
+        std::swap(serial_rounds_, bgio_.serial_rounds);
+        std::swap(serial_rows_, bgio_.serial_rows);
+        std::swap(serial_done_, bgio_.serial_done);
+        std::swap(draft_out_, bgio_.draft_out);
+        bgio_in_ = l == 1;
+    }
+}
+
+/* lever BGL stage 2b: lane 1's events, pinned slot readback and the per-rank cross-Ctx events */
+int Engine::bgl2b_setup() {
+    for (auto& rk : ranks_)
+        if (!rk->bg_ready) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=3 (lever BGL stage 2b): rank %d has no second Ctx", rk->index);
+            return RAD_E_STATE;
+        }
+    bg_gate_.assign(ranks_.size(), nullptr);
+    bg_done_.assign(ranks_.size(), nullptr);
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        RAD_TRY(rad_dev_set(ranks_[r]->device));
+        RAD_TRY(rad_event_create_as(&bg_gate_[r], RAD_EVENT_LOCAL));
+        RAD_TRY(rad_event_create_as(&bg_done_[r], RAD_EVENT_LOCAL));
+    }
+    if (!ranks_.empty()) RAD_TRY(rad_dev_set(ranks_[0]->device));
+    RAD_TRY(rad_event_create_as(&bgio_.step_end, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    RAD_TRY(rad_event_create_as(&bgio_.tok_end, RAD_EVENT_LOCAL | RAD_EVENT_HOST_WAIT));
+    const int64_t slot_bytes = cfg_.max_seqs * (int64_t)sizeof(StepSlot);
+    bgio_.slots_host = static_cast<StepSlot*>(rad_dev_alloc(slot_bytes, RAD_MEM_HOST_PINNED));
+    if (!bgio_.slots_host) return RAD_E_NOMEM;
+    std::memset(bgio_.slots_host, 0, (size_t)slot_bytes);
+    RAD_INFO("lever BGL stage 2b (RADIANCE_BG_LANE_1M=3): lane 1's step goes out whole on the second Ctx (trunk, sampler, drafter passes, "
+             "readback) and is finished when its end event completes, while lane 0 steps on; the second Ctx waits on the card for the "
+             "first before each lane-1 step, the first for the second at its finish");
+    return RAD_OK;
 }
 
 void Engine::pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_t t1) {
@@ -317,9 +361,14 @@ void Engine::pp_stamp(const char* what, int lane, int step, uint64_t t0, uint64_
 int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lane_sched_.clear();
     std::vector<Scheduler*> all{ &sched_ };
+    /* qfn-on-ds lever BGL stage 2: lane 1's builder stages its batches on the second Ctx's stream, which its passes run on -- on
+     * the first Ctx's stream the upload is unordered against the pass (the WIP's intermittent differences, pp_e2e bgl run 2) */
+    std::vector<BatchBuilder::RankIO> rio1 = rio;
+    for (size_t i = 0; i < rio1.size() && i < ranks_.size(); ++i)
+        if (ranks_[i]->bg_ready) rio1[i].stream = ranks_[i]->bg_ctx.stream();
     for (int l = 1; l < n_lanes_; ++l) {
         auto s = std::make_unique<Scheduler>(sched_, l, n_lanes_, &lanes_);
-        RAD_TRY(s->init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
+        RAD_TRY(s->init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), l == 1 && bgl1m_ ? rio1 : rio, &geo_));
         s->set_eog(sched_.eog_ids());
         all.push_back(s.get());
         lane_sched_.push_back(std::move(s));
@@ -327,12 +376,36 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     lanes_.init(all);
     /* tp8 M56: at W(h > 0, t) the leader's head part runs layers [0, h) and writes their state (lanes.h) */
     lanes_.set_head_state(cfg_.pp_cut_h > 0);
+    /* qfn-on-ds Qwen tp8 S7b (round 43): RADIANCE_PP_HEAD_SNAP=1 on the leader -- a chunk-END snapshot's head-layer rows are
+     * staged inside the chunk's HEAD part (rank_loop -> the plugin's rad_tip_set row -1 -> Engine::head_stage), so the
+     * scheduler lends such chunks (LaneSet::snap_holds); unset = today word for word */
+    head_snap_ = false;
+    if (pp_leader() && cfg_.pp_cut_h > 0) {
+        const char* hs = std::getenv("RADIANCE_PP_HEAD_SNAP");
+        if (hs && hs[0] == '1' && hs[1] == '\0') {
+            if (ranks_[0]->kv.has_window_snapshot()) {
+                RAD_ERR("two-node pipeline (Qwen tp8 S7b): RADIANCE_PP_HEAD_SNAP=1 takes a program whose snapshots are state rows "
+                        "only; this one keeps window rows -- unset it");
+                return RAD_E_UNSUPPORTED;
+            }
+            head_snap_ = true;
+            hs_.assign(ranks_.size(), HsRank{});
+            for (size_t i = 0; i < hs_.size(); ++i) { hs_[i].e = this; hs_[i].rank = (int)i; }
+            lanes_.set_head_snap(true);
+            RAD_INFO("two-node pipeline (Qwen tp8 S7b, RADIANCE_PP_HEAD_SNAP=1): a chunk-end snapshot's layers [0, %d) are "
+                     "staged inside the chunk's head part, so the lanes lend snapshot-taking chunks of a cold prompt "
+                     "(a snapshot inside a chunk still holds its sequence)", cfg_.pp_cut_h);
+        }
+    }
     /* tp8 S5 review: draft_ctxskip=1 refused by name under lanes (fn4), not accepted and left off: a run kit
      * that reads its switches back drops it instead of stopping on a value that differs */
     /* tp8 dev D4: under RADIANCE_PP_CTXSKIP_LANES=1 the ring is one region a lane (ctxskip_setup), so the skip is taken */
     if (!(ctxs_.ready && ctxs_.lanes > 1)) fn4::ctxskip_refuse_lanes();
     /* Every lane's batch is its own set of recordings (Ctx::pass_key reads its slab's pointers). */
-    for (auto& rk : ranks_) rk->ctx.set_tape_lanes(n_lanes_);
+    for (auto& rk : ranks_) {
+        rk->ctx.set_tape_lanes(n_lanes_);
+        if (rk->bg_ready) rk->bg_ctx.set_tape_lanes(n_lanes_);   /* qfn-on-ds lever BGL stage 2 */
+    }
     /* lane l holds cards [l * S / N, (l + 1) * S / N) (Scheduler::init) */
     const int64_t per = (cfg_.max_seqs + n_lanes_ - 1) / n_lanes_, least = cfg_.max_seqs / n_lanes_;
     RAD_INFO("two-node pipeline: %d lanes, each a scheduler with its own step slab on every card and at most %lld "
@@ -428,10 +501,10 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
     if (const char* bh = std::getenv("RADIANCE_PP_BG_HOLD_MS"); lanes_.bg_hold_ms() <= 0 && bh && *bh)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_HOLD_MS=%s is not taken: %s (tp8 dev D11)", bh,
                  lanes_.bg_lane() < 0 ? "it needs RADIANCE_PP_BG_LANE" : "not 1 .. 60000 ms");
-    if (lanes_.bg_lane() == 1)
+    if (lanes_.bg_lane() == 1 && !bgl1m_)
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE leaves ONE decode lane at --pp-lanes %d: decode steps no longer overlap on "
                  "the two nodes (use --pp-lanes %d)", n_lanes_, n_lanes_ + 1);
-    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); lanes_.bg_lane() >= 0 && !(rf && !std::strcmp(rf, "1")))
+    if (const char* rf = std::getenv("RADIANCE_PP_READY_FIRST"); lanes_.bg_lane() >= 0 && !bgl1m_ && !(rf && !std::strcmp(rf, "1")))
         RAD_WARN("two-node pipeline: RADIANCE_PP_BG_LANE without RADIANCE_PP_READY_FIRST=1: a decode lane's tail waits behind a BG "
                  "step's in the leader's order (tp8 dev M8)");
     if (lanes_.lend_split())
@@ -464,6 +537,12 @@ int Engine::lanes_init(const std::vector<BatchBuilder::RankIO>& rio) {
                  "before the snapshot, at checkpoint-interval boundaries (RADIANCE_PP_SPAN_INNER=1, tp8 loop P14)%s",
                  !lanes_.span_on() || lanes_.span_short() > 0 || lanes_.span_tail() > 0
                      ? "" : " -- inactive: RADIANCE_PP_SPAN=0, _SPAN_SHORT or _SPAN_TAIL names those cuts");
+    if (bgl1m_)   /* qfn-on-ds lever BGL */
+        RAD_INFO("lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop Q5b S1 stage 1): two lanes on ONE machine -- lane 0 holds every "
+                 "sequence, lane 1 is the background prefill lane (tp8 dev M8): a newcomer planned whole beside decode rows is lent "
+                 "whole to it and runs in a lane-1 step of its own (its first token and its drafter's history there), lane 0's step "
+                 "going out with its decode rows alone; stage 1 runs lane 1's steps on the same queue between lane 0's, nothing "
+                 "issued ahead (a composition change only)");
     return RAD_OK;
 }
 
@@ -2084,8 +2163,10 @@ int Engine::step_loop_lanes() {
                 lane_select(lane);
                 /* the card's acceptance of this step, which ADV_TRUNK continues from: a block or serial drafter ran it
                  * behind the sampler (issue_*_drafter); without a drafter only a pipelining engine does */
-                if (!block_drafting() && !serial_drafting() && !pipelining_)
+                if (!block_drafting() && !serial_drafting() && !pipelining_) {
+                    fal_arm((uint32_t)b->step, so);   /* RADIANCE_DRAFT_FORCE_AL: this ADV_ACCEPT's draw key = collect's */
                     if (const int ac = advance_all(ADV_ACCEPT, 0, false); ac < 0) return fail_loop(ac);
+                }
                 nb = lsched().step_next();
                 if (!nb) ++ia_why[kIaNext];
                 if (nb) {

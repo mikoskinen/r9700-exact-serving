@@ -1740,6 +1740,40 @@ TEST(speculation_by_prompt_lookup_returns_the_greedy_tokens) {
     }
 }
 
+/* The hero image's switches.json (RADIANCE_IMAGE_SWITCHES) is queued after the scheduler registers its drafter (Qwen loop round 44,
+ * FINDINGS F76): a drafter switch in it -- draft_dcap, which fn4::check refuses until Scheduler::init's fn4::draft_register -- is
+ * taken, not a stopped start ('no scheduler has registered a drafter' was R60's startup stop), and reads back after a request. */
+TEST(image_switch_defaults_take_a_drafter_switch_after_the_scheduler_registers) {
+    REQUIRE(world().ok);
+    const std::string path = "/tmp/f76-switches-" + std::to_string((long)::getpid()) + ".json";
+    {
+        FILE* f = std::fopen(path.c_str(), "w");
+        REQUIRE(f != nullptr);
+        std::fputs("{\"draft_dcap\": 3, \"draft_dcap_n\": 107}\n", f);
+        std::fclose(f);
+    }
+    Server s;
+    const bool up = s.start(world().qwen35_spec, { "--spec-ngram", "4", "--draft-window", "adaptive", "--no-prefix-cache" },
+                            { "RADIANCE_IMAGE_SWITCHES=" + path });
+    const std::string log = s.output();
+    CHECK(up);
+    CHECK(!has(log, "no scheduler has registered a drafter"));
+    CHECK(has(log, "2 switches queued for the first step [draft_dcap 3, draft_dcap_n 107]"));
+    if (up) {
+        int status = 0;
+        (void)post(s.port, "/completion", completion(repetitive_prompt(), 8), &status);
+        CHECK_EQ(status, 200);
+        Call c;
+        std::string out;
+        CHECK_EQ(c.send(s.port, "GET", "/admin/fn4", "") ? c.read(&out) : -1, 200);
+        const json j = json::parse(out, nullptr, false);
+        CHECK_EQ(j.value(json::json_pointer("/switches/draft_dcap"), -1), 3);
+        CHECK_EQ(j.value(json::json_pointer("/switches/draft_dcap_n"), -1), 107);
+        CHECK_EQ(s.stop(), 0);
+    }
+    std::remove(path.c_str());
+}
+
 /* Sampling draws each position's random number from (seed, position), so a seeded request repeats
  * exactly, and speculation, which accepts a draft only where the sampler at that coordinate would
  * have drawn it, gives the same tokens as plain decoding. Another seed must give other tokens, or
@@ -1957,6 +1991,200 @@ TEST(concurrent_requests_return_what_each_returns_alone) {
         }
         CHECK_EQ(s.stop(), 0);
     }
+}
+
+/* qfn-on-ds Q92 (FINDINGS F78): lever AGR (RADIANCE_SCHED_ADMIT_GATE=3) and the step-host timer (RADIANCE_LOG_STEP_HOST=0, a line every
+ * step) on a hybrid model with the prefix cache on: four prompts at once return what each returns alone (admission order only, no byte),
+ * the start line names the switch, and every planned step prints its host split with the scheduler's part and AGR's counters. */
+TEST(agr_and_the_step_host_line_keep_the_text) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(500 + i, 70 + 29 * i));
+    std::vector<std::vector<int32_t>> alone;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        for (const auto& p : prompts) alone.push_back(tokens_of(post(s.port, "/completion", completion(p, 40))));
+        CHECK_EQ(s.stop(), 0);
+    }
+    Server s;
+    REQUIRE(s.start(world().qwen35, { "--num-speculative-tokens", "4", "--max-num-seqs", "4" },
+                    { "RADIANCE_SCHED_ADMIT_GATE=3", "RADIANCE_LOG_STEP_HOST=0", "RADIANCE_LOG=info" }));
+    Call calls[4];
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[i], 40).dump()));
+    for (int i = 0; i < 4; ++i) {
+        std::string body;
+        CHECK_EQ(calls[i].read(&body), 200);
+        const std::vector<int32_t> t = tokens_of(json::parse(body, nullptr, false));
+        CHECK_EQ(t.size(), (size_t)40);
+        if (t != alone[(size_t)i])
+            fprintf(stderr, "    prompt %d\n    alone    %s\n    AGR 3    %s\n", i, show(alone[(size_t)i]).c_str(), show(t).c_str());
+        CHECK(t == alone[(size_t)i]);
+    }
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    size_t lines = 0, with_sched = 0;
+    for (size_t a = 0; (a = log.find("step-host ", a)) != std::string::npos; ++a) {
+        ++lines;
+        const size_t e = log.find('\n', a);
+        const std::string line = log.substr(a, e == std::string::npos ? std::string::npos : e - a);
+        if (line.find("| sched ") != std::string::npos && line.find("agr refused ") != std::string::npos &&
+            line.find("collect ") != std::string::npos)
+            ++with_sched;
+    }
+    const size_t f = log.find("step-host ");
+    fprintf(stderr, "    step-host lines %zu (%zu with the scheduler's part); the first:\n      %s\n", lines, with_sched,
+            f == std::string::npos ? "-" : log.substr(f, log.find('\n', f) - f).c_str());
+    CHECK(log.find("RADIANCE_SCHED_ADMIT_GATE=3 (qfn-on-ds Q92") != std::string::npos);
+    CHECK(log.find("RADIANCE_LOG_STEP_HOST=0 (qfn-on-ds Q92)") != std::string::npos);
+    CHECK(lines >= 40);
+    CHECK_EQ(with_sched, lines);
+}
+
+/* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; AgentX c32 agx5): two prompts with a shared 200-token head sent at once
+ * each compute their own copy of the head, and the first to publish pins it under its snapshots. Under
+ * RADIANCE_PREFIX_UNREST=1 (F72's rule as written) the other's snapshots past the head are retired, so its re-send resumes
+ * no deeper than the head; under =2 the engine compares the two copies' bytes (Engine::prefix_same_bytes: every layer of
+ * every cached group, here on the host backend) and where they hold the same bytes the snapshots stay: both re-sends
+ * resume deep in their own prompts. Every reply, and every probability in it, is the cold run's in both modes. */
+TEST(f79_unrest_2_compares_the_two_copies_and_keeps_snapshots_over_equal_bytes) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> head = prompt_ids(11, 200);
+    std::vector<int32_t> a = head, b = head;
+    for (int32_t t : prompt_ids(12, 150)) a.push_back(t);
+    for (int32_t t : prompt_ids(13, 170)) b.push_back(t);
+    json cold_a, cold_b;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        cold_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        cold_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE(cold_a.contains("completion_probabilities"));
+    for (int mode : { 1, 2 }) {
+        Server s;
+        REQUIRE(s.start(world().qwen35,
+                        { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--max-num-seqs", "2" },
+                        { "RADIANCE_PREFIX_UNREST=" + std::to_string(mode), "RADIANCE_LOG=info" }));
+        Call ca, cb;
+        REQUIRE(ca.send(s.port, "POST", "/completion", completion(a, 24, 0.0, 0, 3).dump()));
+        REQUIRE(cb.send(s.port, "POST", "/completion", completion(b, 24, 0.0, 0, 3).dump()));
+        std::string ba, bb;
+        CHECK_EQ(ca.read(&ba), 200);
+        CHECK_EQ(cb.read(&bb), 200);
+        const json ra = json::parse(ba, nullptr, false), rb = json::parse(bb, nullptr, false);
+        const json again_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        const json again_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+        for (const json* r : { &ra, &again_a }) {
+            CHECK(tokens_of(*r) == tokens_of(cold_a));
+            CHECK((*r)["completion_probabilities"] == cold_a["completion_probabilities"]);
+        }
+        for (const json* r : { &rb, &again_b }) {
+            CHECK(tokens_of(*r) == tokens_of(cold_b));
+            CHECK((*r)["completion_probabilities"] == cold_b["completion_probabilities"]);
+        }
+        const std::string log = s.output();
+        auto count = [&](const char* what) {
+            size_t n = 0;
+            for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++n;
+            return n;
+        };
+        auto first_line = [&](const char* what) {
+            const size_t at = log.find(what);
+            if (at == std::string::npos) return std::string("-");
+            const size_t sol = log.rfind('\n', at) + 1;
+            return log.substr(sol, log.find('\n', at) - sol);
+        };
+        const size_t retired = count("keeps another publisher's bytes"), compared = count("hold this request's bytes"),
+                     all_equal = count("all ");
+        (void)all_equal;
+        const int64_t ca2 = timing(again_a, "cache_n"), cb2 = timing(again_b, "cache_n");
+        fprintf(stderr, "    UNREST=%d: re-sends cached a %lld / b %lld; retire lines %zu, compare lines %zu\n      %s\n",
+                mode, (long long)ca2, (long long)cb2, retired, compared, first_line(mode == 2 ? "hold this request's bytes"
+                                                                                              : "keeps another publisher's bytes").c_str());
+        if (mode == 1) {
+            CHECK(retired >= 1);                          /* the second publisher's snapshots went */
+            CHECK_EQ(compared, (size_t)0);
+            CHECK(std::min(ca2, cb2) <= 200);             /* ... so its re-send resumes no deeper than the head */
+        } else {
+            CHECK(compared >= 1);                         /* the comparer ran on the conflict */
+            CHECK(log.find("RADIANCE_PREFIX_UNREST=2 (Qwen loop F79)") != std::string::npos);
+            /* the host backend computes a row independently of its neighbours: the two copies are equal, nothing retired */
+            CHECK(count("cached entries another publisher keeps hold this request's bytes (compared in") >= 1);
+            CHECK_EQ(retired, (size_t)0);
+            CHECK(std::min(ca2, cb2) > 200);              /* both re-sends resume past the head, in their own prompts */
+        }
+    }
+}
+
+/* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; RADIANCE_PREFIX_UNREST=3): the F79 load (two prompts with a
+ * shared 200-token head sent at once, each computing its own copy; the first to publish pins it) -- the second publisher
+ * keeps its own copy of the head as an overlay of its snapshots instead of losing them (no retire line, no compare line),
+ * both re-sends resume deep in their own prompts, the one over the overlay adopting its own head blocks, and every reply
+ * and probability is the cold run's. A third send of the second prompt resumes the re-send's lineage again (its publish
+ * carries the same blocks into its own overlay). */
+TEST(f81_unr3_keeps_the_second_publishers_snapshots_over_its_own_head) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> head = prompt_ids(11, 200);
+    std::vector<int32_t> a = head, b = head;
+    for (int32_t t : prompt_ids(12, 150)) a.push_back(t);
+    for (int32_t t : prompt_ids(13, 170)) b.push_back(t);
+    json cold_a, cold_b;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35, kPlain));
+        cold_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+        cold_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE(cold_a.contains("completion_probabilities"));
+    Server s;
+    REQUIRE(s.start(world().qwen35,
+                    { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--max-num-seqs", "2" },
+                    { "RADIANCE_PREFIX_UNREST=3", "RADIANCE_LOG=info" }));
+    Call ca, cb;
+    REQUIRE(ca.send(s.port, "POST", "/completion", completion(a, 24, 0.0, 0, 3).dump()));
+    REQUIRE(cb.send(s.port, "POST", "/completion", completion(b, 24, 0.0, 0, 3).dump()));
+    std::string ba, bb;
+    CHECK_EQ(ca.read(&ba), 200);
+    CHECK_EQ(cb.read(&bb), 200);
+    const json ra = json::parse(ba, nullptr, false), rb = json::parse(bb, nullptr, false);
+    const json again_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json again_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    const json third_a = post(s.port, "/completion", completion(a, 24, 0.0, 0, 3));
+    const json third_b = post(s.port, "/completion", completion(b, 24, 0.0, 0, 3));
+    CHECK_EQ(s.stop(), 0);
+    for (const json* r : { &ra, &again_a, &third_a }) {
+        CHECK(tokens_of(*r) == tokens_of(cold_a));
+        CHECK((*r)["completion_probabilities"] == cold_a["completion_probabilities"]);
+    }
+    for (const json* r : { &rb, &again_b, &third_b }) {
+        CHECK(tokens_of(*r) == tokens_of(cold_b));
+        CHECK((*r)["completion_probabilities"] == cold_b["completion_probabilities"]);
+    }
+    const std::string log = s.output();
+    auto count = [&](const char* what) {
+        size_t n = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++n;
+        return n;
+    };
+    const char* kOv = "this request's own copies stay beside them";
+    const size_t ov = count(kOv), retired = count("keeps another publisher's bytes"), compared = count("hold this request's bytes");
+    const int64_t ca2 = timing(again_a, "cache_n"), cb2 = timing(again_b, "cache_n");
+    const int64_t ca3 = timing(third_a, "cache_n"), cb3 = timing(third_b, "cache_n");
+    const size_t f = log.find(kOv);
+    fprintf(stderr, "    UNREST=3: re-sends cached a %lld / b %lld, third a %lld / b %lld; overlay lines %zu, retire %zu, compare %zu\n"
+                    "      %s\n", (long long)ca2, (long long)cb2, (long long)ca3, (long long)cb3, ov, retired, compared,
+            f == std::string::npos ? "-" : log.substr(log.rfind('\n', f) + 1, log.find('\n', f) - log.rfind('\n', f) - 1).c_str());
+    CHECK(log.find("RADIANCE_PREFIX_UNREST=3 (Qwen loop F81, lever UNR3)") != std::string::npos);
+    CHECK(ov >= 1);                                   /* the second publisher's own head kept beside the cache's */
+    CHECK_EQ(retired, (size_t)0);
+    CHECK_EQ(compared, (size_t)0);
+    CHECK(std::min(ca2, cb2) > 200);                  /* both re-sends resume past the head, in their own prompts */
+    CHECK(std::min(ca3, cb3) > 200);
 }
 
 /* A prompt that shares a head with an earlier one resumes from the prefix cache: attention from
@@ -2263,6 +2491,144 @@ TEST(the_draft_oracle_replaces_a_draft_heads_proposals_and_keeps_the_plain_text)
     CHECK(has(s.output(), "beside the draft head 'dflash2': no step is issued ahead"));
     /* DFlash2 proposes trees where its plugin measured a gain; under the harness it proposes a chain. */
     CHECK(has(s.output(), "draft trees: not asked"));
+}
+
+/* RADIANCE_DRAFT_FORCE_AL (core/sched/force_al.h; Qwen loop round 46, QUEUE Q88: AgentX's synthetic acceptance),
+ * MEASUREMENT ONLY. DFlash2's block head drafts 7 a step and the forced table sets the acceptance length: the card's
+ * acceptance (here the host backend running sched/advance_impl.h, positioning every draft pass and the step issued
+ * ahead) and the host's collect agree on every forced count with four sequences in flight (the engine refuses a step
+ * where they do not, and the reply would be short or the server would stop), the realized AL at depth 7 is the
+ * table's within 3 % over the run, the text is not the plain run's (drafts the target did not draw are emitted), the
+ * tree-capable head proposes a chain under it, and a value out of range stops the start. Prompt lookup without a head
+ * serves under it too. Unset, every other test in this file is the control. */
+TEST(force_al_sets_the_acceptance_length_and_the_card_agrees_with_the_host) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(300 + i, 60 + 29 * i));
+    std::vector<int32_t> plain0;
+    {
+        Server s;
+        REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache" }));
+        plain0 = tokens_of(post(s.port, "/completion", completion(prompts[0], 64)));
+        /* Unset RADIANCE_SPEC_DECODE_METRICS: no record on the OpenAI body. */
+        const json v = post(s.port, "/v1/completions",
+                            json{ { "prompt", prompts[1] }, { "max_tokens", 32 }, { "ignore_eos", true } });
+        CHECK(v.is_object() && v.contains("choices") && !v.contains("metrics"));
+        CHECK_EQ(s.stop(), 0);
+    }
+    REQUIRE_EQ(plain0.size(), (size_t)64);
+    Server s;
+    REQUIRE(s.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                    { "RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:2.9",
+                      "RADIANCE_SPEC_DECODE_METRICS=1" }));
+    {
+        /* vLLM's per-request record (metrics.speculative_decoding) with the invariants AgentX's harness checks. */
+        const json v = post(s.port, "/v1/completions",
+                            json{ { "prompt", prompts[1] }, { "max_tokens", 96 }, { "ignore_eos", true } });
+        const json m = v.is_object() ? v.value("metrics", json::object()).value("speculative_decoding", json::object())
+                                     : json::object();
+        CHECK(m.contains("acceptance_histogram") && m["acceptance_histogram"].is_array());
+        const int64_t steps = m.value("num_spec_steps", (int64_t)-1), drafts = m.value("num_draft_tokens", (int64_t)-1),
+                      acc = m.value("num_accepted_draft_tokens", (int64_t)-1), k = m.value("num_spec_tokens", (int64_t)-1);
+        int64_t hs = 0, hw = 0;
+        if (m.contains("acceptance_histogram"))
+            for (size_t j = 0; j < m["acceptance_histogram"].size(); ++j) {
+                hs += m["acceptance_histogram"][j].get<int64_t>();
+                hw += (int64_t)j * m["acceptance_histogram"][j].get<int64_t>();
+            }
+        fprintf(stderr, "    spec record: %s\n", m.dump().c_str());
+        CHECK(steps > 10);
+        CHECK_EQ(k, 7);
+        CHECK_EQ(m.contains("acceptance_histogram") ? (int64_t)m["acceptance_histogram"].size() : -1, k + 1);
+        CHECK_EQ(hs, steps);
+        CHECK_EQ(hw, acc);
+        CHECK(acc > 0 && acc <= drafts);
+        CHECK(std::fabs(m.value("mean_acceptance_length", 0.0) - (1.0 + (double)acc / (double)std::max<int64_t>(steps, 1))) < 1e-9);
+    }
+    int64_t drafted = 0, accepted = 0;
+    std::vector<int32_t> forced0;
+    for (int round = 0; round < 3; ++round) {
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[(size_t)i], 160).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            const json r = json::parse(body, nullptr, false);
+            const std::vector<int32_t> t = tokens_of(r);
+            CHECK_EQ(t.size(), (size_t)160);
+            drafted += std::max<int64_t>(timing(r, "draft_n"), 0);
+            accepted += std::max<int64_t>(timing(r, "draft_n_accepted"), 0);
+            if (round == 0 && i == 0) forced0 = t;
+        }
+    }
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    CHECK(has(log, "RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47,5:2.59,6:2.66,7:2.9: MEASUREMENT ONLY"));
+    CHECK(has(log, "draft trees: not asked -- RADIANCE_DRAFT_FORCE_AL"));
+    CHECK(!has(log, "the card accepted"));
+    /* The stop line's depth-7 entry: "depth 7: N verifies, AL x (target 2.9000)". */
+    const size_t at = log.find("RADIANCE_DRAFT_FORCE_AL (measurement only) at the stop");
+    CHECK(at != std::string::npos);
+    long long n7 = 0;
+    double al7 = 0, want7 = 0;
+    if (at != std::string::npos) {
+        const size_t d7 = log.find("depth 7: ", at);
+        CHECK(d7 != std::string::npos);
+        if (d7 != std::string::npos)
+            CHECK_EQ(std::sscanf(log.c_str() + d7, "depth 7: %lld verifies, AL %lf (target %lf)", &n7, &al7, &want7), 3);
+    }
+    if (at != std::string::npos)
+        fprintf(stderr, "    %s\n", log.substr(at, log.find('\n', at) - at).c_str());
+    fprintf(stderr, "    dflash2 forced: depth 7 %lld verifies, AL %.4f (target %.4f); drafted %lld, accepted %lld\n", n7,
+            al7, want7, (long long)drafted, (long long)accepted);
+    CHECK(n7 >= 200);
+    /* F77: every request here runs under ignore_eos (completion()), so no drafted stop token cuts a count */
+    CHECK(at != std::string::npos && has(log.substr(at, 400), ", 0 cut below their draw by a stop token"));
+    CHECK(std::fabs(want7 - 2.9) < 1e-6);
+    CHECK(std::fabs(al7 - 2.9) <= 0.03 * 2.9);
+    CHECK(accepted > 0);
+    REQUIRE(forced0.size() >= 64);
+    CHECK(!std::equal(plain0.begin(), plain0.end(), forced0.begin()));
+    {
+        /* RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify; card = host still, 0 cuts counted. */
+        Server nc;
+        REQUIRE(nc.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache", "--max-num-seqs", "4" },
+                         { "RADIANCE_DRAFT_FORCE_AL=7:2.9", "RADIANCE_DRAFT_FORCE_AL_CUT=0" }));
+        Call calls[4];
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(calls[i].send(nc.port, "POST", "/completion", completion(prompts[(size_t)i], 160).dump()));
+        for (int i = 0; i < 4; ++i) {
+            std::string body;
+            CHECK_EQ(calls[i].read(&body), 200);
+            CHECK_EQ(tokens_of(json::parse(body, nullptr, false)).size(), (size_t)160);
+        }
+        CHECK_EQ(nc.stop(), 0);
+        const std::string ln = nc.output();
+        CHECK(has(ln, "RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify"));
+        CHECK(has(ln, ", 0 cut below their draw by a stop token -- depth 7: "));
+        CHECK(!has(ln, "the card accepted"));
+        const size_t z = ln.find("RADIANCE_DRAFT_FORCE_AL (measurement only) at the stop");
+        if (z != std::string::npos) fprintf(stderr, "    %s\n", ln.substr(z, ln.find('\n', z) - z).c_str());
+    }
+    {
+        Server bad;
+        CHECK(!bad.start(world().g31_df2, { "--num-speculative-tokens", "7", "--no-prefix-cache" },
+                         { "RADIANCE_DRAFT_FORCE_AL=4:6.0" }));
+        CHECK(has(bad.output(), "is not DEPTH:AL"));
+    }
+    {
+        Server pl;
+        REQUIRE(pl.start(world().qwen35_spec, { "--spec-ngram", "4", "--no-prefix-cache" },
+                         { "RADIANCE_DRAFT_FORCE_AL=2.47" }));
+        int status = 0;
+        const json r = post(pl.port, "/completion", completion(repetitive_prompt(), 48), &status);
+        CHECK_EQ(status, 200);
+        CHECK_EQ(tokens_of(r).size(), (size_t)48);
+        CHECK_EQ(pl.stop(), 0);
+        CHECK(has(pl.output(), "RADIANCE_DRAFT_FORCE_AL=2.47: MEASUREMENT ONLY"));
+        CHECK(!has(pl.output(), "the card accepted"));
+    }
 }
 
 /* ds41-acc's confidence gate (dspark_conf; core/sched/draft_conf.h) on DFlash2's block head, with
@@ -3049,6 +3415,247 @@ TEST(fn4_preempt_keep_without_a_host_tier_falls_back_to_recompute_cleanly) {
         CHECK(kept);
         CHECK(same >= 2);
     }
+}
+
+/* qfn-on-ds round 56 lever EGN at reply level (COORD 03:43 gap (a), FINDINGS DEV note 04:51's card cell on the host backend): a
+ * snapshot whose entries were EVICTED and indexed again by another publisher whose bytes differ (decode-written: the delta net's
+ * recurrent path, not the chunked one). P = 100 ids, Rp its greedy reply, L = P + Rp[:100] + Z. R1 = L on an empty cache (= cold,
+ * snapshots every 64 tokens); a fill turns the small pool over (L's chain erased, its snapshots kept: keep-all, 512 slots); R2 = P
+ * decoding 100 tokens re-indexes [0, 200) (prefill + decode-written); R3 = L. EXACT 0 resumes R1's 192 over R2's bytes; EXACT 1
+ * retires it at R2's publish and R3 resumes R2's own 64. The reply and its probabilities are compared with R1's. */
+TEST(round56_egn_a_snapshot_over_reindexed_decode_written_entries) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> P = prompt_ids(5601, 100), Z = prompt_ids(5602, 100);
+    std::vector<std::string> args = { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--checkpoint-slots", "512",
+                                      "--checkpoint-policy", "keep-all", "--max-num-seqs", "2", "--max-num-batched-tokens", "256",
+                                      "--max-model-len", "512" };
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, 1000, 4000, false, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    struct Got { int64_t c1 = -1, c2 = -1, c3 = -1; bool r2 = false, tok = false, prob = false; size_t egn = 0; };
+    Got got[2];
+    for (int ex : { 0, 1 }) {
+        std::vector<std::string> env = device_env(mib);
+        env.push_back("RADIANCE_PREFIX_EXACT=" + std::to_string(ex));
+        env.push_back("RADIANCE_LOG=info");
+        Server s;
+        REQUIRE(s.start(world().qwen35, args, env));
+        const json g = post(s.port, "/completion", completion(P, 120));
+        const std::vector<int32_t> Rp = tokens_of(g);
+        REQUIRE(Rp.size() == 120u);
+        std::vector<int32_t> L = P;
+        L.insert(L.end(), Rp.begin(), Rp.begin() + 100);
+        L.insert(L.end(), Z.begin(), Z.end());
+        auto fill = [&](uint64_t base) {
+            for (uint64_t i = 0; i * 400 < 2 * (uint64_t)pool + 400; ++i)
+                (void)post(s.port, "/completion", completion(prompt_ids(base + i, 400), 1));
+        };
+        fill(57000);
+        const json r1 = post(s.port, "/completion", completion(L, 24, 0.0, 0, 3));
+        fill(57100);
+        const json r2 = post(s.port, "/completion", completion(P, 100));
+        const json r3 = post(s.port, "/completion", completion(L, 24, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+        const std::string log = s.output();
+        Got& o = got[ex];
+        o.c1 = timing(r1, "cache_n"); o.c2 = timing(r2, "cache_n"); o.c3 = timing(r3, "cache_n");
+        const std::vector<int32_t> t2 = tokens_of(r2);
+        o.r2 = t2.size() == 100u && std::equal(t2.begin(), t2.end(), Rp.begin());
+        o.tok = tokens_of(r1) == tokens_of(r3);
+        o.prob = r1["completion_probabilities"] == r3["completion_probabilities"];
+        for (size_t at = log.find("(EGN;"); at != std::string::npos; at = log.find("(EGN;", at + 1)) ++o.egn;
+        fprintf(stderr, "    EXACT=%d (%d MiB, pool %lld): cache_n R1 %lld / R2 %lld / R3 %lld; R2 = Rp %d; R3 = R1: tokens %d, "
+                        "probabilities %d; EGN retire lines %zu\n", ex, mib, (long long)pool, (long long)o.c1, (long long)o.c2,
+                (long long)o.c3, (int)o.r2, (int)o.tok, (int)o.prob, o.egn);
+        CHECK(o.r2);                                      /* the re-indexed tokens are L's */
+        CHECK_EQ(o.c1, (int64_t)0);                       /* R1 is the cold run */
+    }
+    CHECK_EQ(got[0].c3, (int64_t)192);                    /* EXACT 0: R1's snapshot over R2's bytes (the gap) */
+    CHECK(!got[0].prob);                                  /* ... and the reply's probabilities are not the cold run's */
+    CHECK_EQ(got[0].egn, (size_t)0);
+    CHECK(got[1].egn >= 1);                               /* EXACT 1: retired at R2's publish */
+    CHECK(got[1].c3 < 192);                               /* R3 resumes no deeper than R2's own snapshot */
+    CHECK(got[1].tok && got[1].prob);                     /* = cold */
+}
+
+/* qfn-on-ds round 56 (COORD 03:43): the same squeeze with RADIANCE_PREFIX_EXACT=3 (levers EGN + KOW, mem_test egn_... /
+ * kow_... hold the byte cases): the engine names both levers at start, the parks keep / rejoin or recompute through
+ * keep_own / drop_kept, every stream returns its whole length, and the pool ends with no block held by a kept copy (a
+ * fresh request after the squeeze runs alone in a pool the leak would have shrunk). */
+TEST(round56_exact_3_under_preempt_keep_pressure_keeps_the_streams_whole) {
+    REQUIRE(world().ok);
+    std::vector<std::vector<int32_t>> prompts;
+    for (uint64_t i = 0; i < 4; ++i) prompts.push_back(prompt_ids(300 + i, 200 + 20 * i));
+    std::vector<std::string> args = { "--num-speculative-tokens", "4" };
+    for (const std::string& a : small_pool_args()) args.push_back(a);
+    args.push_back("--prefix-cache-mib");
+    args.push_back("16");
+    int64_t longest = 0, together = 0;
+    for (const auto& p : prompts) {
+        longest = std::max<int64_t>(longest, (int64_t)p.size() + 64);
+        together += (int64_t)p.size() + 64;
+    }
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35_kv, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, longest, together - 40, true, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    std::vector<std::string> env = device_env(mib);
+    env.push_back("RADIANCE_FN4_PREEMPT_KEEP=1");
+    env.push_back("RADIANCE_PREFIX_EXACT=3");
+    env.push_back("RADIANCE_LOG=info");
+    Server s;
+    REQUIRE(s.start(world().qwen35_kv, args, env));
+    Call calls[4];
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(calls[i].send(s.port, "POST", "/completion", completion(prompts[i], 64).dump()));
+    for (int i = 0; i < 4; ++i) {
+        std::string body;
+        CHECK_EQ(calls[i].read(&body), 200);
+        CHECK_EQ(tokens_of(json::parse(body, nullptr, false)).size(), (size_t)64);
+    }
+    const double n = metric(s.port, "vllm:num_preemptions_total");
+    /* after the squeeze: one request alone, its whole length (a kept copy left behind would hold blocks for good) */
+    const json after = post(s.port, "/completion", completion(prompt_ids(399, 230), 64));
+    CHECK_EQ(tokens_of(after).size(), (size_t)64);
+    CHECK_EQ(s.stop(), 0);
+    const std::string log = s.output();
+    auto count = [&](const char* what) {
+        size_t k = 0;
+        for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++k;
+        return k;
+    };
+    fprintf(stderr, "    %d MiB, a pool of %lld tokens, preempted %g times; kept %zu, rejoined %zu, recomputed %zu; KOW keep "
+                    "lines %zu, KOW stops %zu, EGN retire lines %zu\n", mib, (long long)pool, n,
+            count("fn4 preempt_keep: request") , count("rejoined at"), count("recomputed"),
+            count("as its own copy (the cache keeps another"), count("rejoins no deeper than entry"),
+            count("(EGN;"));
+    CHECK(log.find("RADIANCE_PREFIX_EXACT=3 (Qwen loop round 56) -- lever EGN") != std::string::npos);
+    CHECK(log.find("-- lever KOW") != std::string::npos);
+    CHECK(n > 0);
+}
+
+/* qfn-on-ds round 57 lever KOW at REPLY level (COORD 05:36 gap (b); DEV notes 03:26 / 04:28 / 05:01): a decoding request fn4
+ * preempt_keep parks while the cache holds ANOTHER publisher's copy of positions it decoded itself -- a live prompt that is the
+ * same tokens, prefilled -- rejoins over that copy today, so its later tokens attend bytes it did not compute. P = 100 ids, R =
+ * its greedy reply ALONE (160 tokens + probabilities, its own start). Then, on one start a RADIANCE_PREFIX_EXACT value: B = P +
+ * R[:120] (a prompt, published at its last chunk by RADIANCE_SCHED_PUB_PROMPT=1, decoding on), S2 / S3 = 300-id prompts decoding,
+ * and A = P (160 tokens) LAST, so A is running_.back() when the small pool runs out and preempt_back parks it; its kept position
+ * lies in (100, 220) when it parked inside B's copy. EXACT 0: A rejoins over B's prefilled copy of [100, kept) (or recomputes when
+ * that copy is gone) and its probabilities differ from R's; EXACT 2: KOW holds A's own blocks of those entries (keep line), A's
+ * reply = R in tokens and probabilities. */
+TEST(round57_kow_a_parked_decode_rejoins_over_another_publishers_prefilled_copy) {
+    REQUIRE(world().ok);
+    const std::vector<int32_t> P = prompt_ids(5701, 100), S2 = prompt_ids(5702, 300), S3 = prompt_ids(5703, 300);
+    const int kRide = 120, kA = 160;
+    std::vector<std::string> args = { "--num-speculative-tokens", "0", "--checkpoint-interval", "64", "--checkpoint-slots", "512",
+                                      "--checkpoint-policy", "keep-all", "--max-num-seqs", "4", "--max-num-batched-tokens", "256",
+                                      "--max-model-len", "512", "--prefill-interleave", "0" };
+    /* after the four prefills ~220 + 300 + 300 + 100 tokens are held; four decode a token a step: a pool of [1100, 1400) runs
+     * out after A decoded ~45-120 tokens, inside B's copy [100, 220) */
+    auto pool_at = [&](int mib) -> int64_t {
+        Server probe;
+        probe.quiet = true;
+        if (!probe.start(world().qwen35_kv, args, device_env(mib))) return -1;
+        return pool_tokens(probe.output());
+    };
+    int64_t pool = 0;
+    std::string why;
+    const int mib = small_device(pool_at, 1100, 1400, false, &pool, &why);
+    if (!mib) fprintf(stderr, "    no small pool: %s\n", why.c_str());
+    REQUIRE(mib > 0);
+    json alone;
+    {
+        Server s;
+        REQUIRE(s.start(world().qwen35_kv, args, device_env(mib)));
+        alone = post(s.port, "/completion", completion(P, kA, 0.0, 0, 3));
+        CHECK_EQ(s.stop(), 0);
+    }
+    const std::vector<int32_t> R = tokens_of(alone);
+    REQUIRE(R.size() == (size_t)kA);
+    std::vector<int32_t> B = P;
+    B.insert(B.end(), R.begin(), R.begin() + kRide);
+    struct Got { bool tok = false, prob = false; int64_t kept_a = -1; size_t kept = 0, rejoined = 0, recomputed = 0, kow = 0, stop = 0;
+                 int first = -1; };
+    Got got[2];
+    for (int ex : { 0, 2 }) {
+        std::vector<std::string> env = device_env(mib);
+        env.push_back("RADIANCE_FN4_PREEMPT_KEEP=1");
+        env.push_back("RADIANCE_SCHED_PUB_PROMPT=1");
+        env.push_back("RADIANCE_PREFIX_EXACT=" + std::to_string(ex));
+        env.push_back("RADIANCE_LOG=info");
+        Server s;
+        REQUIRE(s.start(world().qwen35_kv, args, env));
+        Call cb, c2, c3, ca;
+        REQUIRE(cb.send(s.port, "POST", "/completion", completion(B, 200).dump()));
+        REQUIRE(c2.send(s.port, "POST", "/completion", completion(S2, 200).dump()));
+        REQUIRE(c3.send(s.port, "POST", "/completion", completion(S3, 200).dump()));
+        /* A after the other three are admitted: the newest running request */
+        for (int k = 0; k < 400 && metric(s.port, "vllm:num_requests_running") < 3.0; ++k)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        REQUIRE(ca.send(s.port, "POST", "/completion", completion(P, kA, 0.0, 0, 3).dump()));
+        std::string body;
+        for (Call* c : { &cb, &c2, &c3 }) { CHECK_EQ(c->read(&body), 200); }
+        CHECK_EQ(ca.read(&body), 200);
+        const json a = json::parse(body, nullptr, false);
+        CHECK_EQ(s.stop(), 0);
+        const std::string log = s.output();
+        Got& o = got[ex ? 1 : 0];
+        const std::vector<int32_t> t = tokens_of(a);
+        o.tok = t == R;
+        o.prob = a.is_object() && a.contains("completion_probabilities") &&
+                 a["completion_probabilities"] == alone["completion_probabilities"];
+        for (size_t i = 0; i < t.size() && i < R.size(); ++i) if (t[i] != R[i]) { o.first = (int)i; break; }
+        auto count = [&](const char* what) {
+            size_t k = 0;
+            for (size_t at = log.find(what); at != std::string::npos; at = log.find(what, at + 1)) ++k;
+            return k;
+        };
+        o.kept = count("fn4 preempt_keep: request"); o.rejoined = count("rejoined at"); o.recomputed = count("preempted by recompute");
+        o.kow = count("as its own copy (the cache keeps another"); o.stop = count("rejoins no deeper than entry");
+        /* A's park: the one kept position inside B's copy (B's own is >= 220, S2 / S3's >= 300) */
+        for (size_t at = log.find(" kept at "); at != std::string::npos; at = log.find(" kept at ", at + 1)) {
+            const long long v = std::atoll(log.c_str() + at + 9);
+            if (v > (long long)P.size() && v < (long long)B.size()) o.kept_a = v;
+        }
+        fprintf(stderr, "    EXACT=%d (%d MiB, pool %lld): A kept at %lld; A = alone: tokens %d (first differing %d), probabilities %d; "
+                        "kept lines %zu, rejoined %zu, by recompute %zu, KOW keep lines %zu, KOW stops %zu\n", ex, mib,
+                (long long)pool, (long long)o.kept_a, (int)o.tok, o.first, (int)o.prob, o.kept, o.rejoined, o.recomputed,
+                o.kow, o.stop);
+        if (std::getenv("RAD_E2E_KOW_LOG") || (ex && !(o.tok && o.prob))) {
+            size_t at = 0;
+            for (int k = 0; k < 120 && at < log.size();) {
+                const size_t e = log.find('\n', at);
+                const std::string line = log.substr(at, e == std::string::npos ? std::string::npos : e - at);
+                if (line.find("preempt_keep") != std::string::npos || line.find("KOW") != std::string::npos ||
+                    line.find("rejoin") != std::string::npos || line.find("EGN") != std::string::npos ||
+                    line.find("req ") != std::string::npos) {
+                    fprintf(stderr, "      | %s\n", line.substr(0, 300).c_str());
+                    ++k;
+                }
+                if (e == std::string::npos) break;
+                at = e + 1;
+            }
+        }
+        CHECK(o.kept_a > 0);                              /* A parked inside B's copy */
+    }
+    CHECK(!got[0].prob);                                  /* EXACT 0: the parked reply is not the alone reply (the gap) */
+    CHECK(got[1].kow >= 1);                               /* EXACT 2: KOW held A's own blocks of B's entries */
+    CHECK(got[1].tok && got[1].prob);                     /* ... and A's reply = alone */
 }
 
 /* ================================================================== image generation */

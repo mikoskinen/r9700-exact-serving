@@ -26,6 +26,11 @@ static int64_t mono_us() {
     return (int64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+/* qfn-on-ds Q92: the step-host note's clock (RADIANCE_LOG_STEP_HOST only) */
+static uint64_t hn_ns() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 /* Reclaiming KV from the prefix cache for a request: at most kEvictRounds rounds of
  * kEvictBlocks blocks each. Bounded, because an unbounded loop on the scheduler thread stalls the
@@ -283,6 +288,46 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
         if (bi_one_pf_ && lane_ <= 0)
             RAD_INFO("scheduler: RADIANCE_SCHED_BI_ONE_PF=1 (qfn-on-ds Q18) -- under lever BI chunking 6 a step carries at most one "
                      "prefill sequence: a second prompt's piece waits for the next step (every piece alone or beside decode rows)");
+    }
+    {   /* qfn-on-ds Q92 (FINDINGS F78): lever AGR and the step-host note (scheduler.h agr_ / hn_on_) */
+        const char* e = std::getenv("RADIANCE_SCHED_ADMIT_GATE");
+        agr_ = e && *e ? (std::atoi(e) & 7) : 0;
+        if (agr_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_ADMIT_GATE=%d (qfn-on-ds Q92, F78)%s%s%s", agr_,
+                     (agr_ & 1) ? " -- a fresh prompt's room gate is asked BEFORE its restore (the cache's own blocks counted as "
+                                  "room): one no eviction could seat now restores and evicts nothing" : "",
+                     (agr_ & 2) ? "; a fresh prompt the room gate refuses ends the step's admission walk (first come, first "
+                                  "seated)" : "",
+                     (agr_ & 4) ? "; the room gate asks the prefix cache for the entries the prompt is short in one call "
+                                  "(qfn-on-ds Q103 lever GEV, F80), not 256 a round" : "");
+        hn_on_ = std::getenv("RADIANCE_LOG_STEP_HOST") != nullptr;
+        /* Qwen loop round 61 (FINDINGS TEST note 10:48: the cache gap is now hit-cut tokens): one line an admission whose
+         * attention hit passes its linear resume -- where the cut tokens sit against the snapshot grid. Log only. */
+        hc_log_ = std::getenv("RADIANCE_LOG_HIT_CUT") != nullptr;
+        if (hc_log_) RAD_INFO("scheduler: RADIANCE_LOG_HIT_CUT -- one 'hit cut' line an admission whose prefix hit "
+                              "resumes below its attention match (log only)");
+    }
+    {   /* qfn-on-ds lever PCR (Qwen loop round 58): the publish trim's free reserve, the DS line's RADIANCE_PC_KEEP reserve part
+         * (tp8 loop P82 lever PCK, value / 4: 0 a quarter = today, 1 an eighth, 2 a sixteenth, 3 a thirty-second, 4 none); its
+         * retention part (value % 4) is the DS line's switch and not read here (--checkpoint-policy sets retention) */
+        const char* e = std::getenv("RADIANCE_PC_KEEP");
+        const int v = e && *e ? std::atoi(e) : 0;
+        pcr_sel_ = v > 0 ? std::min(v / 4, 4) : 0;
+        if (v > 0 && lane_ <= 0) {
+            static const char* const kName[5] = { "a quarter (today)", "an eighth", "a sixteenth", "a thirty-second",
+                                                  "none (entries leave only where an admission or a growth evicts)" };
+            RAD_INFO("scheduler: RADIANCE_PC_KEEP=%d (qfn-on-ds lever PCR, the DS line's P82 reserve part): the prefix cache's publish "
+                     "trim keeps %s of the KV pool free%s", v, kName[pcr_sel_],
+                     v % 4 ? "; the retention part (value % 4) is not read in this tree: --checkpoint-policy sets it" : "");
+        }
+    }
+    {   /* Qwen loop round 59 (Q118, FINDINGS TEST note 08:20): the admission walk's reclaim for an overdue kept request
+         * (scheduler.h kr_on_); on unless RADIANCE_SCHED_KEEP_RECLAIM=0 */
+        const char* e = std::getenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        kr_on_ = !(e && !std::strcmp(e, "0"));
+        if (!kr_on_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_KEEP_RECLAIM=0 -- an overdue fn4 preempt_keep request the pool cannot take holds "
+                     "the admission walk with no reclaim (the walk before Qwen loop round 59; an idle engine can stall there)");
     }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
@@ -850,6 +895,11 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.bypass_run = false;
     s.noa_starved = false;
     s.noa_displaced = false;
+    /* qfn-on-ds lever SRB: a recycled slot kept the previous request's estimate, refusal stamp and wait stamp -- a stale
+     * estimate would order this request by another's rows */
+    s.srb_est = -1;
+    s.srb_refused_us = 0;
+    s.srb_since_us = 0;
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
@@ -1033,11 +1083,15 @@ void Scheduler::trim_prefix_cache() {
         const int64_t bs = kvgeom_.g[(size_t)g].block_size;
         if (bs > 0) entry = entry > 0 ? std::lcm(entry, bs) : bs;
     }
+    /* qfn-on-ds lever PCR (RADIANCE_PC_KEEP / 4, the DS line's P82 R): the reserve as a share of the pool -- a quarter (0, today),
+     * an eighth, a sixteenth, a thirty-second, or none (4: entries go only when an admission or a growth needs the room) */
+    static const int kPcrDiv[5] = { 4, 8, 16, 32, 0 };
+    if (kPcrDiv[pcr_sel_] == 0) return;
     int64_t short_by = 0;
     for (int32_t g : cg) {
         const int64_t total = kv_->total_blocks(g), bs = kvgeom_.g[(size_t)g].block_size;
         if (total <= 0 || bs <= 0) continue;
-        const int64_t reserve = total / 4;          /* a quarter of the pool stays free */
+        const int64_t reserve = total / kPcrDiv[pcr_sel_];   /* a quarter of the pool stays free (lever PCR 0 = today) */
         /* Free against the carve, not free_blocks(): on an elastic pool free_blocks() is bounded
          * by the live mark, so a pool that returned its unused top would read as nearly full and
          * the trim would drain the cache for room the pool can grow back into. */
@@ -2014,9 +2068,10 @@ void Scheduler::cold_starts(const Request& r, int64_t target, std::vector<int64_
          * piece's K split as the cold read it: the prompt's own TIF tail (taken inside), another prompt's TIF tail on a
          * sibling's or a longer turn's last piece (warm turn 2 at its predecessor's tail), a crossing turn's earlier span */
         if ((r.tail_grid & kTifBit) && I > 0 && w > I && lastp > n) {
-            const int64_t F = r.tail_grid & ~(int64_t)kTifBit;
+            const int64_t F = tail_grid_f(r.tail_grid);
+            const int64_t tm = tail_min_of(r.tail_grid);   /* F71: + 1 under sched_tail_inner 4 */
             if (F > 0)
-                for (int64_t p = (lastp / F + 1) * F; p + kTailMinPiece <= n + w; p += F) out->push_back(p);
+                for (int64_t p = (lastp / F + 1) * F; p + tm <= n + w; p += F) out->push_back(p);
         }
         n += w;
         if (n < end) out->push_back(n);
@@ -2313,8 +2368,9 @@ int64_t Scheduler::tail_checkpoint(int64_t target, int64_t fine) const {
         const int64_t g = geo_.grid_floor(target - margin);
         /* lever TIF (Request::tail_grid & kTifBit): F is the grid without the bit */
         const bool tif = (fine & kTifBit) != 0;
-        const int64_t F = fine & ~(int64_t)kTifBit;
-        const int64_t f = target > kTailMinPiece && F > 0 ? (target - kTailMinPiece) / F * F : 0;
+        const int64_t F = tail_grid_f(fine);
+        const int64_t tm = tail_min_of(fine);   /* F71: + 1 under sched_tail_inner 4 */
+        const int64_t f = target > tm && F > 0 ? (target - tm) / F * F : 0;
         /* Lever TIF (qfn-on-ds, Qwen loop round 23; QUEUE Q44): the fine tail where the prompt's last chunk [g, target) is
          * pipelined (more than one interval: lever TIP stages a row inside it) -- inside its last piece when it lies there
          * (plan_chunk takes it inside, no cut), else (a last piece under kTailMinPiece rows) lever G's cut; a last chunk
@@ -2661,9 +2717,15 @@ bool Scheduler::preempt_back() {
                      (unsigned long long)r.id, no, (long long)r.n_computed, (long long)s.seq_len());
         }
     }
+    /* round 56 KOW (RADIANCE_PREFIX_EXACT bit 2): the request keeps its own blocks of every entry the cache keeps another
+     * publisher's copy of (pub_blocks_ = its tables, as publish_prefix gave them), so its rejoin attends what its states
+     * were computed over; refused -> recomputed */
+    const bool kow = fn4::preempt_keep() > 0 && published && pc_ && (pc_->exact() & 2) != 0;
     if (fn4::preempt_keep() > 0 && published && !r.embed && r.n_computed >= (int64_t)r.prompt.size() &&
-        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible()) {
+        r.n_computed + 1 >= s.seq_len() && !kv_->has_runtime_window(r.id) && keep_possible() &&
+        (!kow || pc_->keep_own(r, pub_blocks_, r.n_computed) >= 0)) {
         const int64_t whole = kv_->preempt_keep(r.id, r.n_computed);
+        if (whole < 0 && kow) pc_->drop_kept(r);
         if (whole >= 0) {
             s.keep_whole = whole;
             r.state = ReqState::Preempted;
@@ -2773,6 +2835,7 @@ int Scheduler::rejoin_kept(SchedReq& s) {
     }
     s.keep_whole = -1;
     s.keep_tries = 0;
+    pc_->drop_kept(r);   /* round 56 KOW: the rejoin holds its own references now */
     r.state = ReqState::Running;
     s.preempted_us = 0;
     s.running = true;
@@ -2784,6 +2847,7 @@ int Scheduler::rejoin_kept(SchedReq& s) {
 
 void Scheduler::unkeep(SchedReq& s) {
     Request& r = *s.req;
+    if (pc_) pc_->drop_kept(r);   /* round 56 KOW */
     if (kv_->has_sequence(r.id)) kv_->preempt(r.id);
     drop_card(s);
     r.n_computed = 0;
@@ -2813,7 +2877,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         if (preempt_wait_overdue(s)) {
             int rounds = 0;
             while (!preempted_can_prefill(s) && rounds < kEvictRounds &&
-                   cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
+                   cfg_.prefix_cache && pc_ && pc_evict(kEvPreWait, kEvictBlocks) > 0)
                 ++rounds;
             /* Nothing else is running, so a missing state slot will not come back by waiting.
              * Put leaked slots back, then admit. A recompute the empty pool cannot hold is
@@ -2864,6 +2928,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             if (r.tail_grid > 0) { ++tg_n_[0]; tg_seen_ = true; }
             /* lever TIF (sched_tail_inner 3 under lever TIP): latched with the grid (kTifBit), see tail_checkpoint */
             if (r.tail_grid > 0 && tail_inner_sw_ >= 3 && tail_inner_pieces_) r.tail_grid |= kTifBit;
+            /* F71 (sched_tail_inner 4): TIF with every point leaving more than kTailMinPiece rows, latched alike */
+            if ((r.tail_grid & kTifBit) && tail_inner_sw_ >= 4) r.tail_grid |= kTifStrictBit;
         }
     }
     /* lever PSK design 2: the request's targets (latched again below on every admission path; the same values) --
@@ -2881,6 +2947,21 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
         return RAD_E_FULL;
 
     if (r.n_computed == 0 && cfg_.prefix_cache) {
+        /* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE bit 1; FINDINGS F78): the room gate below, asked first. At
+         * the pool's ceiling a long fresh prompt is refused there AFTER its whole context was copied back from the host
+         * tier, and the gate's evict rounds (up to kEvictRounds x kEvictBlocks entries) then drop what the walk restored
+         * for the request before it -- every waiting request, every step, with nothing admitted (agx3: ~1.1M blocks
+         * promoted and ~1.2M dropped in 5 min). Counted first, a prompt no eviction could seat now costs a lookup: no
+         * copy, no eviction, its host copy stays. One the early count lets on goes the usual way (the gate below
+         * still decides). A prompt the empty pool could never hold is not refused here (the gate's own rule). */
+        if (agr_ & 1) {
+            if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && kv_->can_ever_fit(s.seq_len() + 1) &&
+                !fresh_prefill_room_early(s)) {
+                ++agr_n_[0];
+                return kAdmitWait;
+            }
+            ++agr_n_[2];
+        }
         /* Restore before the lookup, which stops at the first block the tiers hold. This is
          * where a cold session gets its context back for the cost of a copy instead of a
          * prefill.
@@ -2890,7 +2971,9 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * behind another conversation's last turn would come back cut and prefill the rest. Such
          * a restore waits one step, once, instead of being cut. */
         const bool whole_only = n_deferred_ > 0 && !s.restore_waited;
+        const uint64_t hn_t0 = hn_on_ ? hn_ns() : 0;
         const RestoreResult rr = pc_->restore(r, whole_only);
+        if (hn_on_) { ++hn_.restores; hn_.restore_ms += (double)(hn_ns() - hn_t0) / 1e6; }
         if (rr == RestoreResult::Declined) {
             s.restore_waited = true;
             admit_next_step_ = true;
@@ -2928,7 +3011,8 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * cached one can. Only once the lever has latched in this process. */
         if (tg_seen_ && geo_.exact && h.checkpoint_slot >= 0 && h.n_linear_tokens > 0 &&
             !geo_.on_grid(h.n_linear_tokens) &&
-            (int64_t)r.prompt.size() - h.n_linear_tokens < kTailMinPiece) {
+            (int64_t)r.prompt.size() - h.n_linear_tokens <
+                ((r.tail_grid & kTifStrictBit) || tail_inner_sw_ >= 4 ? kTailMinPiece + 1 : kTailMinPiece)) {   /* F71 */
             h.n_linear_tokens = 0;
             h.checkpoint_slot = -1;
             ++tg_n_[7];
@@ -3118,9 +3202,10 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             if (f != tail_checkpoint(N, 0)) {
                 const int64_t start = cr_at > 0 ? cr_at : reuse;
                 const int64_t keep = r.checkpoint_at > 0 ? r.checkpoint_at / geo_.quantum * geo_.quantum : 0;
-                const bool near_start = start < f && f - start < kTailMinPiece;
+                const int64_t tm = tail_min_of(r.tail_grid);   /* F71: + 1 under sched_tail_inner 4 */
+                const bool near_start = start < f && f - start < tm;
                 const bool near_keep = keep > 0 && keep != f && keep < N &&
-                                       (keep > f ? keep - f : f - keep) < kTailMinPiece;
+                                       (keep > f ? keep - f : f - keep) < tm;
                 if (near_start || near_keep) {
                     r.tail_grid = 0;
                     ++tg_n_[7];
@@ -3154,9 +3239,24 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
      * and then be preempted at the first decode step, wasting the entire prefill. */
     if (cfg_.prefill_room_gate && r.state != ReqState::Preempted && (int64_t)r.n_computed < (int64_t)r.prompt.size()) {
         int rounds = 0;
-        while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
-               cfg_.prefix_cache && pc_ && pc_->evict(kEvictBlocks) > 0)
-            ++rounds;
+        if (agr_ & 4) {
+            /* qfn-on-ds Q103 lever GEV (bit 4; FINDINGS F80): ask for what the prompt is SHORT, not 256 entries a round --
+             * every call walks the LRU from its front past what cannot leave (and may land the whole copy backlog), so
+             * 221 rounds of 256 cost 2.2 s where one ask walks once. A call that frees less (entries a live sequence also
+             * holds) is asked again for the rest; the same bound in entries as the rounds below, the LRU order unchanged. */
+            int64_t asked = 0;
+            const int64_t cap = (int64_t)kEvictRounds * kEvictBlocks;
+            while (!fresh_prefill_can_fit(s) && asked < cap && rounds < kEvictRounds && cfg_.prefix_cache && pc_) {
+                const int64_t want = std::min<int64_t>(std::max<int64_t>(fresh_prefill_short_entries(s), 1), cap - asked);
+                asked += want;
+                ++rounds;
+                if (pc_evict(kEvGate, want) <= 0) break;
+            }
+        } else {
+            while (!fresh_prefill_can_fit(s) && rounds < kEvictRounds &&
+                   cfg_.prefix_cache && pc_ && pc_evict(kEvGate, kEvictBlocks) > 0)
+                ++rounds;
+        }
         if (!fresh_prefill_can_fit(s)) {
             /* A prompt the empty pool cannot hold must not starve the queue: it fails below
              * (spec §17) like the preempted path, rather than waiting forever. */
@@ -3249,7 +3349,7 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
          * running, no other path would reclaim from it and the request would wait forever. */
         int rounds = 0;
         while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
-            if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_->evict(kEvictBlocks) <= 0) {
+            if (++rounds > kEvictRounds || !cfg_.prefix_cache || pc_evict(kEvEnsure, kEvictBlocks) <= 0) {
                 rc = RAD_E_NOMEM;
                 break;
             }
@@ -3275,6 +3375,20 @@ int Scheduler::admit_one(SchedReq& s, int64_t budget, int64_t reserve, int64_t w
             m_.attn_cached_tokens += s.hit_attn;
             m_.linear_cached_tokens += r.n_cached;
             if (s.hit_attn > r.n_cached) m_.hit_cut_tokens += s.hit_attn - r.n_cached;
+            if (hc_log_ && s.hit_attn > r.n_cached) {
+                const int64_t iv = geo_.checkpoint_interval, tg = tail_grid_now();
+                const char* why = s.hit_cut == SchedReq::HitCut::NoSnapshot   ? "no_snapshot"
+                                : s.hit_cut == SchedReq::HitCut::ResumedBelow ? "resumed_below"
+                                : s.hit_cut == SchedReq::HitCut::Window       ? "window"
+                                : s.hit_cut == SchedReq::HitCut::Adopt        ? "adopt"
+                                                                              : "tail";
+                RAD_INFO("hit cut: req %llu prompt %lld hit %lld resumed %lld cut %lld (%s) | resume %% interval %lld = %lld, "
+                         "hit %% interval = %lld, tail grid %lld, hit %% grid = %lld, restore_cut %d",
+                         (unsigned long long)r.id, (long long)r.prompt.size(), (long long)s.hit_attn, (long long)r.n_cached,
+                         (long long)(s.hit_attn - r.n_cached), why, (long long)iv,
+                         (long long)(iv > 0 ? r.n_cached % iv : -1), (long long)(iv > 0 ? s.hit_attn % iv : -1),
+                         (long long)tg, (long long)(tg > 0 ? s.hit_attn % tg : -1), s.restore_cut ? 1 : 0);
+            }
             if (s.restore_cut) ++m_.prefix_restore_cuts;
             switch (s.hit_cut) {
                 case SchedReq::HitCut::NoSnapshot: ++m_.hit_cut_no_snapshot; break;
@@ -3402,6 +3516,45 @@ bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
  * The old admission only checked the first chunk; the pool could then refuse at 100% and
  * preempt_back() would hand back the entire prefill's KV, forcing the request to start again
  * at zero. */
+/* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80): the prefix-cache ENTRIES the room gate is short
+ * for `s` -- fresh_prefill_can_fit's full-group count past the available blocks, in entries (an entry holds lcm / B blocks of
+ * a cached group with B-token blocks, as trim_prefix_cache counts), the most any full group is short; 0 when the full groups
+ * fit (the stateful groups' slots are no eviction's business). */
+int64_t Scheduler::fresh_prefill_short_entries(const SchedReq& s) const {
+    if (!pc_) return 0;
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;
+    int64_t entry = 0;
+    for (int32_t g : pc_->cached_groups()) {
+        const int64_t bs = kvgeom_.g[(size_t)g].block_size;
+        if (bs > 0) entry = entry > 0 ? std::lcm(entry, bs) : bs;
+    }
+    int64_t short_by = 0;
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0 || gg.block_size <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size();
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;
+        }
+        const int64_t blocks = need - kv_->available_blocks((int32_t)g);
+        const int64_t per = std::max<int64_t>(entry > 0 ? entry / gg.block_size : 1, 1);
+        if (blocks > 0) short_by = std::max(short_by, (blocks + per - 1) / per);
+    }
+    return short_by;
+}
+
 bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
@@ -3435,6 +3588,53 @@ bool Scheduler::fresh_prefill_can_fit(const SchedReq& s) const {
         if (rs.req && !kv_->can_grow(rs.req->id, rs.req->n_computed + 1)) return false;
     }
     return true;
+}
+
+/* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE bit 1): fresh_prefill_can_fit's count before anything is restored or
+ * evicted. The prompt's blocks the pool already holds (the lookup stops at the first block off the card) are its own; a
+ * restore only moves free blocks under the rest of its prefix, so it changes nothing in this count. The blocks only the
+ * prefix cache holds (refcount one: IPrefixCache::held_tokens) count as room, as the gate's evict rounds could give them
+ * back -- an over-count where they are this prompt's own resident blocks, which only lets a prompt on to today's gate. */
+bool Scheduler::fresh_prefill_room_early(const SchedReq& s) const {
+    const Request& r = *s.req;
+    const int64_t target = s.seq_len() + 1;             /* prompt + one decode token */
+    int64_t resident = 0, lendable = 0;
+    if (cfg_.prefix_cache && pc_) {
+        resident = pc_->lookup(r, nullptr, nullptr).n_attn_tokens;
+        lendable = std::max<int64_t>(0, pc_->held_tokens());
+    }
+    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+        const KVGeom::G& gg = kvgeom_.g[g];
+        if (gg.kind != RAD_KV_FULL || !gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+        int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                       (int64_t)kv_->block_table(r.id, (int32_t)g).size() - resident / gg.block_size;
+        if (need < 0) need = 0;
+        for (int32_t slot : running_) {
+            const SchedReq& rs = *reqs_[(size_t)slot];
+            if (!rs.req) continue;
+            const Request& rr = *rs.req;
+            int64_t goal = rr.n_computed + 1;
+            if (rr.n_computed < (int64_t)rr.prompt.size())
+                goal = std::max(goal, (int64_t)rr.prompt.size());
+            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+            if (rows > held) need += rows - held;
+            need += 1;
+        }
+        if (need > kv_->available_blocks((int32_t)g) + lendable / gg.block_size) return false;
+    }
+    return true;
+}
+
+/* qfn-on-ds Q92: every pc_->evict the scheduler makes, counted by call site into the step-host note when it is on */
+int64_t Scheduler::pc_evict(int site, int64_t n) {
+    if (!hn_on_) return pc_->evict(n);
+    const uint64_t t0 = hn_ns();
+    const int64_t got = pc_->evict(n);
+    ++hn_.ev_n[site];
+    hn_.ev_ms[site] += (double)(hn_ns() - t0) / 1e6;
+    if (got > 0) hn_.ev_got[site] += got;
+    return got;
 }
 
 bool Scheduler::preempt_wait_overdue(const SchedReq& s) const {
@@ -3552,9 +3752,105 @@ void Scheduler::srf_choose(bool after_finish) {
     else if (lanes_->inbox_rows_locked(lane_) == 0) srf_wslot_ = pk.slot;
 }
 
+/* ------------------------------------------------------------------ qfn-on-ds lever SRB: BI5's lone step by fewest rows left */
+/* fn4 sched_bi_srpt (Qwen loop round 58, QUEUE Q113; the AgentX c32 budget, STATE 24.11. 07:01): under BI chunking 5 the lone
+ * step takes the first running prefill, and admits the queue's head only when no prefill runs -- so a follow-up turn with a
+ * few thousand rows past its cached prefix waits behind every earlier prompt's whole prefill (agx17: a p50 request waited
+ * 3.16 s before its first piece, a p90 one 15.4 s, of 1.0 / 1.7 s of its own). Here the lone step goes to the prompt with the
+ * fewest rows left: a running prefill by the rows to its prompt's end, a waiting prompt (where an admission is possible) by
+ * the rows past the prefix cache's hit (IPrefixCache::probe, once a request, at most kSrbProbes a step; unprobed = its whole
+ * prompt); ties: a running one, then the lower id. v >= 2: a prompt whose wait for its next piece (a waiting one: since its
+ * arrival, or since the rule first saw it under a test clock) reaches v ms goes first, the longest-waiting first. A preempted / kept / media / embedding request at the queue's
+ * head keeps today's plan (FIFO), as does a lane scheduler. Only WHEN pieces run changes: each piece is planned from its own
+ * request's n_computed as today (its position, rows and snapshot row), and the step stays alone (BI5). */
+void Scheduler::srb_choose(bool admit_possible, int v, int32_t& lone_slot) {
+    static constexpr int kSrbProbes = 2;
+    static constexpr int64_t kSrbRefuseUs = 200000;
+    const int64_t now = srb_clock_ ? srb_clock_() : mono_us();
+    const int64_t age_us = v >= 2 ? (int64_t)v * 1000 : 0;
+    if (admit_possible) {
+        const SchedReq& h = *reqs_[(size_t)waiting_[0]];
+        if (!h.req || h.req->media || h.req->embed || h.keep_whole >= 0 || h.req->state == ReqState::Preempted) return;
+    }
+    struct Pick { int32_t slot = -1; bool waiting = false; int64_t left = 0, since = 0; uint64_t id = 0; };
+    Pick best, aged;
+    auto consider = [&](int32_t slot, bool w, int64_t left, int64_t since, uint64_t id) {
+        if (age_us > 0 && now - since >= age_us &&
+            (aged.slot < 0 || since < aged.since || (since == aged.since && id < aged.id)))
+            aged = Pick{slot, w, left, since, id};
+        if (best.slot < 0 || left < best.left ||
+            (left == best.left && ((!w && best.waiting) || (w == best.waiting && id < best.id))))
+            best = Pick{slot, w, left, since, id};
+    };
+    for (int32_t sl : running_) {
+        SchedReq& q = *reqs_[(size_t)sl];
+        if (!q.req || !q.running) continue;
+        const Request& rr = *q.req;
+        if (!(rr.n_computed < (int64_t)rr.prompt.size() || rr.n_computed + 1 < q.seq_len())) continue;
+        const int64_t goal = std::max<int64_t>((int64_t)rr.prompt.size(), q.seq_len() - 1);
+        if (q.srb_since_us == 0) q.srb_since_us = now;
+        consider(sl, false, std::max<int64_t>(1, goal - rr.n_computed), q.srb_since_us, rr.id);
+    }
+    if (admit_possible) {
+        int probes = 0;
+        for (int32_t w : waiting_) {
+            SchedReq& ws = *reqs_[(size_t)w];
+            if (!ws.req || ws.req->media || ws.req->embed || ws.keep_whole >= 0 || ws.req->state == ReqState::Preempted) continue;
+            if (ws.srb_refused_us != 0 && now - ws.srb_refused_us < kSrbRefuseUs) continue;
+            if (ws.srb_est < 0 && pc_ && probes < kSrbProbes) {
+                ++probes;
+                ++srb_n_[kSrbProbe];
+                const int64_t hit = pc_->probe(*ws.req);
+                ws.srb_est = hit >= 0 ? std::max<int64_t>(1, ws.seq_len() - hit) : ws.seq_len();
+            }
+            const int64_t est = ws.srb_est >= 0 ? ws.srb_est : ws.seq_len();
+            if (ws.srb_since_us == 0) ws.srb_since_us = srb_clock_ || ws.arrived_us <= 0 ? now : ws.arrived_us;
+            consider(w, true, est, ws.srb_since_us, ws.req->id);
+        }
+    }
+    const Pick& p = aged.slot >= 0 ? aged : best;
+    if (p.slot < 0) return;
+    ++srb_n_[kSrbSteps];
+    if (aged.slot >= 0) ++srb_n_[kSrbAged];
+    if (p.waiting) {
+        /* today: a running prefill first, else the queue's head */
+        if (lone_slot >= 0 || p.slot != waiting_[0]) ++srb_n_[kSrbAhead];
+        if (lone_slot >= 0) ++srb_n_[kSrbAdmitAhead];
+        lone_slot = -1;
+        srb_wslot_ = p.slot;
+        reqs_[(size_t)p.slot]->srb_since_us = 0;
+    } else {
+        if (p.slot != lone_slot) ++srb_n_[kSrbAhead];
+        lone_slot = p.slot;
+        reqs_[(size_t)p.slot]->srb_since_us = 0;   /* it runs a piece now: its wait starts again after */
+    }
+    if (srb_n_[kSrbSteps] - srb_logged_ >= 2000) {
+        srb_logged_ = srb_n_[kSrbSteps];
+        RAD_INFO("fn4 sched_bi_srpt %d (Qwen loop lever SRB): %lld lone steps chosen, %lld not FIFO's (%lld waiting prompts "
+                 "admitted ahead of a running prefill), %lld by the age bound, %lld cache probes, %lld admissions refused",
+                 v, (long long)srb_n_[kSrbSteps], (long long)srb_n_[kSrbAhead], (long long)srb_n_[kSrbAdmitAhead],
+                 (long long)srb_n_[kSrbAged], (long long)srb_n_[kSrbProbe], (long long)srb_n_[kSrbRefused]);
+    }
+}
+
 /* ------------------------------------------------------------------ the step */
 const RadBatch* Scheduler::step() {
+    const uint64_t hn_t0 = hn_on_ ? hn_ns() : 0;   /* qfn-on-ds Q92: the step-host note (RADIANCE_LOG_STEP_HOST) */
     std::lock_guard<std::mutex> lk(mu_);
+    if (hn_on_) {
+        hn_ = HostNote{};
+        hn_.lock_ms = (double)(hn_ns() - hn_t0) / 1e6;
+    }
+    struct HnEnd {
+        Scheduler* s; uint64_t t0;
+        ~HnEnd() {
+            if (!s) return;
+            s->hn_.step_ms = (double)(hn_ns() - t0) / 1e6;
+            s->hn_.waiting = (int64_t)s->waiting_.size();
+            s->hn_.running = (int64_t)s->running_.size();
+            for (int k = 0; k < 3; ++k) s->hn_.agr[k] = s->agr_n_[k];
+        }
+    } hn_end{ hn_on_ ? this : nullptr, hn_t0 };
     /* A cycle opens here, so its head depth is chosen here (scheduler.h, draft_cycle). */
     draft_cycle();
 
@@ -3608,7 +3904,7 @@ const RadBatch* Scheduler::step() {
             }
             if (fit) break;
             if (evict_rounds < kEvictRounds && pc_ && cfg_.prefix_cache &&
-                pc_->evict(kEvictBlocks) > 0) {
+                pc_evict(kEvOverdue, kEvictBlocks) > 0) {
                 ++evict_rounds;
                 continue;
             }
@@ -3812,6 +4108,8 @@ const RadBatch* Scheduler::step() {
      * step a chunk (the stall a per-sequence K pin would save). */
     int32_t bi_lone_slot = -1;
     bool bi_lone_admit = false;
+    bool bi5_turn = false;   /* lever TLR: this step is BI5's decode rows' turn */
+    srb_wslot_ = -1;   /* lever SRB: this step's choice only (a step under another chunking, or after a POST, carries none) */
     if (bi_chunk_ == 5) {
         bool any_dec = false;
         for (int32_t sl : running_) {
@@ -3824,15 +4122,21 @@ const RadBatch* Scheduler::step() {
         }
         const bool admit_possible = !waiting_.empty() && !free_cards_.empty() &&
                                     (int64_t)running_.size() < cfg_.max_seqs;
+        /* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58): the lone step's prompt by the fewest rows left, a
+         * waiting one admitted ahead where its rows past the cache's hit are fewer (srb_choose); 0 = the FIFO choice above */
+        if (const int srb = fn4::sched_bi_srpt(); srb > 0 && !lanes_ && !(any_dec && bi_lone_last_) &&
+                                                  (bi_lone_slot >= 0 || admit_possible))
+            srb_choose(admit_possible, srb, bi_lone_slot);
         if (any_dec && bi_lone_last_) {
             hold_prefill = true;            /* the decode rows' turn: no prefill, no admission */
             bi_lone_slot = -1;
             bi_lone_last_ = false;
+            bi5_turn = true;
         } else if (bi_lone_slot >= 0 || admit_possible) {
             bi_lone_admit = bi_lone_slot < 0;
             bi_lone_last_ = any_dec;
             const Request* pr = bi_lone_slot >= 0 ? reqs_[(size_t)bi_lone_slot]->req.get()
-                                                  : reqs_[(size_t)waiting_[0]]->req.get();
+                                                  : reqs_[(size_t)(srb_wslot_ >= 0 ? srb_wslot_ : waiting_[0])]->req.get();
             const int64_t plen = pr ? (int64_t)pr->prompt.size() : 0;
             span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || plen >= span_min_);
             budget = span_now_ ? cfg_.max_tok : geo_.shared_tok;
@@ -3925,6 +4229,11 @@ const RadBatch* Scheduler::step() {
         gate_tokens_ = (double)gate_rows_;
     }
 
+    /* qfn-on-ds lever TLR (fn4 sched_bi_ride, Qwen loop round 60, QUEUE Q120): in BI5's decode rows' turn, one running prompt
+     * whose alone piece is its LAST piece of at most N rows rides the turn (below, at the held-prefill branch) */
+    const int64_t tlr_rows = bi5_turn && !lanes_ ? (int64_t)fn4::sched_bi_ride() : 0;
+    bool tlr_used = false;
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
@@ -3978,7 +4287,48 @@ const RadBatch* Scheduler::step() {
             }
             else { bp = true; psk_ckpt(s, target, &ckpt); }   /* lever PSK design 2: a snapshot at a target only */
         }
+        /* lever TLR (fn4 sched_bi_ride): BI5's decode turn takes one prompt's LAST piece -- its alone piece exactly as its BI5
+         * lone step plans it (the span that step sets, the lone budget, plan_chunk's snapshot row; no lever PSK there either) --
+         * where it is at most N rows, fits the step's budget beside every decoder still to plan, and its blocks come without
+         * another sequence's. A fresh prompt only (no output to replay, no kept request, no replay end inside). Non-last
+         * pieces never ride: the step then carries the piece's rows as its lone step would and the decode rows as their own. */
+        bool tlr = false;
+        if (tlr_rows > 0 && prefill && hold_prefill && !bp && !tlr_used && s.keep_whole < 0 && r.output.empty() &&
+            target == (int64_t)r.prompt.size() && r.n_computed < (int64_t)r.prompt.size() && r.cr_end <= r.n_computed) {
+            const bool keep = span_now_;
+            span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || (int64_t)r.prompt.size() >= span_min_);
+            int64_t ck = -1;
+            const int64_t full = plan_chunk(r.n_computed, chunk_end(r, target), span_now_ ? cfg_.max_tok : geo_.shared_tok,
+                                            &ck, r.checkpoint_at, &r);
+            span_now_ = keep;
+            if (full > 0 && r.n_computed + full >= (int64_t)r.prompt.size()) {
+                int64_t dec_rows = 0;   /* the decoders behind it in the walk, each 1 + its deepest window */
+                for (size_t j = i + 1; j < running_.size(); ++j) {
+                    const SchedReq& q = *reqs_[(size_t)running_[j]];
+                    if (!q.req || !q.running) continue;
+                    const Request& qr = *q.req;
+                    if (qr.n_computed < (int64_t)qr.prompt.size() || qr.n_computed + 1 < q.seq_len()) continue;
+                    dec_rows += dec_row_tok;
+                }
+                if (full <= tlr_rows && full + dec_rows <= budget && kv_->can_grow(r.id, r.n_computed + full + dec_rows)) {
+                    want = full;
+                    ckpt = ck;
+                    tlr = true;
+                    tlr_used = true;
+                    ++tlr_n_[0];
+                } else {
+                    ++tlr_n_[1];
+                }
+                if (tlr_n_[0] + tlr_n_[1] - tlr_logged_ >= 2000 || (tlr && tlr_n_[0] == 1)) {   /* the first ride, then every 2,000 */
+                    tlr_logged_ = tlr_n_[0] + tlr_n_[1];
+                    RAD_INFO("fn4 sched_bi_ride %lld (Qwen loop lever TLR): %lld prompts' last pieces rode BI5's decode turn, %lld "
+                             "left to their lone step (over N rows, no room beside the decoders, or blocks)", (long long)tlr_rows,
+                             (long long)tlr_n_[0], (long long)tlr_n_[1]);
+                }
+            }
+        }
         if (bp) {
+        } else if (tlr) {
         } else if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
         /* fn4 BI chunking 5 / 6 (the Qwen line): a lone step holds its one prefill, nothing else */
         else if ((bi_chunk_ == 5 || bi6_lone) && (bi_lone_admit || (bi_lone_slot >= 0 && slot != bi_lone_slot))) { ++i; continue; }
@@ -4092,7 +4442,7 @@ const RadBatch* Scheduler::step() {
              * work done once, a running request is work in flight. Nothing else releases the
              * cache's references, so this also keeps publishing from leaking. */
             if (++evict_rounds <= kEvictRounds && pc_ && cfg_.prefix_cache &&
-                pc_->evict(kEvictBlocks) > 0)
+                pc_evict(kEvGrow, kEvictBlocks) > 0)
                 continue;
             /* tp8 prefill P0: chunks of this prompt run in other lanes (SchedReq::lent) and hold its window from its
              * committed end (the keep floor) to their end: its next chunk waits for their commit, which frees them,
@@ -4240,7 +4590,7 @@ const RadBatch* Scheduler::step() {
             int rounds = 0;
             bool got = true;
             while (kv_->ensure_from(r.id, r.n_computed + want, r.n_computed) < 0) {
-                if (++rounds > kEvictRounds || !cfg_.prefix_cache || !pc_ || pc_->evict(kEvictBlocks) <= 0) {
+                if (++rounds > kEvictRounds || !cfg_.prefix_cache || !pc_ || pc_evict(kEvNoa, kEvictBlocks) <= 0) {
                     got = false;
                     break;
                 }
@@ -4310,6 +4660,10 @@ const RadBatch* Scheduler::step() {
          * after the walk rather than cut at its front. */
         took_.clear();
         size_t at = 0;
+        struct HnWalk {
+            Scheduler* s; uint64_t t0;
+            ~HnWalk() { if (s) s->hn_.walk_ms = (double)(hn_ns() - t0) / 1e6; }
+        } hn_walk{ hn_on_ ? this : nullptr, hn_on_ ? hn_ns() : 0 };
         while (at < waiting_.size() &&
                (int64_t)plan_.e.size() < cfg_.max_seqs && (budget > 0 || noa_room() > 0)) {
             /* A step planned for one prefill holds that one (span_now_ above). */
@@ -4324,6 +4678,8 @@ const RadBatch* Scheduler::step() {
             if (noa_disp_ && !s.noa_starved) { ++at; continue; }
             /* tp8 loop P44 (fn4 sched_srf 2): a waiting prompt not ahead of the chosen one keeps its place */
             if (srf_holds(s)) { ++at; continue; }
+            /* qfn-on-ds lever SRB: a lone step that admits ahead asks the chosen prompt only (the rest keep their places) */
+            if (srb_wslot_ >= 0 && slot != srb_wslot_) { ++at; continue; }
             /* tp8 loop D55b (RADIANCE_SCHED_PUB_HOLD_MS): a running sibling is computing this prompt's head -- wait for it */
             if (pub_hold_us_ > 0 && pub_holds(s)) {
                 if (!s.pub_held) { s.pub_held = true; ++pub_hold_n_; }
@@ -4354,8 +4710,33 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             /* fn4 preempt_keep: a kept request rejoins at its own position once the pool holds its next verify; it waits
              * as a preempted request does (an overdue one holds the queue behind it) */
+            bool kfit = s.keep_whole >= 0 && preempted_can_prefill(s);
+            /* Qwen loop round 59 (FINDINGS TEST note 08:20, QUEUE Q118): an OVERDUE kept request the pool cannot take reclaims
+             * as admit_one does for an overdue preempted one -- the cache's entries, LRU first (its own chain is the newest:
+             * preempted_can_prefill's lookup just touched it). Before, the walk stopped at it with no reclaim, the step's overdue
+             * reclaim above stopped as soon as ANY overdue waiter fitted (a kept request behind it), and an engine with nothing
+             * running never stepped again (gpu02 kow30: S3 kept at 173,741 tokens, its chain trimmed away, 0 running / 2
+             * waiting for 7 min 54 s). Where the pool is idle and it still does not fit, waiting changes nothing: the keep goes
+             * (a recompute, as rejoin_kept's own fallback) and admit_one below decides as for any preempted request (its own
+             * reclaim; failed where the empty pool cannot hold it). RADIANCE_SCHED_KEEP_RECLAIM=0: the walk as before. */
+            if (s.keep_whole >= 0 && !kfit && kr_on_ && preempt_wait_overdue(s)) {
+                int rounds = 0;
+                while (!kfit && rounds < kEvictRounds && cfg_.prefix_cache && pc_ && pc_evict(kEvPreWait, kEvictBlocks) > 0) {
+                    ++rounds;
+                    kfit = preempted_can_prefill(s);
+                }
+                if (rounds > 0) ++kr_n_[0];
+                if (!kfit && pool_idle() && plan_.e.empty()) {
+                    RAD_WARN("fn4 preempt_keep: request %llu cannot rejoin on an idle pool (kept at %lld tokens, %lld of them "
+                             "whole; the pool cannot take its next verify after %d evict rounds): recomputed",
+                             (unsigned long long)s.req->id, (long long)s.req->n_computed, (long long)s.keep_whole, rounds);
+                    ++pk_n_[2];
+                    ++kr_n_[1];
+                    unkeep(s);
+                }
+            }
             if (s.keep_whole >= 0) {
-                if (!preempted_can_prefill(s)) {
+                if (!kfit) {
                     if (preempt_wait_overdue(s)) break;
                     ++at;
                     continue;
@@ -4378,9 +4759,15 @@ const RadBatch* Scheduler::step() {
             admit_full_ = 0;
             admit_next_step_ = false;
             const int as = admit_one(s, budget, bypass ? 0 : areserve, bypass ? bypass_now_ : 0);
+            if (hn_on_) ++hn_.asked;
             /* tp8 loop P44: the KV valve for a chosen waiting prompt the pool cannot take now (it chooses nobody until admitted) */
             if (as == RAD_OK) s.srf_kv = false;
             else if (as == kAdmitWait && srf_on_ && slot == srf_wslot_) s.srf_kv = true;
+            /* qfn-on-ds lever SRB: the pool refused the chosen prompt -- the next choices pass it over for a while */
+            if (as != RAD_OK && srb_wslot_ >= 0 && slot == srb_wslot_) {
+                s.srb_refused_us = srb_clock_ ? srb_clock_() : mono_us();
+                ++srb_n_[kSrbRefused];
+            }
             /* lever DST: a request the bypass does not take keeps its place for the next ordinary admission, and the
              * walk asks the one behind it */
             if (bypass && as != RAD_OK) { ++at; continue; }
@@ -4393,6 +4780,13 @@ const RadBatch* Scheduler::step() {
              * waited. */
             if (as == kAdmitWait) {
                 if (s.req->state == ReqState::Preempted && preempt_wait_overdue(s)) break;
+                /* qfn-on-ds Q92 lever AGR bit 2: a FRESH prompt's kAdmitWait is the room gate's (admit_one); the room the
+                 * pool lacks for it is not asked again for every request behind it, and none of them takes the room it
+                 * waits for (first come, first seated, as vLLM's waiting queue) */
+                if ((agr_ & 2) && s.req->state != ReqState::Preempted) {
+                    ++agr_n_[1];
+                    break;
+                }
                 ++at;
                 continue;
             }
@@ -4572,7 +4966,7 @@ const RadBatch* Scheduler::step() {
         for (StepEntry& e : plan_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
             e.dev_out = e.produces_token ? row : -1;
-            e.dev_aux = e.n_spec;
+            e.dev_aux = e.n_spec | (fal_eos_bit && e.req && e.req->ignore_eos ? (int32_t)kAdvAuxKeepEos : 0);
             if (e.produces_token) row += 1 + e.n_spec;
             k += e.n_tokens;
         }
@@ -4850,6 +5244,22 @@ bool Scheduler::ends_every_request() const {
     return !plan_.e.empty();
 }
 
+/* lever AHA: a running sequence past its prompt (it decodes) that the in-flight step does not carry */
+bool Scheduler::ahead_leaves_out() const {
+    aha_mark_.assign(reqs_.size(), 0);
+    for (const StepEntry& e : plan_.e)
+        if (e.slot >= 0 && (size_t)e.slot < aha_mark_.size()) aha_mark_[(size_t)e.slot] = 1;
+    for (int32_t slot : running_) {
+        if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) continue;
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running || s.req->state != ReqState::Running || s.lent > 0) continue;
+        const Request& r = *s.req;
+        if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;   /* a prefill */
+        if (!aha_mark_[(size_t)slot]) return true;
+    }
+    return false;
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes -- unless lever CBH holds every
@@ -4872,6 +5282,18 @@ const RadBatch* Scheduler::step_next_locked() {
     if (bi_chunk_ == 6 && (bi6_plan_lone_ || bi6_wait_)) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
+    /* qfn-on-ds lever AHA (fn4 sched_ahead_all, Qwen loop round 59, QUEUE Q119): the step issued ahead carries the in-flight
+     * step's sequences only, so a DECODING sequence that step left out stays out for as long as steps are issued ahead --
+     * BI chunking 5's lone step for a request's last piece (it produces a token) is followed by that request's decode ALONE,
+     * step after step, while every other decoder waits (agx21: 105 runs after the same slot's lone piece, 6,804 one-sequence
+     * steps, 82 s of 1,730; agx20 166 runs, 150 s; the longest 1,487 steps). With the switch such a step is planned in full
+     * (the decode rows' turn takes every decoder). */
+    if (fn4::sched_ahead_all() > 0 && ahead_leaves_out()) {
+        if (aha_n_++ % 4096 == 0)
+            RAD_INFO("fn4 sched_ahead_all: the step in flight leaves a decoding sequence out -- the next one planned in full "
+                     "instead of issued ahead (%lld so far)", (long long)aha_n_);
+        return nullptr;
+    }
     /* The hybrid (scheduler.h): a sequence whose lookup matches long on the text committed so far
      * verifies the lookup's proposal next, which only step() can plan, after the commit. */
     if (hybrid_on() && draft_.head_runs()) {
@@ -4955,7 +5377,7 @@ const RadBatch* Scheduler::step_next_locked() {
         for (StepEntry& e : plan_next_.e) {
             e.dev_tok = (int32_t)(k + e.n_tokens - 1 - e.n_spec);
             e.dev_out = row;
-            e.dev_aux = e.n_spec;
+            e.dev_aux = e.n_spec | (fal_eos_bit && e.req && e.req->ignore_eos ? (int32_t)kAdvAuxKeepEos : 0);
             row += 1 + e.n_spec;
             k += e.n_tokens;
         }
@@ -5467,9 +5889,13 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         cu += e.n_tokens;
 
         if ((int)serial_.size() >= max) continue;
-        if (e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
-        SchedReq& s = *reqs_[(size_t)e.slot];
-        if (!s.req || s.req->state != ReqState::Running || !s.running) continue;
+        /* qfn-on-ds lever BGL: a piece another lane lent this one (a newcomer the BG lane runs whole) owes its history here --
+         * this step holds its rows' hidden states -- and drafts from its first token; its SchedReq is its home's */
+        SchedReq* sh = e.home >= 0 ? home_req(e.home, e.seq) : nullptr;
+        if (e.home >= 0 && !sh) continue;
+        if (!sh && (e.slot < 0 || (size_t)e.slot >= reqs_.size())) continue;
+        SchedReq& s = sh ? *sh : *reqs_[(size_t)e.slot];
+        if (!s.req || s.req->state != ReqState::Running || (!s.running && !sh)) continue;
         Request& r = *s.req;
 
         /* The verified positions are the entry's last 1 + n_spec. Round 1 continues from the last
@@ -5534,6 +5960,7 @@ int Scheduler::serial_begin(int* rounds, SerialRow* out, int max) {
         m.lead       = (int32_t)lead;
         m.base_pos   = head_max;
         m.draft_idx  = can_draft ? n_draft_rows : -1;
+        m.home       = e.home;   /* qfn-on-ds lever BGL */
         serial_.push_back(m);
 
         if (can_draft) {
@@ -5586,6 +6013,7 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
         e.req      = rq;
         e.seq      = m.seq;
         e.slot     = m.slot;
+        e.home     = m.home;   /* qfn-on-ds lever BGL: a lent entry's history / rounds, its request in the home's table */
         e.card     = m.card;
         e.n_tokens = round == 0 ? m.hist_n : 1;
         /* A round's position is the card's; the host stages the furthest it can be, which every
@@ -5645,8 +6073,11 @@ const RadBatch* Scheduler::serial_batch(int round, int step) {
 void Scheduler::serial_end(int rounds_done) {
     std::lock_guard<std::mutex> lk(mu_);
     for (const SerialSeq& m : serial_) {
-        if (m.slot < 0 || (size_t)m.slot >= reqs_.size()) continue;
-        SchedReq& s = *reqs_[(size_t)m.slot];
+        /* qfn-on-ds lever BGL: a lent entry's watermark is its home's */
+        SchedReq* sh = m.home >= 0 ? home_req(m.home, m.seq) : nullptr;
+        if (m.home >= 0 && !sh) continue;
+        if (!sh && (m.slot < 0 || (size_t)m.slot >= reqs_.size())) continue;
+        SchedReq& s = sh ? *sh : *reqs_[(size_t)m.slot];
         if (!s.req || s.req->id != m.seq) continue;
         const int64_t filled = m.dev ? s.req->n_computed
                                      : m.hist_pos + m.hist_n;
@@ -5828,7 +6259,21 @@ int Scheduler::parse_short_tiers(const char* s, std::vector<std::pair<int64_t, i
 }
 
 const Request* Scheduler::block_req(const BlockSeq& d) const { return live_req(d.slot, d.seq); }
-const Request* Scheduler::serial_req(const SerialSeq& m) const { return live_req(m.slot, m.seq); }
+const Request* Scheduler::serial_req(const SerialSeq& m) const {
+    if (m.home >= 0) {   /* qfn-on-ds lever BGL: a lent entry's request lives in its home lane */
+        const SchedReq* s = home_req(m.home, m.seq);
+        return s && s->req && s->req->id == m.seq ? s->req.get() : nullptr;
+    }
+    return live_req(m.slot, m.seq);
+}
+SchedReq* Scheduler::home_req(int home, uint64_t seq) const {
+    if (!lanes_ || home < 0 || home == lane_) return nullptr;
+    const Scheduler* h = lanes_->lane(home);
+    if (!h) return nullptr;
+    const auto it = h->by_id_.find(seq);
+    if (it == h->by_id_.end() || (size_t)it->second >= h->reqs_.size()) return nullptr;
+    return h->reqs_[(size_t)it->second].get();
+}
 
 const RadBatch* Scheduler::block_context(int step) {
     std::lock_guard<std::mutex> lk(mu_);

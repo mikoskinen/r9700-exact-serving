@@ -68,10 +68,20 @@ namespace arch {
  * of 7), so without the pin a row's bytes move with its sequence's depth. At a depth-3 start every full-depth row keeps
  * today's bytes; rows below depth 3 (a cut window) and above it take the depth-3 law (a new reference there). Dense rows
  * keep 5's launches (their law gives one-tile segments at any depth up to 4 at gqa 6). The enabler of a depth rule. */
+/* 7 (24.11.2026, Qwen loop round 63, lever DSP; FINDINGS TEST note 13:27 / DEV answer 13:52: the KOW cell's A beside load
+ * differs from A alone at token 105 on the all-VRAM hero form): as 6, and every DECODE sequence of an ordinary pass takes the
+ * SPARSE path through the pinned law at every context -- alone (a dense one-sequence step too), beside load, in a dense step
+ * and in a staged MIXED pass whose reach is dense. Up to 6 a decode sequence's path is its verify BLOCK's (q rows from
+ * ctx_len c: sparse iff q == 1 or bound(c) + q > qsa_exact_to), not its rows': a q = 5 block from c <= 1,024 is dense, from
+ * 1,025 sparse, so a position in 1,025..1,028 (and a cut window's q <= 3 block at 1,025..2,048) takes either path by where
+ * its block starts -- and the blocks follow the drafts' acceptance, which a draft pass beside a longer sequence changes (draft
+ * passes keep the step's path, below). Dense and sparse split a row's keys by different laws (LONGPROMPT.md L1: equal up to
+ * 1,024 keys, different past them). Under 7 a decode row's path is a function of nothing but itself. Prefill sequences keep
+ * 4's alone choice; draft passes are unchanged. Changes the bytes of decode rows the dense path served (alone too). */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
                                    const int v = e && *e ? std::atoi(e) : 0;
-                                   return v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   return v >= 7 ? 7 : v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 PF probe ATP (Qwen loop round 9, 21.11.2026, QUEUE Q8's upper-bound read; qwen4exp switch sp_route bit 64): every
@@ -96,6 +106,16 @@ inline std::atomic<int>& fn4_kvsbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_KVS_BI");
                                    const int v = e && *e ? std::atoi(e) : 0;
                                    return v < 0 ? 0 : v > 3 ? 3 : v; }()};
+    return f;
+}
+/* lever RIDE's resolve destination (Qwen loop round 61, FINDINGS TEST note 10:58 -- agx38bt's BITRACE: a rider's first
+ * divergence is L03.h_mix at the first row of a block first resolved IN a riding pass): a riding pass is staged, so
+ * kv_cache() names the STAGE, and kv_resolve copied a missed block's mirror bytes to stage row `slot` while its maps named
+ * the RING slot -- the rider (and every later ring pass) attended on that slot's previous bytes. The resolve now names the
+ * ring (kv_cache_ring). RADIANCE_FN4_KVS_RIDE_STAGEDST=1 = the form before (the defect: host case negative control). */
+inline std::atomic<int>& fn4_ride_stagedst_flag() {
+    static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_KVS_RIDE_STAGEDST");
+                                   return e && *e && *e != '0' ? 1 : 0; }()};
     return f;
 }
 /* fn4 att_bi 4: the max_ctx_len a step of this one sequence would carry -- core/sched/batch.cpp's
@@ -763,7 +783,7 @@ inline void AttnGatedFP8::store_cache(RadCtx* c, const RadKVGroupBatch* kvb,
     /* fn4 kvs_apart: on a stage funded beside the ring the streamed store writes the RING (resident blocks) and the
      * mirror; the stage takes this step's tokens at identity below. Aliased (sv 1), the operand is the active view. */
     RAD_ISSUE(c, op_kv_stream,
-              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
+              brows(w.k, T), brows(w.v, T), praw(slot, RAD_I32, T), sv >= 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
               praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
     if (staged) store_stage_identity(c, slot, T);
 }
@@ -868,7 +888,7 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                     brows(w.qg, T), brows(w.k, T), RAD_B(w.cos_sin), rope_pos1(batch, T),
                     RAD_W(w_q_norm), RAD_W(w_k_norm),
                     brows(w.q, T), brows(w.k, T), RAD_NONE,
-                    brows(w.v, T), praw(slot, RAD_I32, T), sv == 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
+                    brows(w.v, T), praw(slot, RAD_I32, T), sv >= 2 ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
                     praw(L.res, RAD_I32, L.blocks), praw2(L.host, RAD_U8, L.blocks, L.bbytes));
         if (staged) store_stage_identity(c, slot, T);
     } else if (fused_kv) {
@@ -915,8 +935,14 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         (st && st->block_bytes > 0) ? st->host_layer_stride / st->block_bytes : 0;
     const bool ring_addressed = st && st->slots > 0 && st_blocks > 0 && st->slots < st_blocks;
     const bool ring_bound = ring_addressed && !kv_stage_layer(c, kv, kvb, layer);
+    /* Qwen loop Form A step (1), lever RIDE (RADIANCE_FN4_KVS_RIDE, core/kvstream/plan.h): a staged MIXED pass whose stage
+     * holds only the prefill sequences' blocks (rad_kv_stage_layer answers 3) -- its decode rows resolve their selection on
+     * the ring and attend on the ring operand (kept current by the stores beside an apart stage), in their alone launches */
+    const bool ride = ring_addressed && !ring_bound && kv_stage_wait_view(c, kv, kvb, layer) == 3;
+    /* lever RIDE: a riding pass is sparse at every reach (its decode rows are ring-bound as alone; the per-sequence launches
+     * below give each prefill sequence its alone path); the selection is emitted every step (QsaBlock emit_sel) */
     const bool    sparse = qsa_sel && qsa_sequ &&
-                           (ring_bound || T == batch->n_seq || qsa_exact_to <= 0 ||
+                           (ring_bound || ride || T == batch->n_seq || qsa_exact_to <= 0 ||
                             reach > qsa_exact_to);
     const bool gated = sparse && op_attn_gq;
     /* A streamed group's selection, per launch: make the rows' blocks resident and rewrite `sel`
@@ -930,6 +956,19 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
         kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
                          brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows);
     };
+    /* lever RIDE: a decode sequence's rows of a riding pass, on the ring although the layer is staged -- a missed block is
+     * copied into the RING (the pass's active view is the stage; fn4_ride_stagedst_flag 1 = the defect: into the stage) */
+    auto resolve_ring = [&](int64_t off, int64_t rows) {
+        if (!res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || rows <= 0) return;
+        kv_resolve_issue(c, op_resolve, res_l, brow_slice(qsa_sel, off, rows, qsa_topk + 1),
+                         brow_slice(qsa_nsel, off, rows, 1), kv, layer, rows,
+                         fn4_ride_stagedst_flag().load(std::memory_order_relaxed) == 0);
+    };
+    if (ride && (!op_resolve || !res_l.host || res_l.blocks <= 0 || res_l.slots <= 0 || !qsa_sel || !qsa_nsel)) {
+        rad_step_fail(c, "kv streaming: lever RIDE (RADIANCE_FN4_KVS_RIDE): a riding pass's decode rows need the ring's "
+                         "kv_resolve and the sparse selection, which this layer does not have");
+        return;
+    }
     /* fn4 att_bi (12.11.2026, 193's trace: L03.att first-differing in 12 of 20 pf probes): the sparse / dense choice is the
      * step's (reach = the longest sequence), so a short sequence beside a long one takes the sparse path where it alone takes
      * the dense one. Under att_bi each sequence takes the path its alone step would: sparse (gated, per row, its rows only)
@@ -937,15 +976,22 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * the gate over its rows. Only when the step mixes both; a pipelined piece pass and a ring-bound pass keep today's. */
     const int abf0 = fn4_attbi_flag().load(std::memory_order_relaxed);
     /* fn4 kvs_bi bit 1: a streamed group's decode sequences in their alone (sparse, own-launch) form, ring or stage */
-    const bool kvs_alone = ring_addressed && (fn4_kvsbi_flag().load(std::memory_order_relaxed) & 1) != 0;
+    const bool kvs_alone = ring_addressed && ((fn4_kvsbi_flag().load(std::memory_order_relaxed) & 1) != 0 || ride);
     /* att_bi 5: a dense step through the same per-sequence launches (its 1-row sequences sparse, as alone; the selection
      * is computed every step); not with a streamed group (the dense path stages the layer itself) */
     const bool dense_bi = !sparse && abf0 >= 5 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_bi &&
                           !(kvb && kvb->stream);
+    /* att_bi 7 (lever DSP): a step the reach left dense that holds a decode sequence takes the per-sequence launches too --
+     * a one-sequence decode step (through lone6 below), a dense step without op_attn_bi's declare, a staged MIXED pass of a
+     * streamed group (staged once per pass by its store's kv_stage_wait: the launches read the stage at block ids, as a
+     * staged sparse MIXED pass's do) -- where every decode sequence is sparse (sp below) */
+    int64_t Ddsp = 0, DTdsp = 0;
+    if (abf0 >= 7) batch_split(batch, &Ddsp, &DTdsp);
+    const bool dsp = abf0 >= 7 && !sparse && Ddsp > 0 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_gq_pin;
     /* att_bi 6: a SPARSE decode step of one sequence (alone) through the same launches, so its rows take the pinned law
-     * as beside load; its dense steps and every prefill stay on today's path */
-    const bool lone6 = abf0 >= 6 && batch->n_seq == 1 && gated && op_attn_gq_pin;
-    if ((gated || dense_bi) && abf0 > 0 && (batch->n_seq > 1 || lone6) && batch->draft_pass == 0 &&
+     * as beside load; its dense steps and every prefill stay on today's path (7: its dense steps too) */
+    const bool lone6 = abf0 >= 6 && batch->n_seq == 1 && (gated || dsp) && op_attn_gq_pin;
+    if ((gated || dense_bi || dsp) && abf0 > 0 && (batch->n_seq > 1 || lone6) && batch->draft_pass == 0 &&
         table && used && kvb && kvb->seqused_h && (!ring_bound || kvs_alone) && qsa_exact_to > 0 && op_attn && op_gq &&
         !(pieces && pieces->cuts(T))) {
         int64_t D = 0, DT = 0;
@@ -963,8 +1009,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 sp[s2] = fn4_attbi_sparse(abf0, (int64_t)kvb->seqused_h[s2], nr[s2], qsa_exact_to, g.max_ctx);
                 /* kvs_bi bit 1: alone, a streamed decode sequence is ring-bound, hence sparse at every context */
                 if (kvs_alone && s2 < D) sp[s2] = 1;
-                /* att_bi 6 alone: entered only where the step took the sparse path */
+                /* att_bi 6 alone: entered only where the step took the sparse path (7: or held a decode sequence) */
                 if (lone6) sp[s2] = 1;
+                /* att_bi 7 (lever DSP): a decode sequence sparse at every context, its path its rows' own */
+                if (abf0 >= 7 && s2 < D) sp[s2] = 1;
             }
             /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
              * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a
@@ -1014,9 +1062,9 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         int64_t e2 = s2 + 1;
                         while (e2 < D && sp[e2] && (e2 - s2 + 1) * qd <= kGqBiRows) ++e2;
                         const int64_t rows = (e2 - s2) * qd;
-                        resolve_sel(a0, rows);
+                        if (ride) resolve_ring(a0, rows); else resolve_sel(a0, rows);
                         RAD_ISSUE_N(c, op_one, 1,
-                                    brow_slice(w.q, a0, rows, qw), kv_cache(kv, layer),
+                                    brow_slice(w.q, a0, rows, qw), ride ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
                                     brow_slice(qsa_sel, a0, rows, qsa_topk + 1),
                                     brow_slice(qsa_sequ, a0, rows, 1),
                                     RAD_NONE, RAD_NONE, RAD_NONE,
@@ -1028,11 +1076,12 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                         continue;
                     }
                     if (sp[s2]) {
+                        const bool on_ring = ride && s2 < D;   /* lever RIDE: a decode sequence of a riding pass */
                         for (int64_t off = a0; off < a0 + n; off += chunk) {
                             const int64_t rows = (a0 + n - off) < chunk ? (a0 + n - off) : chunk;
-                            resolve_sel(off, rows);
+                            if (on_ring) resolve_ring(off, rows); else resolve_sel(off, rows);
                             RAD_ISSUE_N(c, op_attn_gq, 1,
-                                        brow_slice(w.q, off, rows, qw), kv_cache(kv, layer),
+                                        brow_slice(w.q, off, rows, qw), on_ring ? kv_cache_ring(kv, layer) : kv_cache(kv, layer),
                                         brow_slice(qsa_sel, off, rows, qsa_topk + 1),
                                         brow_slice(qsa_sequ, off, rows, 1),
                                         RAD_NONE, RAD_NONE, RAD_NONE,
@@ -1060,6 +1109,18 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 if (op_add) RAD_ISSUE(c, op_add, brows(w.x, T), brows(w.h.x, T), brows(w.x, T));
                 return;
             }
+        }
+    }
+    /* lever RIDE fails closed: a riding pass's decode rows have no blocks on the stage, so every other path would read them
+     * there */
+    if (ride) {
+        int64_t Dr = 0, DTr = 0;
+        batch_split(batch, &Dr, &DTr);
+        if (Dr > 0) {
+            rad_step_fail(c, "kv streaming: lever RIDE (RADIANCE_FN4_KVS_RIDE): a riding pass did not take the per-sequence "
+                             "attention (fn4 att_bi > 0 with the gated sparse path), so its decode rows would read unstaged "
+                             "blocks");
+            return;
         }
     }
     /* A piece at a time where the caller takes the all-reduce that way (ArPieces). On the gated

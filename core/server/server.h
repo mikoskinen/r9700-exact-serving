@@ -455,6 +455,14 @@ private:
     std::atomic<int64_t> speech_sessions_{0};
     std::atomic<bool>    stopping_{false};
     std::atomic<bool>    stuck_told_{false};   /* the stuck device's E line is out (handle_ping) */
+    /* qfn-on-ds lever RPF (Qwen loop round 26, QUEUE Q47; start env RADIANCE_RPF=1, unset = off): after an OpenAI chat reply
+     * of one choice that ends in tool calls, the warm request rpf_warm_body (oai.h) is served in-process on a thread of its
+     * own, not waited for, as cc21x's client did it -- the reply is prefilled while the client runs its tools. stop() waits
+     * for the live ones (they see `stopping_` as a closed peer and cancel). */
+    bool                 rpf_ = false;
+    std::atomic<int>     rpf_live_{0};
+    std::atomic<int64_t> rpf_sent_{0};
+    void rpf_after(const std::string& body, const ParsedMessage& m, const std::string& rid);
     int64_t              started_at_ = 0;
     /* Seconds from the top of Engine::start() to the moment the server began listening; 0 until
      * note_ready(). */

@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -2801,6 +2802,51 @@ int parse_rerank_request(const std::string& body, const OaiDeps& d, const OaiLim
     return RAD_OK;
 }
 
+/* ================================================================== lever RPF (oai.h) */
+
+int rpf_warm_body(const std::string& body, const ParsedMessage& m, std::string* out) {
+    if (m.tool_calls.empty() || m.open_call) return -1;
+    for (const auto& t : m.tool_calls)
+        if (t.id.empty() || t.name.empty()) return -1;
+    json b = json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (!b.is_object()) return -1;
+    auto ms = b.find("messages");
+    if (ms == b.end() || !ms->is_array()) return -1;
+    if (auto n = b.find("n"); n != b.end() && !(n->is_number_integer() && n->get<int64_t>() == 1)) return -1;
+    /* the client's own next prompt, cc_sim's append_turn: role, content, reasoning_content (when the reply has it), tool_calls */
+    json am = json::object();
+    am["role"] = "assistant";
+    am["content"] = m.content;
+    if (!m.reasoning.empty()) am["reasoning_content"] = m.reasoning;
+    json tcs = json::array();
+    for (const auto& t : m.tool_calls) {
+        json f = json::object();
+        f["name"] = t.name;
+        f["arguments"] = t.arguments;
+        json c = json::object();
+        c["id"] = t.id;
+        c["type"] = "function";
+        c["function"] = std::move(f);
+        tcs.push_back(std::move(c));
+    }
+    am["tool_calls"] = std::move(tcs);
+    ms->push_back(std::move(am));
+    for (const auto& t : m.tool_calls) {
+        json tm = json::object();
+        tm["role"] = "tool";
+        tm["tool_call_id"] = t.id;
+        tm["content"] = "";
+        ms->push_back(std::move(tm));
+    }
+    for (const char* k : { "stream", "stream_options", "max_completion_tokens", "logprobs", "top_logprobs", "n",
+                           "ignore_eos", "min_tokens" })
+        b.erase(k);
+    b["max_tokens"] = 1;
+    b["stream"] = false;
+    *out = b.dump();
+    return 0;
+}
+
 /* ================================================================== responses */
 
 static json tool_calls_json(const std::vector<ToolCall>& tcs) {
@@ -2863,6 +2909,34 @@ json timings_json(const TimingsOut& t) {
     return o;
 }
 
+/* RADIANCE_SPEC_DECODE_METRICS=1 (Qwen loop round 46, QUEUE Q88: AgentX): the per-request speculative-decoding record at
+ * the response root as vLLM's --per-request-spec-decode-metrics writes it (metrics.speculative_decoding: num_spec_steps,
+ * num_draft_tokens, num_accepted_draft_tokens, mean_acceptance_length = 1 + accepted / steps, draft_acceptance_rate =
+ * accepted / drafted, acceptance_histogram = steps by accepted count 0..num_spec_tokens, num_spec_tokens = the most drafts
+ * a step of this request carried), on the non-streamed body and the streamed usage chunk. Unset: nothing is added. */
+static bool spec_metrics_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("RADIANCE_SPEC_DECODE_METRICS");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+
+static json spec_decode_json(const TimingsOut& t) {
+    const int k = std::min(std::max(t.spec_max, 0), 16);
+    json h = json::array();
+    for (int j = 0; j <= k; ++j) h.push_back(t.spec_hist[j]);
+    json o;
+    o["num_spec_steps"]            = t.spec_steps;
+    o["num_draft_tokens"]          = t.draft_n;
+    o["num_accepted_draft_tokens"] = t.draft_n_accepted;
+    o["mean_acceptance_length"]    = t.spec_steps > 0 ? 1.0 + (double)t.draft_n_accepted / (double)t.spec_steps : 1.0;
+    o["draft_acceptance_rate"]     = t.draft_n > 0 ? (double)t.draft_n_accepted / (double)t.draft_n : 0.0;
+    o["acceptance_histogram"]      = std::move(h);
+    o["num_spec_tokens"]           = k;
+    return o;
+}
+
 /* OpenAI's completion object of type `object` around `choices`, as JSON text. */
 static std::string completion_object(const OaiRequest& r, const char* object, json choices,
                                      const UsageOut& u, const TimingsOut& t) {
@@ -2875,6 +2949,7 @@ static std::string completion_object(const OaiRequest& r, const char* object, js
     o["choices"] = std::move(choices);
     o["usage"] = usage_json(u);
     if (t.valid) o["timings"] = timings_json(t);
+    if (t.valid && spec_metrics_on()) o["metrics"]["speculative_decoding"] = spec_decode_json(t);
     return o.dump();
 }
 

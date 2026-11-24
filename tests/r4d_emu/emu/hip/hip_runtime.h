@@ -251,6 +251,7 @@ inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }   /* v_rsq_f32 is w
 /* The device's fast exponential is not bit-exact to expf; here it is expf, so a test compares two
  * kernels that both take it, never a kernel against a host value of it. */
 inline float __expf(float x) { return std::exp(x); }
+inline float __logf(float x) { return std::log(x); }   /* qfn-on-ds lever EPD's r4d_emu_gdnepd (the update's softplus) */
 inline unsigned __float_as_uint(float f) { unsigned u; std::memcpy(&u, &f, 4); return u; }
 inline float __int_as_float(int u) { float f; std::memcpy(&f, &u, 4); return f; }
 inline int __float_as_int(float f) { int u; std::memcpy(&u, &f, 4); return u; }
@@ -378,6 +379,8 @@ inline double __longlong_as_double(long long u) { double d; std::memcpy(&d, &u, 
 #define __builtin_amdgcn_wave_barrier() ((void)emu_ballot(true))
 /* v_exp_f32: 2^x within an ulp on the card; exp2 here (no test compares it with a host value) */
 #define __builtin_amdgcn_exp2f(x) std::exp2((float)(x))
+/* v_rcp_f32: 1 ulp on the card; the division here (qfn-on-ds lever EPD's r4d_emu_gdnepd compares two kernel forms, not a host value) */
+#define __builtin_amdgcn_rcpf(x) (1.0f / (float)(x))
 /* a system-scope fence orders nothing more between fibers on one thread */
 inline void __threadfence_system() {}
 /* every copy completes before it returns, as every launch does */

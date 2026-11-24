@@ -182,6 +182,108 @@ __device__ __forceinline__ int kv_compact_rot(int h0, int slots, int* out, int c
     return total;
 }
 
+/* fn4 kvs_fix (Qwen loop round 54, QUEUE Q105, lever KVX): kv_compact_rot's list with an early stop and coalesced reads. The
+ * rotated positions r = 0 .. slots-1 (slot q = (h0 + r) mod slots) go in windows of kThreads * kWinU, position
+ * r = base + u * kThreads + tid of window `base`, so a wave reads 32 adjacent slots a load and the window's order is
+ * (u, wave, lane) = r ascending; a window's accepted slots get their list positions from the waves' ballots and one prefix
+ * over the window's kWinU * 32 wave counts. The first `cap` accepted slots in rotated order go to out[0 .. cap) -- the same
+ * list as kv_compact_rot's -- and the walk stops after the window in which the running count reaches cap. Returns the count
+ * over the windows walked, the same in every thread: the full pass's count when that is below cap, and >= cap exactly when
+ * the full pass's is. Its callers read the return only as min(n, cap) and n >= cap (4b's rotations), so their outcome is
+ * kv_compact_rot's while the pass stops near the hand: a CLOCK rotation that needs a few victims no longer reads the whole
+ * ring twice. s_cnt / s_off: kThreads ints each (kWinU * 32 + 1 used). */
+constexpr int kWinU = 4;
+template <class P>
+__device__ __forceinline__ int kv_compact_win(int h0, int slots, int* out, int cap, int tid, int* s_cnt, int* s_off,
+                                              P pred) {
+    constexpr int NW = kThreads / 32;
+    const int lane = tid & 31, wv = tid >> 5;
+    int total = 0;
+    for (int base = 0; base < slots; base += kThreads * kWinU) {
+        bool hit[kWinU];
+        int qq[kWinU];
+#pragma unroll
+        for (int u = 0; u < kWinU; ++u) {
+            const int r = base + u * kThreads + tid;
+            int q = h0 + r;
+            if (q >= slots) q -= slots;
+            qq[u] = q;
+            hit[u] = r < slots && pred(q);
+        }
+        unsigned bal[kWinU];
+#pragma unroll
+        for (int u = 0; u < kWinU; ++u) {
+            bal[u] = (unsigned)__builtin_amdgcn_ballot_w32(hit[u]);
+            if (lane == 0) s_cnt[u * NW + wv] = __builtin_popcount(bal[u]);
+        }
+        __syncthreads();
+        if (tid < kWinU * NW) {
+            int s = 0;
+            for (int i = 0; i < tid; ++i) s += s_cnt[i];
+            s_off[tid] = s;
+            if (tid == kWinU * NW - 1) s_off[kWinU * NW] = s + s_cnt[tid];
+        }
+        __syncthreads();
+        const int wt = s_off[kWinU * NW];
+        if (total < cap) {
+#pragma unroll
+            for (int u = 0; u < kWinU; ++u)
+                if (hit[u]) {
+                    const int pos = total + s_off[u * NW + wv] + __builtin_popcount(bal[u] & ((1u << lane) - 1u));
+                    if (pos < cap) out[pos] = qq[u];
+                }
+        }
+        total += wt;
+        __syncthreads();   /* the next window rewrites s_cnt / s_off */
+        if (total >= cap) break;
+    }
+    return total;
+}
+
+/* fn4 kvs_flat (Qwen loop round 52, QUEUE Q101; rad_fn4_switch("kvs_flat"), RADIANCE_FN4_KVS_FLAT at start; 0 = today):
+ * steps 2 and 7 over the flat entry space, kFlatU entries a thread in flight. The entry's block, or -1 when the entry is
+ * past the launch, past its row's nsel, or names no block of the id space (the row loop's `continue`s). */
+constexpr int kFlatU = 8;
+__device__ __forceinline__ int kv_flat_block(const int32_t* __restrict__ sel, const int32_t* __restrict__ nsel,
+                                             int e, int E, int pitch, int blocks) {
+    if (e >= E) return -1;
+    /* 32-bit: the shim takes this form only while M * pitch fits an int */
+    const int q = (int)((unsigned)e / (unsigned)pitch), i = e - q * pitch;
+    int n = nsel[q];
+    if (n < 0) n = 0;
+    if (n > pitch) n = pitch;
+    if (i >= n) return -1;
+    const int b = sel[e];
+    return (unsigned)b < (unsigned)blocks ? b : -1;
+}
+
+/* Qwen loop round 53 (QUEUE Q105, bench only): Stamp = thread 0 writes wall_clock64 (100 MHz) at the phase ends into the
+ * row scratch past the victim list (kv_st_base), and the call's counts after them; reachable only through r4d_kv_stamp_set
+ * (r4d_selftest --perfkvres): the served instances (Stamp false) compile as before. A phase without a barrier at its end gets
+ * one in the stamped instance only (KV_STB). Slots: 0 entry, 1 epoch, 2 lookups + hit count, 3 sort, 4 free count (3b),
+ * 5 free list (4a), 6 serial step 4, 7 4b check pass, 8 4b rotations + batch re-point, 9 4b end, 10 revert, 11 copies,
+ * 12 rewrite, 13 end; 16.. counts (claims, nmiss, placed, hits, free, kc, vser, lookups). */
+#define KV_ST(k)  do { if constexpr (Stamp) { if (tid == 0) kst[(k)] = kv_now(); } } while (0)
+#define KV_STB(k) do { if constexpr (Stamp) { __syncthreads(); if (tid == 0) kst[(k)] = kv_now(); } } while (0)
+__device__ __forceinline__ unsigned long long kv_now() {
+#ifdef R4D_EMU_HOST
+    return 0ull;   /* the host SIMT emulator has no clock; the stamped instance is bench-only */
+#else
+    return (unsigned long long)wall_clock64();
+#endif
+}
+__device__ __forceinline__ unsigned long long* kv_st_base(int32_t* miss_slot, int slots) {
+    return (unsigned long long*)(((uintptr_t)(miss_slot + 2LL * slots) + 7u) & ~(uintptr_t)7u);
+}
+
+/* fn4 kvs_fix (Qwen loop round 54, QUEUE Q105, lever KVX; Fix = true): the passes a call with a miss makes over EVERY ring slot,
+ * cut to one -- (1) step 3b's free count also counts the unstamped slots and their largest heat, which step 4b's check pass
+ * re-read after step 4: step 4 (kvs_vic on, 4b to follow) only stamps the slots it places, one each (identity or a free slot,
+ * both unstamped), and changes no other slot, so 4b's count = 3b's - s_placed and 4b's largest heat <= 3b's; 4b keeps its
+ * pass when 3b saw a heat above 3 (a state no legal call writes: kv_heat_up saturates at 3); (2) 4b's CLOCK rotations list
+ * their victims with kv_compact_win (above): the same victims in the same order, the walk stopping near the hand. The same
+ * placement, maps, heats, counters and rewritten selection as Fix = false in every state. */
+template <bool Flat, bool Stamp = false, bool Fix = false>
 __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     int32_t* __restrict__ sel, const int32_t* __restrict__ nsel,
     int32_t* __restrict__ res, int32_t* __restrict__ slot_block,
@@ -205,6 +307,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     __shared__ int s_wc;
 
     const int tid = (int)threadIdx.x;
+    unsigned long long* const kst = Stamp ? kv_st_base(miss_slot, slots) : nullptr;
+    (void)kst;
+    KV_ST(0);
 
     /* ---- 1. the epoch ---- */
     if (tid == 0) {
@@ -219,12 +324,64 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         s_free = 0;
         /* This call's miss count, cleared here: a call that claims nothing returns before the sweep. */
         ctl[2] = 0;
+        /* kvs_fix: step 3b's pass sums 4b's unstamped count and largest heat here */
+        if constexpr (Fix) { s_vavail = 0; s_vheat = 0; }
     }
     __syncthreads();
     const int epoch = s_epoch;
+    KV_ST(1);
 
     /* ---- 2. one lookup per entry; the map is its own set ---- */
     int lookups = 0, hits = 0;
+    if constexpr (Flat) {
+        /* fn4 kvs_flat (Qwen loop round 52): the same lookups over the flat entry space e = q * pitch + i, every thread
+         * busy and kFlatU entries a thread in flight -- their selection loads, then their map loads, then their stamps /
+         * claims, then the heat bumps and list appends. Today's loop runs row by row, one entry a thread a row, so at 64
+         * rows x 513 only 513 of 1,024 threads work and each walks 64 dependent load -> atomic chains. Every outcome is
+         * the row loop's: the map is the set (one CAS wins a block), a slot's first stamper alone bumps its heat (two
+         * entries of one thread on one slot: its atomics to one address land in program order), and the claim list is
+         * sorted in step 3, so the order of claims never reaches the placement. An entry cache value read before a
+         * same-thread claim reads -1 where the row loop read -2; step 7 reads the map for both. */
+        const int E = M * pitch;
+        for (int base = tid; base < E; base += kThreads * kFlatU) {
+            int bb[kFlatU], ss[kFlatU], ox[kFlatU], oc[kFlatU];
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) bb[u] = kv_flat_block(sel, nsel, base + u * kThreads, E, pitch, blocks);
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) ss[u] = bb[u] >= 0 ? res[bb[u]] : -3;
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                ox[u] = epoch;
+                oc[u] = 0;
+                if (bb[u] < 0) continue;
+                const int s = ss[u];
+                if (ecache > 0) s_ent[base + u * kThreads] = s;
+                if (s >= 0 && s < slots) ox[u] = atomicExch(&slot_state[(size_t)s * sst_ld], epoch);
+                else if (s == -1) oc[u] = atomicCAS(&res[bb[u]], -1, -2);
+            }
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                if (bb[u] < 0) continue;
+                const int s = ss[u];
+                if (s >= 0 && s < slots) {
+                    if (ox[u] != epoch) {
+                        slot_state[(size_t)s * sst_ld + 1] = kv_heat_up(slot_state[(size_t)s * sst_ld + 1]);
+                        ++hits;
+                    }
+                } else if (s == -1 && oc[u] == -1) {
+                    const int k = atomicAdd(&s_claims, 1);
+                    if (k < cap) s_list[k] = bb[u];
+                }
+            }
+        }
+        if (tid == 0)
+            for (int q = 0; q < M; ++q) {
+                int n = nsel[q];
+                if (n < 0) n = 0;
+                if (n > pitch) n = pitch;
+                lookups += n;
+            }
+    } else
     for (int q = 0; q < M; ++q) {
         int n = nsel[q];
         if (n < 0) n = 0;
@@ -271,6 +428,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         s_distinct = s_claims;
     }
     __syncthreads();
+    KV_ST(2);
 
     /* ---- 3. the canonical miss order: ascending block id ---- */
     const int claims = s_distinct;
@@ -368,6 +526,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         __syncthreads();
     }
 
+    KV_STB(3);
     /* ---- 3b. how many slots are free ---- */
     /* Free slots are taken before any resident block is evicted (step 4). One coalesced pass over
      * the slot maps counts them, so a full ring goes straight to CLOCK instead of scanning a turn
@@ -377,11 +536,31 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
     if (hand0 < 0 || hand0 >= slots) hand0 = 0;
     if (claims > 0) {
         int nf = 0;
+        if constexpr (Fix) {
+            /* kvs_fix: the free count, the unstamped count and their largest heat in one pass (the three words of a slot
+             * read together); 4b's check pass reads the last two from here */
+            int av = 0, hm = 0;
+#pragma unroll 4
+            for (int s = tid; s < slots; s += kThreads) {
+                const int sb = slot_block[s];
+                const int sq = slot_state[(size_t)s * sst_ld];
+                const int hq = slot_state[(size_t)s * sst_ld + 1];
+                if (sq != epoch) {
+                    ++av;
+                    if (hq > hm) hm = hq;
+                    if (sb < 0) ++nf;
+                }
+            }
+            if (av) atomicAdd(&s_vavail, av);
+            if (hm) atomicMax(&s_vheat, hm);
+        } else {
         for (int s = tid; s < slots; s += kThreads)
             if (slot_block[s] < 0 && slot_state[(size_t)s * sst_ld] != epoch) ++nf;
+        }
         if (nf != 0) atomicAdd(&s_free, nf);
     }
     __syncthreads();
+    KV_ST(4);
 
     /* fn4 kvs_vic (16.11.2026, qwen/KV-STREAM-EXACT.md): the victims of step 4 without thread 0
      * walking the ring. Thread 0 alone scanned for a free slot (skipping every occupied one) and swept
@@ -406,6 +585,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             [&](int q) { return slot_block[q] < 0 && slot_state[(size_t)q * sst_ld] != epoch; });
         (void)nfree;   /* = s_free: the same predicate over the same state */
     }
+    KV_STB(5);
 
     /* ---- 4. one victim per miss: the block's own slot first, else a free slot, else CLOCK ---- */
     /* Identity first: a block whose id fits the ring and whose own slot is free goes there, so a
@@ -505,16 +685,28 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         }
     }
     __syncthreads();
+    KV_ST(6);
 
     /* ---- 4b. kvs_vic: CLOCK for misses kc .. nmiss-1, in rotations of the ring from the hand ---- */
     if (claims > 0 && s_kc < nmiss0) {
         const int kc = s_kc, nc = nmiss0 - kc, hc = s_hand;
         /* What the model needs: every remaining miss non-identity (consistent maps), heats in 0..3,
          * and at least nc unstamped slots. Else thread 0 runs the serial sweep (s_vser). */
-        if (tid == 0) { s_vser = 0; s_vavail = 0; s_vheat = 0; }
+        /* kvs_fix: 3b's sums stand unless 3b saw a heat above 3 (then the pass, as today) */
+        bool vchk = true;
+        if constexpr (Fix) {
+            vchk = s_vheat > 3;
+            __syncthreads();   /* every thread has read s_vheat before thread 0 rewrites it */
+        }
+        if (tid == 0) {
+            s_vser = 0;
+            if (vchk) { s_vavail = 0; s_vheat = 0; }
+            else s_vavail -= s_placed;   /* kvs_fix: step 4 stamped one unstamped slot a placement, nothing else */
+        }
         __syncthreads();
         {
             int av = 0, hm = 0;
+            if (vchk)
             for (int q = tid; q < slots; q += kThreads) {
                 if (slot_state[(size_t)q * sst_ld] == epoch) continue;
                 ++av;
@@ -533,12 +725,23 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         __syncthreads();
         if (s_vavail < nc || s_vheat > 3) { if (tid == 0) s_vser = 1; }
         __syncthreads();
+        KV_ST(7);
         if (!s_vser) {
             int got = 0, hand = hc;
             for (int rot = 0; rot < 3 && got < nc; ++rot) {
                 const int want_n = nc - got;
                 int* const out = miss_slot + kc + got;
-                const int n = kv_compact_rot(hc, slots, out, want_n, tid, s_cnt, s_off, [&](int q) {
+                int n;
+                if constexpr (Fix) {
+                    /* kvs_fix: the same list, stopping near the hand; the slot's three words loaded together */
+                    n = kv_compact_win(hc, slots, out, want_n, tid, s_cnt, s_off, [&](int q) {
+                        const int sq = slot_state[(size_t)q * sst_ld];
+                        const int old = slot_block[q];
+                        const int hq = slot_state[(size_t)q * sst_ld + 1];
+                        return sq != epoch && !(old >= 0 && old < blocks && hq > 0);
+                    });
+                } else
+                n = kv_compact_rot(hc, slots, out, want_n, tid, s_cnt, s_off, [&](int q) {
                     if (slot_state[(size_t)q * sst_ld] == epoch) return false;
                     const int old = slot_block[q];
                     return !(old >= 0 && old < blocks && slot_state[(size_t)q * sst_ld + 1] > 0);
@@ -573,6 +776,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
                 res[b] = q;
             }
             __syncthreads();
+            KV_ST(8);
             if (tid == 0) {
                 const int placed = s_placed + nc;
                 ctl[1] = hand;
@@ -624,6 +828,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         }
     }
     __syncthreads();
+    KV_ST(9);
 
     /* Unplaced claims (still -2) revert to -1 so a later call may claim them. Every claim is named
      * by a selection entry, so the selection reaches all of them; the list is the shorter pass when
@@ -646,6 +851,7 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         }
     }
     __syncthreads();
+    KV_ST(10);
 
     /* ---- 6. the copies, one block each, in miss order, in this launch ---- */
     /* One warp a miss, so every miss's host read is in flight at once: a 2 KiB copy from the
@@ -684,7 +890,29 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         }
     }
 
+    KV_STB(11);
     /* ---- 7. the rewrite: every valid entry becomes the slot holding its block ---- */
+    if constexpr (Flat) {
+        /* fn4 kvs_flat: the same rewrite over the flat entry space, kFlatU entries a thread in flight (each entry is its own
+         * thread's: sel[e] is read and written by one thread, as below). */
+        const int E = M * pitch;
+        for (int base = tid; base < E; base += kThreads * kFlatU) {
+            int bb[kFlatU], sv[kFlatU];
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) bb[u] = kv_flat_block(sel, nsel, base + u * kThreads, E, pitch, blocks);
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u) {
+                sv[u] = -1;
+                if (bb[u] < 0) continue;
+                int s = ecache > 0 ? s_ent[base + u * kThreads] : -1;
+                if (s < 0) s = res[bb[u]];
+                sv[u] = s;
+            }
+#pragma unroll
+            for (int u = 0; u < kFlatU; ++u)
+                if (bb[u] >= 0) sel[base + u * kThreads] = sv[u] >= 0 ? sv[u] : 0;
+        }
+    } else {
     for (int q = 0; q < M; ++q) {
         int n = nsel[q];
         if (n < 0) n = 0;
@@ -700,7 +928,9 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
             sel[e] = s >= 0 ? s : 0;
         }
     }
+    }
 
+    KV_STB(12);
     /* The union: the distinct slots this call hit or filled, plus the claims it could not place. */
     if (tid == 0) {
         const int placed = s_placed;
@@ -714,8 +944,17 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
         ctr[1] += (uint64_t)s_lookups;
         ctr[2] += 1u;
         ctl[0] = epoch;
+        if constexpr (Stamp) {
+            kst[13] = kv_now();
+            kst[16] = (unsigned long long)s_distinct; kst[17] = (unsigned long long)s_nmiss;
+            kst[18] = (unsigned long long)s_placed;   kst[19] = (unsigned long long)s_hits;
+            kst[20] = (unsigned long long)s_free;     kst[21] = (unsigned long long)s_kc;
+            kst[22] = (unsigned long long)s_vser;     kst[23] = (unsigned long long)s_lookups;
+        }
     }
 }
+#undef KV_ST
+#undef KV_STB
 
 }  // namespace
 
@@ -734,10 +973,32 @@ __global__ __launch_bounds__(kThreads) void kv_resolve_kernel(
  *
  * The two planes are addressed by `bbytes` alone, so the shim has already checked that each
  * block's row pitch in bytes is exactly `block_bytes` and that its trailing extents fill it. */
+/* Qwen loop round 53 (QUEUE Q105, bench only): r4d_kv_stamp_set(1) = the stamped instances (kv_resolve_kernel<.., true>),
+ * which write 24 u64 past the row scratch's victim list (the caller's scratch must hold r4d_rad_kv_resolve_scratch + 256 B). */
+static std::atomic<int> g_kv_stamp{0};
+extern "C" int r4d_kv_stamp_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_kv_stamp.store(on, std::memory_order_relaxed);
+    return 1;
+}
+
+/* One instance of kv_resolve_kernel<Flat, Stamp, Fix> on the shim's operands. */
+template <bool Flat, bool Stamp, bool Fix>
+static int kv_resolve_emit_t(long sel, long nsel, long res, long slot_block, long slot_state, long ctl, long host, long cache,
+                             long miss_block, long miss_slot, int M, int blocks, int slots, int pitch, int bbytes, int sst_ld,
+                             int cap, int ecache, int vic, RadStream stream) {
+    return R4D_EMIT(stream, (kv_resolve_kernel<Flat, Stamp, Fix>), dim3(1), dim3(kThreads),
+                    (uint32_t)(cap + ecache) * sizeof(int),
+                    (int32_t*)sel, (const int32_t*)nsel, (int32_t*)res, (int32_t*)slot_block,
+                    (int32_t*)slot_state, (int32_t*)ctl, (const uint8_t*)host, (uint8_t*)cache,
+                    (int32_t*)miss_block, (int32_t*)miss_slot, M, blocks, slots, pitch,
+                    bbytes, sst_ld, cap, ecache, vic);
+}
+
 static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, long slot_state,
                                long ctl, long host, long cache, long miss_block, long miss_slot,
                                int M, int blocks, int slots, int pitch, int bbytes, int sst_ld,
-                               int vic, RadStream stream) {
+                               int vic, int flat, int fix, RadStream stream) {
     if (!sel || !nsel || !res || !slot_block || !slot_state || !ctl || !host || !cache ||
         !miss_block || !miss_slot)
         return R4D_NO(RAD_E_INVAL);
@@ -752,12 +1013,24 @@ static int r4d_kv_resolve_emit(long sel, long nsel, long res, long slot_block, l
      * its 513, a wide prefill does not and step 7 reads the map. */
     const long long entries = (long long)M * pitch;
     const int ecache = entries <= (long long)(room - cap) ? (int)entries : 0;
-    return R4D_EMIT(stream, kv_resolve_kernel, dim3(1), dim3(kThreads),
-                    (uint32_t)(cap + ecache) * sizeof(int),
-                    (int32_t*)sel, (const int32_t*)nsel, (int32_t*)res, (int32_t*)slot_block,
-                    (int32_t*)slot_state, (int32_t*)ctl, (const uint8_t*)host, (uint8_t*)cache,
-                    (int32_t*)miss_block, (int32_t*)miss_slot, M, blocks, slots, pitch,
-                    bbytes, sst_ld, cap, ecache, vic);
+    /* fn4 kvs_flat: steps 2 and 7 over the flat entry space (the kernel's note at kv_flat_block), 32-bit entry indices:
+     * a launch whose M * pitch passes them keeps the row loops (none does: max_tok x 513) */
+    const bool fl = flat && entries + (long long)kThreads * kFlatU <= (long long)INT32_MAX;
+    const bool stamp = g_kv_stamp.load(std::memory_order_relaxed) != 0;
+    /* fn4 kvs_fix (lever KVX): kv_resolve_kernel<.., .., true> */
+    const bool fx = fix != 0;
+#define KV_EMIT_(F, S, X) return kv_resolve_emit_t<F, S, X>(sel, nsel, res, slot_block, slot_state, ctl, host, cache, \
+                                                          miss_block, miss_slot, M, blocks, slots, pitch, bbytes, sst_ld, \
+                                                          cap, ecache, vic, stream)
+    if (stamp) {
+        if (fx) { if (fl) KV_EMIT_(true, true, true); KV_EMIT_(false, true, true); }
+        if (fl) KV_EMIT_(true, true, false);
+        KV_EMIT_(false, true, false);
+    }
+    if (fx) { if (fl) KV_EMIT_(true, false, true); KV_EMIT_(false, false, true); }
+    if (fl) KV_EMIT_(true, false, false);
+    KV_EMIT_(false, false, false);
+#undef KV_EMIT_
 }
 
 /* ============================================================== the plugin ABI entry point */
@@ -792,6 +1065,49 @@ static int kv_vic(const RadArgs* a) {
 extern "C" int r4d_kv_vic_set(int on) {
     if (on < 0 || on > 1) return -1;
     g_kv_vic.store(on, std::memory_order_relaxed);
+    return 1;
+}
+
+/* fn4 kvs_flat (Qwen loop round 52, QUEUE Q101; RADIANCE_FN4_KVS_FLAT, rad_fn4_switch("kvs_flat")): 1 = steps 2 and 7 over
+ * the flat entry space (kv_resolve_kernel<true>), 0 = today's row loops. The same placement, maps, counters and rewritten
+ * selection either way (libref's). A launch parameter `flat` overrides it (the host emulator's tests). */
+static std::atomic<int> g_kv_flat{-1};
+static int kv_flat(const RadArgs* a) {
+    int v = g_kv_flat.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_KVS_FLAT");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_kv_flat.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_kv_flat.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "flat", v) ? 1 : 0;
+}
+extern "C" int r4d_kv_flat_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_kv_flat.store(on, std::memory_order_relaxed);
+    return 1;
+}
+
+/* fn4 kvs_fix (Qwen loop round 54, QUEUE Q105, lever KVX; RADIANCE_FN4_KVS_FIX, rad_fn4_switch("kvs_fix")): 1 = the passes over
+ * every ring slot cut to one (kv_resolve_kernel<.., .., true>: 3b's pass also counts 4b's unstamped slots and largest heat; 4b's
+ * CLOCK rotations stop near the hand), 0 = today. The same placement, maps, counters and rewritten selection either way. A launch
+ * parameter `fix` overrides it (the host emulator's tests). */
+static std::atomic<int> g_kv_fix{-1};
+static int kv_fix(const RadArgs* a) {
+    int v = g_kv_fix.load(std::memory_order_relaxed);
+    if (v < 0) {
+        const char* e = std::getenv("RADIANCE_FN4_KVS_FIX");
+        const int on = (e && *e && std::atoi(e) > 0) ? 1 : 0;
+        int want = -1;
+        g_kv_fix.compare_exchange_strong(want, on, std::memory_order_relaxed);
+        v = g_kv_fix.load(std::memory_order_relaxed);
+    }
+    return (int)r4d_geti_or(a, "fix", v) ? 1 : 0;
+}
+extern "C" int r4d_kv_fix_set(int on) {
+    if (on < 0 || on > 1) return -1;
+    g_kv_fix.store(on, std::memory_order_relaxed);
     return 1;
 }
 
@@ -868,7 +1184,7 @@ extern "C" int r4d_rad_kv_resolve(const RadArgs* a, RadStream stream) {
                                r4d_addr(st), r4d_addr(ct), r4d_addr(ho), r4d_addr(ca),
                                (long)(uintptr_t)miss_block, (long)(uintptr_t)miss_slot,
                                (int)M, (int)blocks, (int)slots, (int)pitch, (int)bbytes,
-                               (int)st->stride[0], kv_vic(a), stream);
+                               (int)st->stride[0], kv_vic(a), kv_flat(a), kv_fix(a), stream);
 }
 
 /* `next_pow2(slots)` block ids (a wide launch sorts its claims here), then `slots` slots, then `slots` ids of victim

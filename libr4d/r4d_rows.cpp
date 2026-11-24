@@ -25,6 +25,7 @@
 #include "r4d_plugin.h"
 #include "rad_abi_layout.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -931,6 +932,10 @@ static const RadParamSpec pRowsColl[] = {
      * streams, 4 x 5120 a row) names the all-reduce's bound, so it rides that instance: a shard of ceil(rows / 4) rows
      * of 4 x 5120 fits a slot sized for rows x 5120; the launch checks the shard against the slot */
     { "bound",      RAD_P_INT, RAD_OPTIONAL },
+    /* qfn-on-ds lever LSK (Qwen loop round 27, QUEUE Q51): 1 = the launch at `overlap` 1 takes the lane form's SECOND pair
+     * (switches ar_laneblocks_s / ar_lanethreads_s; 0 there = the first pair's) -- qwen4exp's SP-serial ops (MIXED and
+     * serial prefill steps) under RADIANCE_FN4_SPSER_LANE=1; the shards and each element's rank fold do not depend on it */
+    { "lane_kind",  RAD_P_INT, RAD_OPTIONAL },
 };
 static const RadOperandSpec oRowsColl[] = {
     { "x", RAD_OPD_INOUT, 0 },
@@ -11919,6 +11924,32 @@ extern "C" int rad_kernel_chain(int i) {
     };
     for (const char* p : kChained)
         if (std::strcmp(k->name, p) == 0) return 1;
+    /* qfn-on-ds lever RCH (Qwen loop round 28, 22.11.2026; start env RADIANCE_FN4_RG_CHAIN=1, unset = the list above word for
+     * word): the fused router that also writes the inverse slot table (e10ecd67, Flash-Next's decode router since GATHER_INV)
+     * has its chained wrapper (r4d_moe.hip r4dchain_router_gemm_topk_scatter_inv) and a launch that takes it at <= 32 rows
+     * when the row carries `chain`, but the row never joined this list, so every decode router ran plain behind a barrier
+     * (prof5 stamps: 196-199 us a trunk pass at c1 / c8, 48 + one a MTP pass a step). The same body either way: the same bytes. */
+    static const bool rch = [] {
+        const char* e = std::getenv("RADIANCE_FN4_RG_CHAIN");
+        const bool on = e && e[0] == '1' && e[1] == '\0';
+        if (on)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_RG_CHAIN=1: router_gemm_topk_scatter_inv_bf16 joins the "
+                                 "chained rows (its r4dchain_ form at <= 32 rows; Qwen loop lever RCH)\n");
+        return on;
+    }();
+    if (rch && std::strcmp(k->name, "router_gemm_topk_scatter_inv_bf16") == 0) return 1;
+    /* qfn-on-ds lever F8W (the same round; start env RADIANCE_FN4_F8_CHAIN_WIDE=1, unset = today): the fn4 BI wide decode GEMM
+     * row (gemm_nt_q_dec, 65-512 decode rows) joins the list, and its launch keeps `chain` above 64 rows under the same env
+     * (r4d_gemm_fp8a8.hip f8_chain_wide); the chained form is the narrow kernel's r4dchain_ twin: the same bytes. */
+    static const bool f8w = [] {
+        const char* e = std::getenv("RADIANCE_FN4_F8_CHAIN_WIDE");
+        const bool on = e && e[0] == '1' && e[1] == '\0';
+        if (on)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_F8_CHAIN_WIDE=1: gemm_i8a8_nt_m16_dec joins the chained rows "
+                                 "(r4dchain_gemm_fp8a8 above 64 decode rows; Qwen loop lever F8W)\n");
+        return on;
+    }();
+    if (f8w && std::strcmp(k->name, "gemm_i8a8_nt_m16_dec") == 0) return 1;
     return 0;
 }
 

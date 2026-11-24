@@ -82,6 +82,8 @@ public:
      * server listens, or the KL mode starts scoring, so the stretch from start() to there
      * reports where it waits like start() itself. */
     int serve(std::unique_ptr<StallWatch> watch);
+    /* qfn hero image: radiance_home/switches.json (or RADIANCE_IMAGE_SWITCHES) queued for the first step; engine.cpp */
+    int image_switch_defaults();
 
     /* --debug-graph and friends: print everything declare and plan learned, without serving. A
      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */
@@ -135,6 +137,7 @@ private:
     /* Per KV group, the ranges a staged pass of the next step copies (kvstream_step_runs), refilled
      * in place each step. */
     std::vector<std::vector<KVStageRun>> stage_runs_;
+    std::vector<std::vector<KVStageRun>> ride_runs_;   /* lever RIDE: the prefill sequences' ranges of a riding step */
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL
@@ -309,6 +312,10 @@ private:
         /* [n_seq][RAD_SCHED_MAX_SPEC] on a tree step (StepPlan::spec_is_tree): each entry's
          * accepted nodes in commit order (accept_tree's path). Empty on a chain step. */
         std::vector<int32_t> path;
+        /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h): the draw key the step's ADV_ACCEPT ran with (its RadBatch::step),
+         * which collect_step reads so the host's forced count is the card's; fal_has false = no ADV_ACCEPT was issued. */
+        uint32_t             fal_key = 0;
+        bool                 fal_has = false;
     };
 
     /* The text frontend, loaded from the container. The sampler's grammars walk `vocab_view_`,
@@ -333,6 +340,40 @@ private:
     std::vector<std::unique_ptr<Scheduler>> lane_sched_;
     LaneSet                       lanes_;
     int                           n_lanes_ = 1;
+    /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1): lanes on ONE machine -- lane 0 every sequence, lane 1 M8's BG lane whose
+     * steps the step loop runs between lane 0's (stage 1: one queue; Engine::step_loop) */
+    bool                          bgl1m_ = false;
+    int64_t                       bgl_steps_ = 0;   /* lane-1 steps run (lever BGL) */
+    /* lever BGL stage 2b (RADIANCE_BG_LANE_1M=3): lane 1's per-step single copies, swapped with the engine's own by lane_select (so
+     * every helper acts on the selected lane's), lane 1's step in flight, and the cross-Ctx events (bg_gate_: a rank's first Ctx
+     * before a lane-1 step; bg_done_: a rank's second Ctx at the end of one) */
+    bool                          bgl2b_ = false;
+    bool                          bgio_in_ = false;
+    struct BgLaneIO {
+        RadEvent step_end = nullptr, tok_end = nullptr;
+        int32_t* rb_p = nullptr;
+        int64_t  rb_n = 0;
+        StepSlot* slots_host = nullptr;
+        std::vector<Scheduler::SerialRow> serial_row;
+        int serial_rounds = 0, serial_rows = 0, serial_done = 0;
+        std::vector<int32_t> draft_out;
+    } bgio_;
+    struct BgFlight {
+        bool on = false;
+        const RadBatch* b = nullptr;
+        StepOut so;
+        bool pf1_tok = false;
+        uint64_t t0 = 0;
+    } bgf_;
+    std::vector<RadEvent>         bg_gate_, bg_done_;
+    int64_t                       bgl_overlap_steps_ = 0;   /* lane-0 steps issued while a lane-1 step was in flight */
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25): lane 0 issues its decode steps ahead (pipelining) beside
+     * lane 1's steps; the steps so issued, and those of them issued while a lane-1 step was in flight */
+    bool                          bgl_ahead_ = false;
+    int64_t                       bgl_ahead_steps_ = 0, bgl_ahead_beside_ = 0;
+    double                        bgl_flight_ms_ = 0;       /* lane-1 steps' issue-to-finish ms, summed */
+    int  bgl2b_setup();
+    int  finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bool pf1_tok, bool t_on);
     Scheduler*                    cur_sched_ = &sched_;
     std::atomic<Scheduler*>       issue_sched_{ &sched_ };
     Scheduler& lsched() { return *cur_sched_; }
@@ -454,6 +495,9 @@ private:
     void pp_kv_check_send();
     int  pp_kv_check_recv(const std::vector<uint8_t>& body, uint64_t step);
     int  pp_kv_crc(int32_t group, int32_t slot, int64_t top, uint32_t* crc, int64_t* bytes);
+    /* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): PrefixCache::same_bytes_fn -- how many
+     * leading entries of `a` and `b` hold the same bytes on every rank, every layer of every cached group (engine.cpp). */
+    int64_t prefix_same_bytes(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n);
     int  pp_kv_check_every_ = 0;
     int64_t pp_kv_checks_ = 0, pp_kv_bad_ = 0;
     /* tp8 loop P37 (RADIANCE_PP_KV_CHECK_DEFER=1, with RADIANCE_PP_KV_CHECK=N): under lanes a due check waits for a round
@@ -758,6 +802,17 @@ private:
     void clear_fresh_states();
     bool serial_drafting() const;
     int  advance_all(int mode, int round, bool from_proposal, int rows = -1);
+    /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h; Qwen loop round 46, QUEUE Q88): MEASUREMENT ONLY -- a chain verify
+     * accepts AL - 1 drafts on average (vLLM's minimum-variance schedule) instead of the agreed ones. fal_.on 0 = unset.
+     * fal_key_ is the step number the next ADV_ACCEPT draws with (set by issue_*_drafter from the step, also stored in
+     * its StepOut); fal_n_ / fal_a_ count verifies and forced drafts by the row's draft count (the host's, after the
+     * cut), fal_cut_ the verifies a stop token cut below their draw; logged every 16,384 verifies and at the stop. */
+    ForceAl  fal_{};
+    uint32_t fal_key_ = 0;
+    int64_t  fal_n_[kFalDepths] = {}, fal_a_[kFalDepths] = {}, fal_rows_ = 0, fal_cut_ = 0;
+    void     fal_note(bool final_line);
+    /* Before an ADV_ACCEPT: the key it and the step's collect_step draw with. */
+    void     fal_arm(uint32_t step, StepOut& so) { fal_key_ = step; so.fal_key = step; so.fal_has = true; }
     int  issue_serial_drafter(int step, StepOut& so);
     /* The next step's forward pass, issued before this one is read back; null when the scheduler
      * wants this step committed first. See Scheduler::step_next. */
@@ -828,6 +883,13 @@ private:
     int    phase_n_ = 0;
     std::chrono::steady_clock::time_point phase_t_{};
     void   phase_mark(int p);
+    /* qfn-on-ds Q92 (FINDINGS F78): RADIANCE_LOG_STEP_HOST=<ms> -- one line a step of at least <ms> (0: every step) with this
+     * step's phases, the scheduler's host note (Scheduler::HostNote) and the step's tail (tier pump, the ticks, the
+     * publish) split; -1 off. engine.cpp's step loop only (not the lanes' loop). */
+    double  phase_step_us_[PH_N] = {};
+    double  step_host_ms_ = -1;
+    double  tail_ms_[3] = {};
+    void    step_host_line(const RadBatch* b);
 
     /* Block driver (spec §10): a context pass mirroring the step just run, then one pass that
      * fills every drafted position at once. DFlash2 has this shape. issue_block_drafter queues
@@ -1043,6 +1105,32 @@ private:
     /* The step's TIP snapshot (an entry whose snapshot lies inside it, on the only prefill sequence): its row in the step,
      * or 0 (none); `e` the entry. */
     int64_t tip_row_of(const StepPlan& plan, const StepEntry** e) const;
+    /* qfn-on-ds Qwen tp8 S7b (round 43; RADIANCE_PP_HEAD_SNAP=1 on a leader at W(h > 0, t), engine_lanes.cpp lanes_init): a
+     * chunk-END snapshot's head layers [0, h) staged inside the chunk's HEAD part -- the rank thread names it to the plugin
+     * around the head issue (rank_loop: rad_tip_set row -1), the plugin hands every head layer's state rows to head_stage
+     * before X1's send, which copies them into the snapshot's checkpoint slot of every such entry of the issue; the entry
+     * waits in `done` (another lane's head may be issued before its save) and save_checkpoints saves the rest of its rows
+     * (the tail layers, as the step leaves them). One HsRank a rank. */
+    struct HsEntry {
+        uint64_t seq = 0;
+        int32_t  ck = -1;
+        std::vector<int32_t> slots;                /* the sequence's state slot a group (state_slots_of) */
+        std::vector<std::vector<uint8_t>> staged;  /* [group][layer row] */
+        int64_t  rows = 0;
+    };
+    struct HsRank {
+        Engine* e = nullptr;
+        int     rank = 0;
+        int     fail = 0;
+        std::vector<HsEntry> cur;    /* this head issue's entries (head_stage copies each one's row) */
+        std::vector<HsEntry> done;   /* staged, waiting for their save */
+    };
+    bool     head_snap_ = false;
+    std::vector<HsRank> hs_;
+    std::mutex hs_mu_;
+    uint64_t hs_saves_ = 0, hs_rows_ = 0;
+    static int head_stage(void* u, int group, int layer, void* stream);
+    bool     pp_head_now() const;   /* the pass the ranks issue now is a leader's HEAD part (engine_node.cpp) */
     int64_t  arena_floor_ = 0;
     int64_t  arena_last_ = 0;
     uint64_t arena_floor_ns_ = 0;

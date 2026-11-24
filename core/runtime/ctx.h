@@ -25,6 +25,7 @@
 #include "device/device.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <deque>
@@ -198,6 +199,13 @@ struct KVPoolBinding {
     /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
      * each step. Empty copies the whole row. */
     std::vector<KVStageRun> stage_runs;
+    /* Qwen loop Form A step (1), lever RIDE (RADIANCE_FN4_KVS_RIDE=1 with kvs_apart): the step's ranges in full
+     * (stage_runs_full: every sequence's tables) and for a trunk MIXED pass whose decode rows ride the ring
+     * (stage_runs_ride: the prefill sequences' tables only); kvstream_enter makes one of them stage_runs for each pass and
+     * sets `ride` for a pass whose decode rows attend on the ring (rad_kv_stage_layer then answers 3). */
+    std::vector<KVStageRun> stage_runs_full, stage_runs_ride;
+    bool        has_ride_runs = false;
+    bool        ride = false;
 };
 
 /* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */
@@ -232,6 +240,11 @@ struct CtxDesc {
      * reference library's host rows. Null: the oracle checks a band only where the reference
      * library won its host row. */
     Registry*       registry    = nullptr;
+    /* qfn-on-ds F65 (lever BGL stage 2b): CUs every queue this Ctx creates leaves to the card's other queues
+     * (rad_stream_cu_keep; 0 = the whole card). A second Ctx a rank whose passes run beside the first's: its collectives
+     * and chained launches spin on peer cards, so without a region it cannot enter, its spinners can hold every slot a
+     * first-Ctx collective's blocks need while their twins on a peer wait behind the second Ctx (FINDINGS F65). */
+    int             cu_keep     = 0;
 };
 
 /* tp8 loop P31 (issue.cpp): RADIANCE_SLOW_ISSUE_MS's value (0 = off), and the process's pass-line budget (the count so far) */
@@ -290,6 +303,13 @@ public:
     int             wgp_count() const { return wgp_count_; }
     int             world_size() const { return world_size_; }
     RadStream       stream()     const { return stream_; }
+    /* qfn-on-ds lever BGL stage 2 (WIP): every stream this Ctx issues on, drained (the compute stream and the second lane's) */
+    int             sync_all() const {
+        int s = stream_ ? rad_stream_sync(stream_) : 0;
+        if (s >= 0 && lane1_) s = rad_stream_sync(lane1_);
+        if (s >= 0 && lane1_spare_) s = rad_stream_sync(lane1_spare_);
+        return s;
+    }
     Program*        program()    const { return program_; }
 
     /* The lane subsequent issues launch on, and its stream. Lane 0 is `stream_`. See lane1_ for
@@ -637,9 +657,20 @@ private:
     /* tp8 S5: a two-node pipeline node with lanes keeps kTapes a lane (each lane's batch is its own set
      * of recordings, and the leader's lane step two: its head, a few dispatches, and its tail); kTapes
      * everywhere else. */
-    size_t                   tape_cap_   = kTapes;
+    /* qfn-on-ds lever TCAP (Qwen loop Q117; staged round 58, built round 59): RADIANCE_TAPE_CAP=N (8..1024; read when a Ctx is
+     * made) keeps N recorded passes a lane instead of kTapes -- the AgentX decode step after a prefill piece is ISSUED LIVE (the
+     * 50-ms step-host rider on agx23: its ranks phase p50 114.85 ms vs 0.12 for a decode step after a decode), i.e. recorded again,
+     * when the pieces' own tapes and a moved n_seq push its passes out of the 24; a play writes the recorded dispatches, so the
+     * cap moves no byte. Anything else (unset, out of range) = kTapes. */
+    static size_t tape_base() {
+        const char* e = std::getenv("RADIANCE_TAPE_CAP");
+        const long v = e && *e ? std::atol(e) : 0;
+        return v >= 8 && v <= 1024 ? (size_t)v : kTapes;
+    }
+    size_t                   tape_cap_   = tape_base();
 public:
-    void set_tape_lanes(int lanes) { tape_cap_ = kTapes * (size_t)(lanes > 1 ? lanes : 1); }
+    void set_tape_lanes(int lanes) { tape_cap_ = tape_base() * (size_t)(lanes > 1 ? lanes : 1); }
+    size_t tape_cap() const { return tape_cap_; }
 private:
     static constexpr int64_t kAuditPlays = 1024;
 
@@ -804,6 +835,9 @@ private:
      * process's SVM buffers: 46-231 s on the first prefill step that takes lane 1. Until adopted it is not lane1_, so
      * every step that does not ask for lane 1 runs exactly the single-lane path (lane_join, pass_key). */
     RadStream lane1_spare_ = nullptr;
+    int       cu_keep_     = 0;         /* qfn-on-ds F65: CtxDesc::cu_keep */
+    int       keep_cus(RadStream s);    /* applies cu_keep_ to a stream this Ctx made (said once a Ctx) */
+    bool      cu_keep_said_ = false;
     int       lane_       = 0;
     /* tp8 loop M6F: collectives issued with the row's second instance set (RADIANCE_AR_SETS=2) */
     long long ar_set1_issues_ = 0;

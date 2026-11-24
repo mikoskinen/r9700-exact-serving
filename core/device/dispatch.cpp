@@ -743,6 +743,12 @@ int rad_stream_gate(RadStream s, void** gate) {
     rad::device_set_error("rad_stream_gate: the %s backend has no gates", dev()->name);
     return RAD_E_UNSUPPORTED;
 }
+int rad_stream_cu_keep(RadStream s, int keep_cus, int* out_cus) {   /* qfn-on-ds F65 */
+    if (out_cus) *out_cus = 0;
+    if (const auto f = dev()->stream_cu_keep) return f(s, keep_cus, out_cus);
+    rad::device_set_error("rad_stream_cu_keep: the %s backend has no CU masks", dev()->name);
+    return RAD_E_UNSUPPORTED;
+}
 int rad_gate_open(void* gate) {
     if (const auto f = dev()->gate_open) return f(gate);
     return RAD_E_UNSUPPORTED;

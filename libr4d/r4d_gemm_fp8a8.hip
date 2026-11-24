@@ -181,7 +181,7 @@ constexpr uint32_t f8_waves(bool full, uint32_t nt, uint32_t mw, uint32_t fk, bo
  * after it: its blocks return early (an empty K slice, the finisher's losers), and every block of
  * a chained launch must still count itself in. */
 template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK,
-          bool GATED = false, bool I8 = false, bool BIAS = false>
+          bool GATED = false, bool I8 = false, bool BIAS = false, bool PP = false>
 __device__ __forceinline__ void gemm_fp8a8_body(
     const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
     const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
@@ -340,6 +340,7 @@ __device__ __forceinline__ void gemm_fp8a8_body(
     // accumulators, 16 apart). A per-B-row scale must be looked up for each, not just the first.
     const uint32_t bl0 = wn + frag_c(lane);
 
+    if constexpr (!PP) {
     for (uint32_t c0 = kbeg; c0 < kend; c0 += FK) {
 #pragma unroll
         for (uint32_t p = 0; p < kBP; ++p) {
@@ -438,6 +439,122 @@ __device__ __forceinline__ void gemm_fp8a8_body(
 #pragma unroll
         for (uint32_t p = 0; p < kAF; ++p) pf[p] = pfn[p];
         __syncthreads();
+    }
+    } else {
+    /* lever F8P (Qwen loop round 37, 23.11.2026; QUEUE Q66; start env RADIANCE_FN4_F8_PP=1, unset = the loop above): TWO weight
+     * K tiles in flight a wave instead of one. The loop above issues tile c0+FK's fragments into `pfn` before tile c0's WMMAs
+     * and copies them into `pf` at its foot, and that copy waits for them: one tile (4 KiB a wave) in flight and one DRAM
+     * latency a tile (ISA read, round 36: GDN out_proj K 1536 = 6 tiles ~ 6 latencies ~ the measured 9.7 us a call, ~400 GB/s).
+     * Here `pf` / `pfn` hold an even / odd tile, a trip runs both (no copy), and each tile's buffer is refilled with tile
+     * c0+2FK right after its own WMMAs read it (the scheduling barrier keeps the refill behind them, so no third buffer):
+     * while one tile waits, the next one's fragments are already in flight. The same registers, the same loads, the same
+     * WMMAs in the same K order and the same folds: the same bytes. The activation tile and the scales keep the one-ahead
+     * staging above (issued before the refill, so the next tile's wait at its top does not cover the refill), and the two
+     * barriers are LDS-only (lds_barrier): __syncthreads is a fence over every address space, whose s_wait_loadcnt 0 would
+     * wait for the refill at the tile's foot (ISA of the first build: one tile in flight again). */
+        /* The weight fragments of tile `t` into `dst`, issued UNCONDITIONALLY: no branch around (or after) the loads, since the
+         * compiler counts loads in flight in issue order and, past a load it cannot be sure was issued, waits for everything. A
+         * tile past kend re-reads tile `t0` (never used); a dead wave (rows past N, !Full only) reads tile row 0 -- its rows
+         * are never stored (the epilogue's r < rows, the finisher's rhi), so their accumulators need no zeros. */
+        const uint32_t arow_u = alive ? arow : 0u;
+        auto frags = [&](Stage8 (&dst)[kAF], uint32_t t, const uint32_t t0) __attribute__((always_inline)) {
+            if (t >= kend) t = t0;
+#pragma unroll
+            for (uint32_t p = 0; p < kAF; ++p) {
+                const uint8_t* src = afrag + (size_t)(arow_u * ksuper + t / r4d_fp8::kSuperK + p) * r4d_fp8::kTileBytes;
+                Stage8 v;
+                v.v = *(const uint4*)src;
+                v.w = *(const uint4*)(src + 16);
+                dst[p] = v;
+            }
+        };
+        frags(pfn, kbeg + FK, kbeg);
+        auto tile = [&](const uint32_t c0, Stage8 (&cur)[kAF]) __attribute__((always_inline)) {
+#pragma unroll
+            for (uint32_t p = 0; p < kBP; ++p) {
+                const uint32_t r = sn + p * kRPP;
+                if (r < FN) stage8_store<FK>(s_b, r, sk, pb[p]);
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < kWSPer; ++r)
+                if (tid + r * MW * kWave < kWS) s_ws[tid + r * MW * kWave] = qws[r];
+#pragma unroll
+            for (uint32_t r = 0; r < kASPer; ++r)
+                if (tid + r * MW * kWave < kAS) s_as[tid + r * MW * kWave] = qas[r];
+            lds_barrier();   /* LDS only: __syncthreads is an all-space fence (s_wait_loadcnt 0: it would wait for the refill) */
+            const uint32_t c1 = c0 + FK;
+            if (c1 < kend) {
+                const bool live = Full || (c1 + sk + kSeg <= cols);
+#pragma unroll
+                for (uint32_t p = 0; p < kBP; ++p) {
+                    const uint32_t r = sn + p * kRPP;
+                    if (r < FN)
+                        pb[p] = stage8_load(bsrc + (size_t)p * kRPP * b_ld + c1,
+                                            live && (Full || (n0 + r) < nb));
+                }
+                load_q(c1);
+            }
+#pragma unroll
+            for (uint32_t ks = 0; ks < FK; ks += kK) {
+                const i2v af = frag_of(cur[ks / r4d_fp8::kSuperK], (ks % r4d_fp8::kSuperK) / 16u);
+                i2v bf[NT];
+#pragma unroll
+                for (uint32_t j = 0; j < NT; ++j) bf[j] = frag<FK>(s_b, wn + j * 16, ks, lane);
+#pragma unroll
+                for (uint32_t j = 0; j < NT; ++j) raw[j] = mma8<I8>(af, bf[j], raw[j]);
+                if ((c0 + ks + kK) % kBlock == 0 || c0 + ks + kK >= kend) {
+                    const uint32_t f = ks / kBlock < kFolds ? ks / kBlock : kFolds - 1u;
+                    if constexpr (I8) {
+                        float wsr[8];
+                        {
+                            const uint4 w8 =
+                                *(const uint4*)&s_ws[(wave * kFolds + f) * 8u + (lane >> 4) * 4u];
+                            const uint32_t d[4] = { w8.x, w8.y, w8.z, w8.w };
+#pragma unroll
+                            for (uint32_t t = 0; t < 8; ++t)
+                                wsr[t] = bscale((uint16_t)(d[t / 2] >> (16 * (t % 2))));
+                        }
+#pragma unroll
+                        for (uint32_t j = 0; j < NT; ++j) {
+                            const float s = s_as[f * FN + bl0 + j * 16u];
+#pragma unroll
+                            for (uint32_t t = 0; t < 8; ++t) {
+                                out[j][t] += acc_val<I8>(raw[j][t]) * (wsr[t] * s);
+                                raw[j][t] = 0.0f;
+                            }
+                        }
+                    } else {
+                        const float ws = bscale((uint16_t)s_ws[wave * kFolds + f]);
+#pragma unroll
+                        for (uint32_t j = 0; j < NT; ++j) {
+                            const float s = ws * s_as[f * FN + bl0 + j * 16u];
+#pragma unroll
+                            for (uint32_t t = 0; t < 8; ++t) {
+                                out[j][t] += raw[j][t] * s;
+                                raw[j][t] = 0.0f;
+                            }
+                        }
+                    }
+                }
+            }
+            /* The refill: this tile's buffer takes tile c0 + 2FK once its WMMAs have read it. */
+            __builtin_amdgcn_sched_barrier(0);
+#ifdef R4D_EMU_HOST
+            /* r4d_emu_i8wide's mutation control only: the refill re-reads tile c0, so a later tile computes on a stale buffer */
+            frags(cur, std::getenv("R4D_EMU_F8P_MUTATE") ? c0 : c0 + 2u * FK, c0);
+#else
+            frags(cur, c0 + 2u * FK, c0);
+#endif
+            lds_barrier();   /* every wave done reading s_b / the scales; the refill stays in flight */
+        };
+        /* Whole pairs in the loop and an odd last tile after it: a pair's second tile under a branch would leave a back edge
+         * whose last loads are the first tile's refill alone, and the waits at the loop head would count from there. */
+        uint32_t c0 = kbeg;
+        for (; c0 + FK < kend; c0 += 2u * FK) {
+            tile(c0, pf);
+            tile(c0 + FK, pfn);
+        }
+        if (c0 < kend) tile(c0, pf);
     }
 
     if constexpr (GATED) {
@@ -721,6 +838,34 @@ void r4dchain_gemm_fp8a8(
     const uint16_t* __restrict__ Bias = nullptr, uint32_t c_ld = 0) {
     r4d_chain_wait();
     gemm_fp8a8_body<Full, NT, MW, FK, GATED, I8, BIAS>(R4D_F8K_ARGS);
+    r4d_chain_done();
+}
+/* Lever F8P's twins (the body's PP loop: two weight K tiles in flight a wave), int8 narrow decode tile only (the Qwen trunk's
+ * gemm_nt_q / gemm_nt_q_dec), no gated / bias form. Their own names, so every kernel above keeps its symbol and text. */
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK, bool I8>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, false))
+void gemm_fp8a8_pp_kernel(
+    const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
+    const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
+    void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
+    uint32_t rows, uint32_t cols, uint32_t nb,
+    uint32_t a_ld, uint32_t b_ld, uint32_t sa_ld, uint32_t sb_ld, uint32_t ck,
+    uint8_t* __restrict__ Q, float* __restrict__ Sc, uint16_t* __restrict__ Yb,
+    uint32_t q_ld, uint32_t s_ld, uint32_t y_ld, const uint16_t* __restrict__ Bias, uint32_t c_ld) { R4D_IKA_ENTRY();
+    gemm_fp8a8_body<Full, NT, MW, FK, false, I8, false, true>(R4D_F8K_ARGS);
+}
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK, bool I8>
+__global__ __launch_bounds__(MW * kWave) R4D_WAVES(f8_waves(Full, NT, MW, FK, I8, false))
+void r4dchain_gemm_fp8a8_pp(
+    const uint8_t* __restrict__ Ap, const void* __restrict__ Sa,
+    const uint8_t* __restrict__ Bp, const void* __restrict__ Sb,
+    void* __restrict__ Y, void* __restrict__ C, unsigned int* __restrict__ Ctr,
+    uint32_t rows, uint32_t cols, uint32_t nb,
+    uint32_t a_ld, uint32_t b_ld, uint32_t sa_ld, uint32_t sb_ld, uint32_t ck,
+    uint8_t* __restrict__ Q, float* __restrict__ Sc, uint16_t* __restrict__ Yb,
+    uint32_t q_ld, uint32_t s_ld, uint32_t y_ld, const uint16_t* __restrict__ Bias, uint32_t c_ld) {
+    r4d_chain_wait();
+    gemm_fp8a8_body<Full, NT, MW, FK, false, I8, false, true>(R4D_F8K_ARGS);
     r4d_chain_done();
 }
 #undef R4D_F8K_ARGS
@@ -1138,6 +1283,55 @@ extern "C" void r4d_gemm_fp8a8_pin_nt(int nt) {
     g_nt_force.store(v, std::memory_order_relaxed);
 }
 
+/* qfn-on-ds lever F8W (Qwen loop round 28, 22.11.2026; start env RADIANCE_FN4_F8_CHAIN_WIDE=1, unset = today): the narrow
+ * dispatch above 64 rows (fn4 BI wide: grid.y carries 64-token groups) keeps the row's `chain` instead of dropping it, so a
+ * 65-512-row decode launch runs r4dchain_gemm_fp8a8 (the same body: the same bytes) instead of the plain kernel behind a
+ * barrier. aql.cpp blocks_of() counts the 3-D grid, so the chain target covers every block. prof5 stamps at c32 (128 rows):
+ * 574 us of idle before the 216 fp8 GEMMs a trunk pass, 255 us at c16 where they chain. */
+static bool f8_chain_wide() {
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_FN4_F8_CHAIN_WIDE");
+        const bool v = e && e[0] == '1' && e[1] == '\0';
+        if (v)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_F8_CHAIN_WIDE=1: gemm_fp8a8's narrow dispatch keeps its "
+                                 "chained form above 64 rows (Qwen loop lever F8W)\n");
+        return v;
+    }();
+    return on;
+}
+
+/* qfn-on-ds lever F8P (Qwen loop round 37, 23.11.2026; QUEUE Q66; start env RADIANCE_FN4_F8_PP=1, unset = today): the int8 narrow
+ * decode tile (gemm_nt_q / gemm_nt_q_dec at MW 4 / 8 / 16: the Qwen trunk's GDN in / out, attention, shared down) runs its
+ * twin gemm_fp8a8_pp_kernel / r4dchain_gemm_fp8a8_pp: two weight K tiles in flight a wave (the body's PP loop), the same bytes.
+ * r4d_gemm_fp8a8_pin_pp (selftest / emulator): -1 = the env (default), 0 = off, 1 = on, read at every launch. */
+std::atomic<int> g_pp_force{-1};
+extern "C" void r4d_gemm_fp8a8_pin_pp(int v) {
+    g_pp_force.store(v == 0 || v == 1 ? v : -1, std::memory_order_relaxed);
+}
+static bool f8_pp() {
+    const int f = g_pp_force.load(std::memory_order_relaxed);
+    if (f >= 0) return f == 1;
+    static const bool on = [] {
+        const char* e = std::getenv("RADIANCE_FN4_F8_PP");
+        const bool v = e && e[0] == '1' && e[1] == '\0';
+        if (v)
+            std::fprintf(stderr, "radiance: libr4d: RADIANCE_FN4_F8_PP=1: the int8 narrow decode GEMM runs two weight K tiles "
+                                 "in flight a wave (gemm_fp8a8_pp_kernel; Qwen loop lever F8P)\n");
+        return v;
+    }();
+    return on;
+}
+
+/* The launch's kernel: F8P's twin for the int8 tile at MW >= 4 when f8_pp(), else today's (an `if constexpr`, so no other
+ * shape instantiates a twin). */
+template <bool Full, uint32_t NT, uint32_t MW, uint32_t FK, bool I8>
+static auto f8_kernel(bool chain, bool pp) {
+    if constexpr (I8 && MW >= 4u) {
+        if (pp) return chain ? &r4dchain_gemm_fp8a8_pp<Full, NT, MW, FK, I8> : &gemm_fp8a8_pp_kernel<Full, NT, MW, FK, I8>;
+    }
+    return chain ? &r4dchain_gemm_fp8a8<Full, NT, MW, FK, false, I8> : &gemm_fp8a8_kernel<Full, NT, MW, FK, false, I8>;
+}
+
 // Bytes of f32 scratch one r4d_gemm_fp8a8_nt_m16 call needs, or 0 when it will not split. The
 // caller may pass more, or none (the launch then runs unsplit: correct but slow, and unreported).
 // The bound is max_m() so the query and the band cannot drift apart.
@@ -1207,7 +1401,8 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
      * scales with NT on both sides (4096*NT bytes against FN * (256+8) = 4224*NT), so it fits. */
     uint32_t nt = (M > 48) ? 4u : ((M > 32) ? 3u : ((M > 16) ? 2u : 1u));
     if (const uint32_t f = g_nt_force.load(std::memory_order_relaxed)) { if ((uint32_t)M <= f * 16u) nt = f; }
-    if (gy > 1) { nt = 4u; chain = false; }
+    if (gy > 1) { nt = 4u; if (!f8_chain_wide()) chain = false; }
+    const bool pp = i8 && f8_pp();   /* lever F8P (f8_kernel: the int8 tile at MW >= 4 only) */
     /* `Full` drops the column guard, so it must mean all NT tiles are live, not just M % 16 == 0.
      * Otherwise (e.g. M = 48, NT = 4) the epilogue writes past a split-K scratch sized for M, over
      * the arrival counter, and the finisher hangs. */
@@ -1220,8 +1415,7 @@ static int gemm_fp8a8_nt_m16_emit(long a, long ascale, long wq, long ws, long c,
 
 #define R4D_F8D(f, mw_, nt_, fk_, i8_)                                                         \
     emit_rc = R4D_EMIT(stream,                                                                 \
-                       (chain ? r4dchain_gemm_fp8a8<f, nt_, mw_, fk_, false, i8_>               \
-                              : gemm_fp8a8_kernel<f, nt_, mw_, fk_, false, i8_>),              \
+                       (f8_kernel<f, nt_, mw_, fk_, i8_>(chain, pp)),                          \
                        grid, dim3(mw_ * kWave),                                                \
                        0, (const uint8_t*)wq, (const void*)ws,                                 \
                        (const uint8_t*)a, (const void*)ascale, dst, (void*)c, ctr,              \

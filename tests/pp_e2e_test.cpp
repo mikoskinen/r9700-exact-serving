@@ -2227,6 +2227,102 @@ TEST(bg_lane_newcomers_serve_one_process_tokens) {
     }
 }
 
+/* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop Q5b S1 stage 1): ONE process, two lanes -- lane 0 every sequence,
+ * lane 1 M8's BG lane whose steps run between lane 0's -- serves one process's tokens: the newcomers that arrive beside decoders
+ * are lent whole to lane 1 (the stop line counts them), everything else is a composition change. Negative control: the same
+ * process without the variable says nothing of BGL and lends nothing. */
+TEST(bgl_one_machine_bg_lane_serves_one_process_tokens) {
+    REQUIRE(world().ok);
+    const std::vector<std::string> ext = { "--max-num-seqs", "6", "--max-num-batched-tokens", "1040", "--max-model-len", "2048" };
+    std::vector<std::vector<int32_t>> ref;
+    std::string ref_log;
+    {
+        Serving one;
+        REQUIRE(one.start("", ext));
+        ref = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        ref_log = one.lead.output();
+    }
+    CHECK(ref_log.find("lever BGL") == std::string::npos);
+    /* runs 0 / 1: stage 1 (lane 1's steps on the rank's own Ctx); run 2: stage 2 WIP -- lane 1's steps on a second Ctx a rank and a
+     * second sampler driver, every kernel instance doubled (RADIANCE_AR_SETS=all), still one step at a time */
+    /* run 3: stage 2b -- lane 1's step issued whole on the second Ctx and finished by event while lane 0 steps on */
+    /* run 4: stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25) -- lane 0 issues its decode steps ahead beside lane 1's */
+    for (int k = 0; k < 5; ++k) {
+        Serving one;
+        const std::vector<std::string> env = k < 2  ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=1" }
+                                           : k == 2 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=2", "RADIANCE_AR_SETS=all" }
+                                           : k == 3 ? std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all" }
+                                                    : std::vector<std::string>{ "RADIANCE_BG_LANE_1M=3", "RADIANCE_AR_SETS=all",
+                                                                                "RADIANCE_BGL_AHEAD=1" };
+        std::vector<std::string> env2 = env;
+        if (k >= 2) if (const char* dv = std::getenv("BGL2_DBG")) env2.push_back(std::string("RADIANCE_BGL2_DBG=") + dv);
+        if (k < 2 && std::getenv("BGL2_ONLY")) continue;
+        if (k < 3 && std::getenv("BGL3_ONLY")) continue;
+        if (k < 4 && std::getenv("BGL4_ONLY")) continue;
+        std::vector<std::string> ext2 = ext;
+        if (std::getenv("BGL2_PLACE")) { ext2.push_back("--placement"); ext2.push_back(std::getenv("BGL2_PLACE")); }
+        REQUIRE(one.start("", ext2, env2));
+        const std::vector<std::vector<int32_t>> got = split_set(one.port);
+        kill(one.lead.child.pid, SIGTERM);
+        CHECK_EQ(one.lead.finish(60), 0);
+        const std::string log = one.lead.output();
+        REQUIRE_EQ(ref.size(), got.size());
+        int differ = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            CHECK(!ref[i].empty());
+            if (ref[i] == got[i]) continue;
+            ++differ;
+            size_t at = 0;
+            while (at < ref[i].size() && at < got[i].size() && ref[i][at] == got[i][at]) ++at;
+            fprintf(stderr, "    BGL run %d: request %zu differs from token %zu (of %zu / %zu)\n", k, i, at, ref[i].size(), got[i].size());
+        }
+        long long lent = -1, rows = -1, steps = -1;
+        static const std::string kTag = "lever BGL: ";
+        if (const size_t at = log.rfind(kTag); at != std::string::npos)
+            (void)std::sscanf(log.c_str() + at + kTag.size(), "%lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s)",
+                              &lent, &rows, &steps);
+        fprintf(stderr, "    BGL run %d: %d of %zu requests differ; %lld newcomers lent whole (%lld rows), %lld BG steps\n", k, differ,
+                ref.size(), lent, rows, steps);
+        CHECK_EQ(differ, 0);
+        if (differ) fprintf(stderr, "%s\n", tail(log, 30).c_str());
+        CHECK(log.find("lever BGL (RADIANCE_BG_LANE_1M=1") != std::string::npos);
+        CHECK((log.find("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank") != std::string::npos) == (k >= 2));
+        if (k >= 2) CHECK(log.find("RADIANCE_AR_SETS=all (tp8 loop M6F): ") != std::string::npos);
+        if (k >= 3) {
+            long long ov = -1;
+            static const std::string kOv = "lever BGL stage 2b: ";
+            if (const size_t at = log.rfind(kOv); at != std::string::npos) ov = std::atoll(log.c_str() + at + kOv.size());
+            fprintf(stderr, "    BGL run %d (stage 2b): %lld lane-0 steps issued beside a lane-1 step in flight\n", k, ov);
+            CHECK(ov >= 0);
+            /* qfn-on-ds F65: the second Ctx asks for its CU keep (default 8) at bring-up; the host backend has no CUs and says so */
+            CHECK(log.find("F65 CU keep: the backend has no CU masks") != std::string::npos);
+        }
+        if (k == 2) CHECK(log.find("F65 CU keep") == std::string::npos);   /* =2 runs one step at a time: no keep */
+        /* run 4: the ahead form engaged (its start line) and lane 0 issued steps ahead; runs 0-3 issue none */
+        {
+            long long ah = -1, beside = -1;
+            static const std::string kAh = "lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): ";
+            if (const size_t at = log.rfind(kAh); at != std::string::npos)
+                (void)std::sscanf(log.c_str() + at + kAh.size(), "%lld lane-0 step(s) issued ahead, %lld", &ah, &beside);
+            if (k == 4) {
+                fprintf(stderr, "    BGL run 4 (stage 2b ahead): %lld lane-0 steps issued ahead, %lld beside a lane-1 step\n", ah, beside);
+                CHECK(log.find("lane 0 issues its decode steps ahead beside lane 1's steps") != std::string::npos);
+                CHECK(ah > 0);
+                /* the host backend runs a pass at issue, so lane 1's end event has completed before lane 0's next issue_ahead: the
+                 * decline on a finished lane-1 step leaves none beside it (without the decline: 118 of 194 in the mutation run) */
+                CHECK_EQ(beside, 0);
+            } else {
+                CHECK(log.find(kAh) == std::string::npos);
+            }
+        }
+        CHECK(lent > 0);
+        CHECK(steps > 0 && steps <= lent);
+        CHECK(rows >= 680);
+    }
+}
+
 /* tp8 loop D45 (RADIANCE_PP_NODE_IDLE=2 + RADIANCE_PP_NODE_IDLE_S=1 on both nodes): the node-idle time BY STRETCH -- with a BG
  * step in flight or without -- beside D8's line, with newcomers lent whole to a BG lane (3 lanes, BG_LANE=1, W(1,3), the
  * follower's one-layer segments): every request's tokens are one process's; each node's run line is D8's (the same text, so

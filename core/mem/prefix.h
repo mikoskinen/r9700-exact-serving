@@ -46,6 +46,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
 #include <list>
 #include <memory>
 #include <string>
@@ -271,6 +273,52 @@ public:
     void set_policy(std::unique_ptr<CheckpointPolicy> p);
     /* The drafter's refill window (CheckpointPolicy::set_floor), held across set_policy. */
     void set_drafter_floor(int64_t tokens);
+    /* qfn-on-ds F72 (Qwen loop round 27; RADIANCE_PREFIX_UNREST=1 at start, off = today): insert() retires a publisher's
+     * own snapshots that rest on an entry the cache keeps another publisher's copy of (see Stats::unrested). Tests set it. */
+    void set_unrest(bool on) { unrest_ = on ? 1 : 0; }
+    bool unrest() const { return unrest_ != 0; }
+    /* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): the same rule, but an entry whose kept copy
+     * holds the same BYTES as this request's own (every cached group, every layer, every rank: same_bytes_fn) is no
+     * conflict -- the request's snapshots rest on bytes equal to the cache's, so they stay; the rule retires only from the
+     * first entry whose copies differ (or that cannot be compared: off the card, no comparer installed). 1 = F72's rule
+     * as written, 0 = off. Tests set it. */
+    void set_unrest_mode(int mode) { unrest_ = mode < 0 ? 0 : mode > 3 ? 3 : mode; }
+    int  unrest_mode() const { return unrest_; }
+    /* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; RADIANCE_PREFIX_UNREST=3): nothing is retired and nothing is
+     * compared. Where the cache keeps another publisher's copy of an entry this request's own snapshots rest on, insert()
+     * keeps the request's OWN blocks of every such entry as an overlay held by those snapshots (refcounted, released with
+     * the last one: retire_ckpt); a lookup that resumes one of them hands the overlay's blocks for those entries, so the hit
+     * attends the bytes its state was computed from, whatever made the two copies differ (F81: step shape, decode-written
+     * vs prefilled). A reservation at a snapshot another request computed is refused (its slot keeps that request's state
+     * and overlay). The overlays together hold at most RADIANCE_PREFIX_UNREST3_PCT % (default 10) of the cached pool's
+     * entries: past it the least recently used overlay's snapshots are retired, and an insert that still does not fit
+     * retires as mode 1 does. Tests set the cap with set_unr3_pct. */
+    void set_unr3_pct(int pct) { unr3_pct_ = pct < 0 ? 0 : pct > 100 ? 100 : pct; }
+    /* qfn-on-ds round 56 (COORD 03:43, the two every-mode gaps of DEV note 03:26; RADIANCE_PREFIX_EXACT, a bit set, 0 =
+     * today). Bit 1, lever EGN: every entry carries the clock value its bytes were indexed at (born: a new entry, a
+     * republish; a host round trip keeps it), and a snapshot the clock value its owner's publish sealed it at; a snapshot
+     * is never handed out over an entry born after its seal -- an entry evicted while a snapshot rested on it and indexed
+     * again by another publisher holds other bytes (gap (a)) -- and insert() retires such snapshots on its chain. A
+     * reservation at another request's snapshot makes that request its owner, unsealed until its publish. Bit 2, lever
+     * KOW: a request fn4 preempt_keep parks keeps its own blocks of every entry the cache holds another copy of
+     * (keep_own), its rejoin's lookup hands those, and stops at an entry born after the park (gap (b)); drop_kept / release
+     * give them back. Tests set it. */
+    void set_exact(int bits) { exact_ = bits < 0 ? 0 : bits & 3; }
+    int  exact() const { return exact_; }
+    /* KOW (exact bit 2): the request `req` is parked with the first `n_tokens` of `tokens` in whole blocks `blocks` (one
+     * table per cached group, as insert). Keeps a reference on its own blocks of every whole entry the cache holds on the
+     * card as another copy; returns how many entries, negative on a refusal (nothing kept). 0 and nothing kept with bit 2
+     * off. */
+    int64_t keep_own(uint64_t req, const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm,
+                     const std::vector<std::vector<int32_t>>& blocks, int64_t n_tokens);
+    /* KOW: give back what keep_own kept for `req` (after its rejoin adopted them, or a recompute). */
+    void drop_kept(uint64_t req);
+    /* Installed by the engine under RADIANCE_PREFIX_UNREST=2: `a` and `b` are `n` entries' block ids, entry-major in
+     * entry_groups() order (n * entry_groups().size() ids each); returns how many LEADING entries hold the same bytes in
+     * a's and b's blocks on every rank, every layer of every cached group (n when all do), negative on a failure (then
+     * nothing counts as equal). Called inside insert() on the step thread under the scheduler's lock, only where the F72
+     * rule would retire snapshots. Empty: mode 2 retires as mode 1 does. */
+    std::function<int64_t(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n)> same_bytes_fn;
     const CheckpointPolicy& policy() const { return *policy_; }
 
     /* ---------------- full attention ---------------- */
@@ -286,6 +334,10 @@ public:
                     const std::vector<MMContentKey>& mm,
                     std::vector<std::vector<int32_t>>* blocks_out = nullptr,
                     const HitCap* cap = nullptr, uint64_t session = 0) const;
+    /* qfn-on-ds lever SRB (Qwen loop round 58): the tokens a lookup of `tokens` would let a sequence skip today (the whole
+     * entries on the card, backed off by one on a full hit; with recurrent state the deepest snapshot at or below) -- an
+     * ESTIMATE for the scheduler's prefill order: no LRU touch, no counter, no snapshot taken over, nothing handed out. */
+    int64_t probe(const std::vector<int32_t>& tokens, const std::vector<MMContentKey>& mm) const;
 
     /* Publish the whole entries a sequence just filled. `blocks[i]` is the block table of
      * cached_groups()[i]. Takes a KV reference on every newly indexed block. */
@@ -384,7 +436,7 @@ public:
      * read by its forward by now, and the ones it reserved have been saved into (the engine
      * issues the save before the next step is planned); until this call they keep their slots
      * against retention, reserve_checkpoint's eviction and expiry. */
-    void begin_step() { handed_.clear(); reserved_.clear(); }
+    void begin_step();
 
     /* ---------------- expiry ----------------
      *
@@ -458,6 +510,26 @@ public:
         /* Entries whose bytes a later publisher's took over (republish): no snapshot rested on
          * the first copy, and the publisher's snapshots rest on its own. */
         int64_t republished = 0;
+        /* qfn-on-ds F72 (Qwen loop round 27): a publisher's own snapshots retired because an entry below them keeps another
+         * publisher's bytes (pinned under another snapshot, or read by a live sequence, so republish could not take it): a
+         * hit would resume their state over bytes they were not computed from. */
+        int64_t unrested = 0;
+        /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): entries whose two copies were compared at an F72 conflict, how many of
+         * them held the same bytes (the request's snapshots stayed over them), and the inserts that found a difference. */
+        int64_t unrest_compared = 0, unrest_equal = 0, unrest_differ = 0;
+        /* qfn-on-ds F81 UNR3 (RADIANCE_PREFIX_UNREST=3): overlays made, entries put into them, entries the live overlays
+         * hold now (blocks held only by them once the publisher frees: `unr3_fresh`), snapshot attachments, lookups that
+         * resumed an overlay's owner and the entries they took from it, reservations refused at another request's
+         * snapshot, snapshots retired by the cap, inserts the cap sent to F72's rule. */
+        int64_t unr3_overlays = 0, unr3_entries = 0, unr3_live = 0, unr3_fresh = 0, unr3_attached = 0;
+        int64_t unr3_resumed = 0, unr3_substituted = 0, unr3_refused = 0, unr3_capped = 0, unr3_fallback = 0;
+        /* round 56 EGN (RADIANCE_PREFIX_EXACT bit 1): snapshots a lookup passed over because an entry under them was born
+         * after their seal, snapshots insert() retired for it, re-reservations that changed a snapshot's owner. KOW (bit 2):
+         * parks that kept own entries, the entries kept, rejoin lookups that took them, and the ones stopped at a re-born
+         * entry. */
+        int64_t egn_skipped = 0, egn_retired = 0, egn_reowned = 0;
+        int64_t kow_parks = 0, kow_entries = 0, kow_substituted = 0, kow_stopped = 0;
+        int64_t kow_unindexed = 0;   /* round 57: kept entries served from the own copy with no indexed entry there */
     };
     const Stats& stats() const { return stats_; }
 
@@ -482,10 +554,15 @@ private:
         /* Last hit or publish, monotonic clock. Every path that moves an entry to the LRU's back
          * stamps it, so the list is in this order and expiry stops at the first entry it keeps. */
         uint64_t used_ns = 0;
+        /* EGN: `clock_` when these bytes were indexed (created, or republished); a restore keeps it */
+        uint64_t born = 0;
         std::list<BlockHash>::iterator lru;
     };
     struct Ckpt {
         uint64_t  session = 0;
+        /* F72: the request whose step computed this state (the reserving session); take_over re-indexes `session` for
+         * retention, this stays */
+        uint64_t  owner = 0;
         int64_t   pos = 0;
         BlockHash prefix;
         int32_t   slot = -1;
@@ -497,7 +574,51 @@ private:
          * planned and the copy after the step that computes it; in between the slot still holds
          * the previous tenant's state and must not be handed out. */
         bool      valid = false;
+        /* UNR3: the overlay (overlays_ key) this snapshot rests on beside the cache's entries, 0 if none */
+        uint64_t  overlay = 0;
+        /* EGN: `clock_` at its owner's publish (every entry under it born at or before), 0 = not sealed (not checked);
+         * the request a reservation by another session hands it to at its commit, 0 = none */
+        uint64_t  sealed = 0;
+        uint64_t  next_owner = 0;
     };
+    /* KOW: what keep_own kept for a parked request -- chain entry indexes (ascending), their blocks entry-major in
+     * entry_groups_ order (one reference each), the seal (`clock_` at the park) */
+    struct Kept {
+        std::vector<int64_t> at;
+        std::vector<int32_t> blocks;
+        uint64_t sealed = 0;
+    };
+    std::unordered_map<uint64_t, Kept> kept_;
+    int exact_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_EXACT");
+                      return e && *e ? (std::atoi(e) & 3) : 0; }();
+    /* EGN: whether snapshot `c` may be handed out over the chain entries whose born values are `born` (one per entry,
+     * UINT64_MAX for an entry not in the index) with running maxima `pm` */
+    bool egn_ok(const Ckpt& c, const std::vector<uint64_t>& born, const std::vector<uint64_t>& pm) const;
+    /* EGN: born values of the chain `hs`'s first `n` entries and their running maxima */
+    void egn_borns(const std::vector<BlockHash>& hs, int64_t n, std::vector<uint64_t>* born,
+                   std::vector<uint64_t>* pm) const;
+    mutable std::vector<uint64_t> egn_born_, egn_pm_;   /* lookup's scratch */
+    /* UNR3: a publisher's own copies of entries the cache keeps another copy of. `at` = chain entry indexes, ascending;
+     * `blocks` = at.size() x entry_groups_.size() ids, entry-major in entry_groups_ order, each with one KV reference of
+     * the overlay's; `held_by` = the snapshots attached (one reference each); `fresh` = entries with a block only the
+     * overlay and its publisher held at the insert (the memory it adds, for the cap). */
+    struct Overlay {
+        std::vector<int64_t> at;
+        std::vector<int32_t> blocks;
+        std::vector<BlockHash> held_by;
+        uint64_t owner = 0;
+        int64_t  fresh = 0;
+    };
+    std::unordered_map<uint64_t, Overlay> overlays_;
+    uint64_t next_overlay_ = 0;
+    int unr3_pct_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST3_PCT");
+                         const int v = e && *e ? std::atoi(e) : 10; return v < 0 ? 0 : v > 100 ? 100 : v; }();
+    /* UNR3 helpers: attach / detach one snapshot's reference (the last detach releases the blocks); the cap's room in
+     * entries; retire the least recently used overlays' snapshots until `need` fresh entries fit (false if they cannot). */
+    void unr3_attach(Ckpt& c, const BlockHash& key, uint64_t id);
+    void unr3_detach(Ckpt& c, const BlockHash& key);
+    int64_t unr3_cap() const;
+    bool unr3_make_room(int64_t need, uint64_t keep_owner);
 
     std::vector<BlockHash> chain_all(const std::vector<int32_t>& tokens,
                                      const std::vector<MMContentKey>& mm,
@@ -547,7 +668,8 @@ private:
      * snapshots, a few hundred, rather than the chain's blocks. */
     std::unordered_map<BlockHash, Ckpt, BlockHashHash>::iterator
     deepest_ckpt(const std::vector<BlockHash>& hs, int64_t limit,
-                 const std::vector<int64_t>* at = nullptr) const;
+                 const std::vector<int64_t>* at = nullptr,
+                 const std::vector<uint64_t>* born = nullptr, const std::vector<uint64_t>* pm = nullptr) const;
     static double idle_s(uint64_t used_ns);
 
     KVManager*  kv_ = nullptr;
@@ -560,6 +682,11 @@ private:
     std::vector<int32_t> per_;            /* blocks of groups_[i] an entry holds */
     std::vector<int32_t> entry_groups_;   /* the group of each of an entry's blocks */
     bool        has_linear_ = false;
+    /* 0 off, 1 F72's rule, 2 F79's (compare the copies' bytes first), 3 UNR3 (keep the request's own copies as an overlay);
+     * any other non-zero value is 1, as before */
+    int         unrest_ = [] { const char* e = std::getenv("RADIANCE_PREFIX_UNREST");
+                               return !(e && *e && *e != '0') ? 0 : (e[0] == '2' && e[1] == 0) ? 2
+                                    : (e[0] == '3' && e[1] == 0) ? 3 : 1; }();
 
     mutable std::unordered_map<BlockHash, Entry, BlockHashHash> map_;
     mutable std::list<BlockHash> lru_;    /* front = oldest; resident entries only */
@@ -587,6 +714,15 @@ private:
     bool reserved(const BlockHash& h) const {
         return std::find(reserved_.begin(), reserved_.end(), h) != reserved_.end();
     }
+    /* F72: snapshots insert() found resting on bytes the cache does not hold while they were handed out or reserved this
+     * step: invalid from then on, retired at their commit or at the next begin_step. */
+    std::vector<BlockHash> unrested_;
+    bool unrested(const BlockHash& h) const {
+        return std::find(unrested_.begin(), unrested_.end(), h) != unrested_.end();
+    }
+    /* F72: retire the snapshots `owner` computed on chain `hs` deeper than entry `kept_b` (they rest on its own copy of an
+     * entry the cache holds another publisher's bytes for), whichever session indexes them now; returns how many. */
+    int64_t retire_unrested(uint64_t owner, const std::vector<BlockHash>& hs, int64_t kept_b);
     mutable uint64_t clock_ = 0;
     std::unique_ptr<CheckpointPolicy> policy_;
     int64_t drafter_floor_ = 0;

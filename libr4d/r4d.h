@@ -796,9 +796,15 @@ int r4d_ar_xpush_set(int on);
  * 8 = lever FAS (qfn-on-ds round 15): the drain-1 fence at every four-rank size */
 int r4d_ar_fence_set(int v);
 int r4d_kv_vic_set(int on);   /* fn4 kvs_vic: kv_resolve victims by compaction (1) or serially (0) */
+int r4d_kv_flat_set(int on);   /* fn4 kvs_flat: kv_resolve steps 2 / 7 over the flat entry space (1) or by rows (0) */
 // fn4 ar_laneblocks: that lane's block count -- 0 the resolved tunable (4), else 4..24 in steps of 4
 // (RADIANCE_FN4_AR_LANE_BLOCKS at start). The sums do not depend on it. 1 applied, -1 refused.
 int r4d_ar_lane_blocks_set(int blocks);
+// qfn-on-ds lever LSK (Qwen loop round 27): the lane form's SECOND pair, taken by an `overlap` 1 rows collective whose op
+// declares `lane_kind` 1 (qwen4exp's SP-serial ops under RADIANCE_FN4_SPSER_LANE=1) -- 0 = follow the first pair, else the
+// first pair's values (RADIANCE_FN4_AR_LANE_THREADS_S / _BLOCKS_S at start). The sums do not depend on it.
+int r4d_ar_lane_threads_s_set(int threads);
+int r4d_ar_lane_blocks_s_set(int blocks);
 // fn4 runtime switch hook (core runtime/fn4_switch.h): "hc_fusedown" / "hc_normwave" / "hc_writevec" /
 // "hc_readv" / "ar_lanethreads" -> 1 applied, -1 refused, anything else 0.
 int rad_fn4_switch(const char* name, int value);

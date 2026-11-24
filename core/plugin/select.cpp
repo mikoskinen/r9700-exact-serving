@@ -484,16 +484,20 @@ int Registry::init_instance(Resolved& r, int rank, int world_size) {
     return RAD_OK;
 }
 
-int Registry::init_instance_set(Resolved& r, int rank, int world_size, int set) {
+int Registry::init_instance_set(Resolved& r, int rank, int world_size, int set, bool any_row) {
     if (!r.row || !r.row->info || set <= 0) return RAD_E_INVAL;
     const RadKernelInfo* k = r.row->info;
-    if (!k->init || !r.row->collective) { r.instance1 = nullptr; return RAD_OK; }
+    if (!k->init || (!r.row->collective && !any_row)) { r.instance1 = nullptr; return RAD_OK; }
     std::vector<RadParam> ps(r.geom.params(), r.geom.params() + r.geom.n_params());
-    RadParam s{};
-    s.key = "ar_set";
-    s.kind = RAD_P_INT;
-    s.ival = set;
-    ps.push_back(s);
+    /* the set's number is a collective's parameter (its slots by set); any other row's second instance is a plain second init
+     * (qfn-on-ds lever BGL stage 2: its own counters / scratch) */
+    if (r.row->collective) {
+        RadParam s{};
+        s.key = "ar_set";
+        s.kind = RAD_P_INT;
+        s.ival = set;
+        ps.push_back(s);
+    }
     void* inst = nullptr;
     const int st = k->init(ps.data(), (int)ps.size(), rank, world_size, &inst);
     if (st < 0) {

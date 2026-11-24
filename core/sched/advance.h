@@ -24,6 +24,7 @@
 
 #include "rad_device.h"
 #include "draft.h"
+#include "force_al.h"
 
 namespace rad {
 
@@ -68,6 +69,10 @@ enum AdvMode : int32_t {
     ADV_CTXTREE = 8,  /* before the context pass: the accepted path's rows at their depth, the
                        * rejected rows stored nowhere */
 };
+
+/* ADV_ACCEPT's row number under RADIANCE_DRAFT_FORCE_AL (Scheduler::fal_eos_bit): the row's request runs under ignore_eos, so
+ * a drafted stop token does not end it and does not cut its forced count; the draft count is the number without the bit. */
+enum : int32_t { kAdvAuxKeepEos = 1 << 30 };
 
 /* The most paged KV groups one ADV_COMPACT moves (the trunk's sliding and global groups and a
  * drafter's own, with room). */
@@ -160,6 +165,9 @@ struct AdvanceArgs {
     /* ADV_COMPACT: every paged group's cache on this rank. */
     AdvPool pool[kAdvMaxPools] = {};
     int32_t n_pool = 0;
+    /* ADV_ACCEPT under RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): a chain verify accepts
+     * fal_count(...) drafts instead of the agreed ones; `fal.on` 0 (every other mode, and unset) = the agreement rule. */
+    ForceAl fal;
 };
 
 /* Issue one advance on `s`. The rows are independent, so the card runs them in parallel. */

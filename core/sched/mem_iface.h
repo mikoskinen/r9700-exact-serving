@@ -201,9 +201,18 @@ struct IPrefixCache {
      * null, ends the hit early (HitCap, core/mem/prefix.h). */
     virtual CacheHit lookup(const Request& r, std::vector<std::vector<int32_t>>* blocks_out,
                             const HitCap* cap) const = 0;
+    /* qfn-on-ds lever SRB (Qwen loop round 58): the tokens a lookup would let `r` skip, as an estimate for the prefill
+     * order -- no effect on the cache (PrefixCache::probe); -1 where the cache cannot say. */
+    virtual int64_t probe(const Request& r) const { (void)r; return -1; }
     /* fn4 preempt_keep (Scheduler::rejoin_kept): while set, lookup and restore key on these tokens -- a kept request's
      * prompt ++ output, which its publish indexed -- instead of the prompt; nullptr goes back to the prompt. */
     virtual void whole_sequence(const std::vector<int32_t>* tokens) { (void)tokens; }
+    /* round 56 (RADIANCE_PREFIX_EXACT, PrefixCache::set_exact): the bit set in force, 0 = off. Bit 2 (KOW): a request
+     * fn4 preempt_keep parks keeps its own blocks of the whole entries (prompt ++ output, as insert) the cache holds another
+     * copy of; its rejoin's lookup hands them; drop_kept gives them back. keep_own < 0: refused, nothing kept. */
+    virtual int  exact() const { return 0; }
+    virtual int64_t keep_own(const Request&, const std::vector<std::vector<int32_t>>&, int64_t) { return 0; }
+    virtual void drop_kept(const Request&) {}
     virtual const std::vector<int32_t>& cached_groups() const = 0;
     /* The drafter's refill window (Scheduler::init): retention keeps a snapshot that deep below a
      * session's tip, so a refill-capped hit has one to end on (PrefixCache::set_drafter_floor). */
@@ -469,6 +478,10 @@ struct PCBinding final : IPrefixCache {
         /* r.id: the admission takes its conversation's snapshots over. */
         return m->lookup(seq_ ? *seq_ : r.prompt, mm_, out, cap, r.id);
     }
+    int64_t probe(const Request& r) const override {
+        media_keys(r, &mm_, salt_id);
+        return m->probe(r.prompt, mm_);
+    }
     const std::vector<int32_t>* seq_ = nullptr;
     void whole_sequence(const std::vector<int32_t>* tokens) override { seq_ = tokens; }
 
@@ -512,6 +525,16 @@ struct PCBinding final : IPrefixCache {
         m->hold(r.id, r.prompt, mm_);
     }
     void release(const Request& r) override { m->release(r.id); }
+    int  exact() const override { return m->exact(); }
+    int64_t keep_own(const Request& r, const std::vector<std::vector<int32_t>>& blocks, int64_t n_tokens) override {
+        std::vector<int32_t> toks;
+        toks.reserve(r.prompt.size() + r.output.size());
+        toks.insert(toks.end(), r.prompt.begin(), r.prompt.end());
+        toks.insert(toks.end(), r.output.begin(), r.output.end());
+        media_keys(r, &mm_, salt_id);
+        return m->keep_own(r.id, toks, mm_, blocks, n_tokens);
+    }
+    void drop_kept(const Request& r) override { m->drop_kept(r.id); }
     const std::vector<int32_t>& cached_groups() const override { return m->cached_groups(); }
     void set_drafter_floor(int64_t tokens) override { m->set_drafter_floor(tokens); }
 

@@ -127,6 +127,10 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
     switch (a.mode) {
     case ADV_ACCEPT: {
         const int32_t* y = a.src + rout;
+        /* RADIANCE_DRAFT_FORCE_AL: the row's request runs under ignore_eos (kAdvAuxKeepEos, staged only while the env is
+         * set); the draft count is the number without the bit. */
+        const bool keep_eos = a.fal.on && (rows[3 * a.row_pitch + i] & kAdvAuxKeepEos);
+        const int32_t aux = keep_eos ? (rows[3 * a.row_pitch + i] & ~kAdvAuxKeepEos) : rows[3 * a.row_pitch + i];
         /* A tree verify, which the trunk's spec_parent row says (its first entry is -1, the root,
          * whoever staged it: ADV_TRUNK for a card row, the builder for a host row): accept_tree's
          * rule. From the bonus token, follow the first child (lowest node index) whose token is
@@ -161,17 +165,29 @@ RAD_ADV_FN void adv_row(const AdvanceArgs& a, int i) {
          * while it equals the target's pick at its position, and the run stops at an
          * end-of-generation token, not after it. */
         const int32_t* d = tok + rtok + 1;
-        int32_t acc = 0;
-        while (acc < aux && d[acc] == y[acc]) ++acc;
-        for (int32_t j = 0; j <= acc; ++j)
-            if (adv_is_eog(a, y[j])) { acc = j; break; }
+        int32_t acc = 0, last;
+        if (a.fal.on && aux > 0) {
+            /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): the first f drafts as drafted, then the
+             * target's token after them; the cut over those emitted tokens, as Engine::collect_step cuts them. */
+            const int32_t f = fal_count(a.fal, a.fal.key, slot, aux);
+            acc = f;
+            if (!a.fal.nocut && !keep_eos)
+                for (int32_t j = 0; j <= f; ++j)
+                    if (adv_is_eog(a, j < f ? d[j] : y[j])) { acc = j; break; }
+            last = acc < f ? d[acc] : y[acc];
+        } else {
+            while (acc < aux && d[acc] == y[acc]) ++acc;
+            for (int32_t j = 0; j <= acc; ++j)
+                if (adv_is_eog(a, y[j])) { acc = j; break; }
+            last = y[acc];
+        }
         const int32_t head = ctx[i] + (rtok - k) + acc;
         S.acc = acc;
         S.head = head;
         S.hrow = rtok + acc;
         S.ctx = head + 1;
         S.n_acc = acc + 1;
-        S.tok[0] = y[acc];
+        S.tok[0] = last;
         S.npath = 0;
         return;
     }

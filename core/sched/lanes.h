@@ -149,6 +149,18 @@ public:
      * follower runs the BG lanes' passes in layer segments (RADIANCE_PP_SEG_LAYERS, without RADIANCE_PP_SEG_PREFILL) with the
      * decode lanes' passes between them; the leader's RADIANCE_PP_READY_FIRST=1 lets decode tails go before them. Default 0. */
     static int bg_env();   /* k from the environment (0: off) */
+    /* qfn-on-ds lever BGL (Qwen loop round 24, QUEUE Q5b S1 stage 1; RADIANCE_BG_LANE_1M=1, one machine, no --pp-nodes): two
+     * lanes in one process -- lane 0 holds every sequence, lane 1 is M8's background prefill lane (bg_env() reads 1 under it
+     * when RADIANCE_PP_BG_LANE is unset). Stage 1 runs the BG lane's steps on the same queue between lane 0's steps
+     * (Engine::step_loop), so it changes composition only (a newcomer's prompt in a lone step instead of a MIXED one);
+     * stage 2 issues them on a second Ctx a rank beside lane 0's decode steps. Off by default. */
+    static bool bg1m_env();
+    /* RADIANCE_BG_LANE_1M=2: stage 2 -- as 1, plus a second Ctx a rank for lane 1's steps (Rank::bg_ctx; WIP: built and budgeted,
+     * the loop does not issue on it yet) */
+    static bool bg1m2_env();
+    /* RADIANCE_BG_LANE_1M=3: stage 2b -- as 2, with lane 1's step issued whole on the second Ctx and finished by its event while lane 0
+     * steps on (the overlap) */
+    static bool bg1m3_env();
     /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N, 1 .. 256; with BG lanes, the same value on both nodes): a BG lane's step slab carves
      * its block tables for N rows instead of --max-num-seqs (each row --max-model-len wide: at 32 x 1 M that is ~512 MiB a card
      * a lane, the whole of a BG lane's slab), and lane_split_bg lends into a BG lane only while its inbox holds fewer than N
@@ -307,6 +319,14 @@ public:
      * (the next chunk's head would rewrite the layers [0, h) state the snapshot copies behind the tail). */
     void set_head_state(bool on) { head_state_ = on; }
     bool head_state() const { return head_state_; }
+    /* qfn-on-ds Qwen tp8 S7b (round 43; RADIANCE_PP_HEAD_SNAP=1 on the leader, Engine::head_stage): the leader stages a
+     * chunk-END snapshot's head-layer rows inside the chunk's HEAD part, so such a chunk no longer holds its sequence; a
+     * snapshot inside a chunk (lever TI / TIP) still does. */
+    void set_head_snap(bool on) { head_snap_ = on; }
+    bool head_snap() const { return head_snap_; }
+    bool snap_holds(int64_t ckpt_tok, int64_t n_tokens) const {
+        return head_state_ && (!head_snap_ || ckpt_tok < n_tokens - 1);
+    }
 
     struct Piece {
         int       home = -1;
@@ -433,6 +453,7 @@ private:
     int64_t hold_steps_ = 0, hold_reqs_ = 0, hold_lent_ = 0, hold_home_ = 0, hold_us_ = 0, hold_max_us_ = 0;
     int64_t split_min_ = 128;
     bool    head_state_ = false;
+    bool    head_snap_ = false;    /* Qwen tp8 S7b */
     int64_t lent_ = 0, done_ = 0, rows_ = 0, tok_ = 0, dpiece_ = 0;
     int64_t why_[kWhyN] = {};
     std::string broken_;

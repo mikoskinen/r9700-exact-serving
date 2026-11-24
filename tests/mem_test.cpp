@@ -4971,6 +4971,670 @@ TEST(a_head_a_short_prompt_published_first_takes_the_bytes_a_longer_prompts_snap
     CHECK_EQ(x.f.pc.stats().republished, 2ll);
 }
 
+/* qfn-on-ds F72 (Qwen loop round 27; test t4p1 on gpu02): a hit must not resume a snapshot over bytes it was not computed
+ * from. A long request recomputes a head another request published (that one still live, so republish cannot take the
+ * entry; or pinned under that one's snapshot) and commits snapshots from ITS copy; the cache keeps the other copy. Today
+ * (unrest off) a hit of the long chain resumes at the long request's snapshot over the other copy -- t4p1's re-sent root
+ * answered otherwise than cold. With RADIANCE_PREFIX_UNREST (set_unrest) insert() retires those snapshots: the hit resumes
+ * where the bytes under it are the ones its state saw (none with a live reader; the pinning publisher's own at 16), and the
+ * long request's snapshots at or below the first kept entry would stay. Both reasons a copy stays (live reader, pinned) and the control (unrest off) are read. */
+TEST(f72_a_snapshot_is_not_resumed_over_another_publishers_copy_of_its_head) {
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (bool on : { false, true }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest(on);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            /* the other publisher: the head (entries 0 and 1) and its own tail */
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            if (reason == 1) {             /* a snapshot of its own at 16 rests on entry 0: pinned */
+                const auto okeys = chain_of(other);
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);   /* not live: only the pin keeps its copy */
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());   /* sequence 1 stays live on the head */
+            }
+            /* the long request: its own blocks, snapshots at 16 (on entry 0 only) and at 320, then the publish */
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            /* entry 0 stays the other's in both cases; under the pin (reason 1) entry 1 rests on no snapshot and is taken */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 2u);
+            CHECK(hit[0][0] != mine[0]);                     /* the cache's head is the other publisher's */
+            if (!on) {
+                CHECK_EQ(h.n_linear_tokens, 320);            /* today: resumes over bytes its state never saw (F72) */
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+            } else {
+                /* no snapshot over the other copy: none at all (live reader), or the other's own at 16 (pinned) */
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                /* the long request's 320 is gone; the pinning publisher's 16 stays (insert's take_over indexes it under 2) */
+                const auto left = x.f.pc.checkpoints(2);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) == left.end());
+                CHECK_EQ(left.size(), reason ? 1u : 0u);
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+        }
+    }
+}
+
+/* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; AgentX c32 agx5): under F72's rule every session of a multi-session
+ * load whose shared system prompt another session published first lost every snapshot (entry 0 pinned under the first
+ * session's snapshots). RADIANCE_PREFIX_UNREST=2 asks the engine's comparer (same_bytes_fn) whether the two copies of
+ * each conflicting entry hold the same bytes, and retires only from the first entry whose copies differ. F72's two
+ * reasons a copy stays (a live reader; pinned), the comparer's answers all-equal / first-differs / one-equal / failure,
+ * no comparer installed, and the rule as written (mode 1) as the control. All equal must also pin the kept copies: the
+ * request's snapshots rest on bytes equal to them, so a later publisher may not replace them. */
+TEST(f79_a_snapshot_stays_over_another_publishers_copy_holding_the_same_bytes) {
+    /* answer: -2 = no comparer installed, -1 = the comparer fails, otherwise the leading equal entries it reports
+     * (99 = all); mode 1 = F72's rule as written (the control) */
+    struct Arm { int mode; int answer; };
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (const Arm arm : { Arm{ 1, 99 }, Arm{ 2, 99 }, Arm{ 2, 0 }, Arm{ 2, 1 }, Arm{ 2, -1 }, Arm{ 2, -2 } }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest_mode(arm.mode);
+            CHECK_EQ(x.f.pc.unrest_mode(), arm.mode);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                const auto okeys = chain_of(other);
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                theirs = bt[0];
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());
+                theirs = x.f.kv.block_table(1, G_FULL);
+            }
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            int calls = 0;
+            int64_t asked = -1;
+            const size_t W = x.f.pc.entry_groups().size();
+            if (arm.answer != -2)
+                x.f.pc.same_bytes_fn = [&](const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n) -> int64_t {
+                    ++calls;
+                    asked = n;
+                    CHECK_EQ(a.size(), (size_t)n * W);
+                    CHECK_EQ(b.size(), (size_t)n * W);
+                    CHECK_EQ(a[0], theirs[0]);                  /* the kept copy first, this request's second */
+                    CHECK_EQ(b[0], mine[0]);
+                    if (n > 1) { CHECK_EQ(a[W], theirs[1]); CHECK_EQ(b[W], mine[1]); }
+                    return arm.answer == 99 ? n : arm.answer;
+                };
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t conflicts = reason ? 1 : 2;           /* under the pin entry 1 is republished, not a conflict */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            const bool asks = arm.mode == 2 && arm.answer != -2;
+            CHECK_EQ(calls, asks ? 1 : 0);
+            if (asks) { CHECK_EQ(asked, conflicts); }
+            const int64_t equal = !asks ? 0 : arm.answer == 99 ? conflicts : std::max<int64_t>(0, std::min<int64_t>(arm.answer, conflicts));
+            CHECK_EQ(x.f.pc.stats().unrest_compared, asks ? conflicts : 0ll);
+            CHECK_EQ(x.f.pc.stats().unrest_equal, equal);
+            const bool stays = equal == conflicts;              /* no copy differs: the snapshot at 320 stays */
+            CHECK_EQ(x.f.pc.stats().unrest_differ, asks && !stays ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 2u);
+            CHECK(hit[0][0] != mine[0]);                        /* the cache's head stays the other publisher's */
+            CHECK_EQ(hit[0][0], theirs[0]);
+            const auto left = x.f.pc.checkpoints(2);
+            if (stays) {
+                CHECK_EQ(h.n_linear_tokens, 320);
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) != left.end());
+            } else {
+                /* F72 as written: from the first copy that differs (or every one, when nothing could be compared) */
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                CHECK(std::find(left.begin(), left.end(), (int64_t)320) == left.end());
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+            /* A third publisher with its own copy of the head and a snapshot over it, nothing live on the head now: the
+             * entries that held equal bytes are pinned (the second request's snapshot rests on them), so they keep the
+             * first copy; without the pin (live reader, F72 retired) republish takes them. */
+            if (reason == 0) {
+                x.f.pc.same_bytes_fn = nullptr;
+                x.f.pc.set_unrest_mode(0);
+                const int64_t before = x.f.pc.stats().republished;
+                CHECK_OK(x.f.kv.add_sequence(3));
+                CHECK_OK(x.f.kv.ensure(3, (int64_t)prompt.size()));
+                const std::vector<int32_t> third = x.f.kv.block_table(3, G_FULL);
+                ckpt_at(x.f, 3, keys, 32);
+                CHECK_OK(x.f.pc.insert(3, prompt, {}, { third }, 32));
+                CHECK_EQ(x.f.pc.stats().republished - before, conflicts - equal);   /* the pinned ones stay */
+                x.f.kv.free_sequence(3);
+            }
+        }
+    }
+}
+
+/* qfn-on-ds F81 lever UNR3 (Qwen loop round 55, QUEUE Q102; AgentX agx15: under UNR2 half the conflicting head copies differ
+ * by step shape, so 1,487 snapshots were retired): RADIANCE_PREFIX_UNREST=3 keeps the publisher's OWN blocks of every entry
+ * the cache keeps another copy of as an overlay held by its snapshots, and a lookup resuming one of those snapshots hands
+ * the overlay's blocks for those entries. F72's two reasons a copy stays (a live reader; pinned) x the modes: 0 (today:
+ * resumes at 320 over the other's head = the negative control of the block check), 1 (F72: retired), 3 (resumes at 320 over
+ * ITS OWN head). Then, under 3: the other publisher's own hit still reads its own copy; the overlay outlives the publisher's
+ * sequence and goes with its last snapshot; a request that resumed the snapshot and publishes deeper carries the same
+ * blocks into its own overlay; a reservation at another request's snapshot is refused (same owner: allowed); the cap (0 %)
+ * sends the insert to F72's rule; a cap the next overlay does not fit under retires the least recently used overlay's
+ * snapshots. */
+TEST(f81_unr3_a_snapshot_resumes_over_its_own_copy_kept_beside_the_caches) {
+    for (int reason : { 0, 1 }) {          /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+        for (int mode : { 0, 1, 3 }) {
+            TierFixture x;
+            CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            x.f.pc.set_unrest_mode(mode);
+            CHECK_EQ(x.f.pc.unrest_mode(), mode);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            const auto okeys = chain_of(other);
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                CHECK_OK(x.f.kv.add_sequence(1));
+                CHECK_OK(x.f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(x.f, 1, okeys, 16);
+                std::vector<std::vector<int32_t>> bt;
+                for (int32_t g : x.f.pc.cached_groups()) bt.push_back(x.f.kv.block_table(1, g));
+                theirs = bt[0];
+                CHECK_OK(x.f.pc.insert(1, other, {}, bt, (int64_t)other.size()));
+                x.f.kv.free_sequence(1);
+            } else {
+                publish(x.f, 1, other, (int64_t)other.size());
+                theirs = x.f.kv.block_table(1, G_FULL);
+            }
+            CHECK_OK(x.f.kv.add_sequence(2));
+            CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+            ckpt_at(x.f, 2, keys, 320);
+            CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t conflicts = reason ? 1 : 2;           /* under the pin entry 1 is republished, not a conflict */
+            CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 0ll);
+            std::vector<std::vector<int32_t>> hit;
+            const CacheHit h = x.f.pc.lookup(prompt, {}, &hit);
+            REQUIRE(hit.size() == 1u && hit[0].size() >= 20u);
+            if (mode == 0) {
+                /* the negative control: resumes at 320 over the other publisher's head (F72's defect) */
+                CHECK_EQ(h.n_linear_tokens, 320);
+                CHECK_EQ(hit[0][0], theirs[0]);
+                CHECK(hit[0][0] != mine[0]);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+            } else if (mode == 1) {
+                CHECK_EQ(h.n_linear_tokens, reason ? 16 : 0);
+                CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+            } else {
+                /* UNR3: resumes at 320 over ITS OWN copy of every entry under the snapshot; nothing retired */
+                CHECK_EQ(h.n_linear_tokens, 320);
+                for (int i = 0; i < 20; ++i) CHECK_EQ(hit[0][(size_t)i], mine[(size_t)i]);
+                CHECK_EQ(x.f.pc.stats().unrested, 0ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_live, conflicts);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, conflicts);
+                CHECK_EQ(x.f.pc.stats().unr3_attached, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_resumed, 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_substituted, conflicts);
+                /* the cache's entry 0 stays the other's: a lookup of the other prompt (pinned: resumes its own 16) reads it */
+                std::vector<std::vector<int32_t>> oh;
+                const CacheHit h1 = x.f.pc.lookup(other, {}, &oh);
+                REQUIRE(oh.size() == 1u && !oh[0].empty());
+                CHECK_EQ(oh[0][0], theirs[0]);
+                CHECK_EQ(h1.n_linear_tokens, reason ? 16 : 0);
+                /* a reservation at request 2's snapshot by another request is refused; request 2's own is not */
+                int32_t s4 = -1;
+                CHECK_EQ(x.f.pc.reserve_checkpoint(4, 320, keys[19], &s4), RAD_E_FULL);
+                CHECK_EQ(x.f.pc.stats().unr3_refused, 1ll);
+                int32_t s2 = -1;
+                CHECK_OK(x.f.pc.reserve_checkpoint(2, 320, keys[19], &s2));
+                CHECK(s2 >= 0);
+                x.f.pc.commit_checkpoint(keys[19]);
+                /* the overlay outlives the publisher's sequence: its blocks of the conflicting entries stay referenced */
+                if (reason == 0) x.f.kv.free_sequence(1);
+                x.f.kv.free_sequence(2);
+                CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 1);
+                /* request 3 resumes request 2's snapshot, adopts what the hit hands (its own head = request 2's copy), goes
+                 * on to 400 with a snapshot there and publishes: its overlay holds the same blocks (no new entry) */
+                x.f.pc.begin_step();
+                std::vector<int32_t> longer = prompt;
+                const auto more = tok_run(12000, 96);
+                longer.insert(longer.end(), more.begin(), more.end());
+                const auto lkeys = chain_of(longer);
+                std::vector<std::vector<int32_t>> h3;
+                const CacheHit hh = x.f.pc.lookup(longer, {}, &h3, nullptr, 3);
+                CHECK_EQ(hh.n_linear_tokens, 320);
+                REQUIRE(h3.size() == 1u && h3[0].size() >= 20u);
+                h3[0].resize(20);
+                CHECK_OK(x.f.kv.add_sequence(3));
+                CHECK_OK(x.f.kv.adopt(3, G_FULL, h3[0], 320));
+                CHECK_OK(x.f.kv.ensure(3, (int64_t)longer.size()));
+                const std::vector<int32_t> t3 = x.f.kv.block_table(3, G_FULL);
+                CHECK_EQ(t3[0], mine[0]);
+                ckpt_at(x.f, 3, lkeys, 400);
+                CHECK_OK(x.f.pc.insert(3, longer, {}, { t3 }, 400));
+                /* live reader gone (reason 0): no snapshot rests on the other's head, so the cache takes request 3's bytes
+                 * (= request 2's overlay blocks) by republish; pinned (reason 1): entry 0 stays the other's and request 3's
+                 * own overlay carries the same block (no new memory) */
+                CHECK_EQ(x.f.pc.stats().republished, reason ? 1ll : 2ll);
+                CHECK_EQ(x.f.pc.stats().unr3_overlays, reason ? 2ll : 1ll);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, conflicts);
+                x.f.kv.free_sequence(3);
+                /* a hit of request 3's chain resumes its 400 over request 2's copy of the head (the overlay or the cache) */
+                x.f.pc.begin_step();
+                std::vector<std::vector<int32_t>> h4;
+                const CacheHit h4h = x.f.pc.lookup(longer, {}, &h4);
+                CHECK_EQ(h4h.n_linear_tokens, 400);
+                REQUIRE(h4.size() == 1u && h4[0].size() >= 25u);
+                CHECK_EQ(h4[0][0], mine[0]);
+                if (reason == 0) { CHECK_EQ(h4[0][1], mine[1]); }
+                x.f.pc.begin_step();
+                x.f.pc.clear();
+                CHECK_EQ(x.f.pc.stats().unr3_live, 0ll);
+                CHECK_EQ(x.f.pc.stats().unr3_fresh, 0ll);
+                CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 0);   /* the last snapshot released the overlay */
+                continue;
+            }
+            if (reason == 0) x.f.kv.free_sequence(1);
+            x.f.kv.free_sequence(2);
+        }
+    }
+    /* the cap: 0 % sends the insert to F72's rule (the snapshot at 320 retired, no overlay, the blocks not kept) */
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        x.f.pc.set_unrest_mode(3);
+        x.f.pc.set_unr3_pct(0);
+        const auto prompt = tok_run(7600, 336);
+        const auto keys = chain_of(prompt);
+        std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+        const auto tail = tok_run(9600, 32);
+        other.insert(other.end(), tail.begin(), tail.end());
+        publish(x.f, 1, other, (int64_t)other.size());
+        CHECK_OK(x.f.kv.add_sequence(2));
+        CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+        ckpt_at(x.f, 2, keys, 320);
+        CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(x.f.pc.stats().unr3_fallback, 1ll);
+        CHECK_EQ(x.f.pc.stats().unr3_overlays, 0ll);
+        CHECK_EQ(x.f.pc.stats().unrested, 1ll);
+        CHECK_EQ(x.f.pc.lookup(prompt, {}).n_linear_tokens, 0);
+        x.f.kv.free_sequence(2);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, mine[0]), 0);
+        x.f.kv.free_sequence(1);
+    }
+    /* the cap: 1 % of the pool's entries; a second overlay that does not fit beside the first retires the first's snapshot
+     * (least recently used, not handed out this step) and its blocks go back */
+    {
+        TierFixture x;
+        CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        x.f.pc.set_unrest_mode(3);
+        x.f.pc.set_unr3_pct(1);
+        const int64_t cap = x.f.kv.total_blocks(G_FULL) / 100;
+        REQUIRE(cap >= 3 && cap <= 18);
+        auto pair = [&](int32_t base, uint64_t o_id, uint64_t r_id, int head_entries, std::vector<int32_t>* own) {
+            const auto prompt = tok_run(base, 336);
+            const auto keys = chain_of(prompt);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 16 * head_entries);
+            const auto tail = tok_run(base + 2000, 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            publish(x.f, o_id, other, (int64_t)other.size());          /* live on the head */
+            CHECK_OK(x.f.kv.add_sequence(r_id));
+            CHECK_OK(x.f.kv.ensure(r_id, (int64_t)prompt.size()));
+            *own = x.f.kv.block_table(r_id, G_FULL);
+            ckpt_at(x.f, r_id, keys, 320);
+            CHECK_OK(x.f.pc.insert(r_id, prompt, {}, { *own }, 320));
+            x.f.kv.free_sequence(r_id);
+        };
+        std::vector<int32_t> a, b;
+        pair(30000, 11, 12, 2, &a);
+        CHECK_EQ(x.f.pc.stats().unr3_fresh, 2ll);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, a[0]), 1);
+        x.f.pc.begin_step();
+        pair(40000, 13, 14, (int)cap - 1, &b);                       /* 2 + cap - 1 > cap */
+        CHECK_EQ(x.f.pc.stats().unr3_capped, 1ll);
+        CHECK_EQ(x.f.pc.stats().unr3_fallback, 0ll);
+        CHECK_EQ(x.f.pc.stats().unr3_fresh, cap - 1);
+        CHECK_EQ(x.f.pc.stats().unr3_overlays, 2ll);
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, a[0]), 0);            /* the first overlay's blocks went back */
+        CHECK_EQ(x.f.kv.block_refcount(G_FULL, b[0]), 1);
+        CHECK_EQ(x.f.pc.lookup(tok_run(30000, 336), {}).n_linear_tokens, 0);
+        CHECK_EQ(x.f.pc.lookup(tok_run(40000, 336), {}).n_linear_tokens, 320);
+        x.f.kv.free_sequence(11);
+        x.f.kv.free_sequence(13);
+    }
+}
+
+/* Every chain entry's block ids as a hit hands them (one cached group here). */
+static std::vector<int32_t> hit_blocks(Fixture& f, const std::vector<int32_t>& prompt, CacheHit* h,
+                                       const HitCap* cap = nullptr, uint64_t session = 0) {
+    std::vector<std::vector<int32_t>> hit;
+    *h = f.pc.lookup(prompt, {}, &hit, cap, session);
+    return hit.empty() ? std::vector<int32_t>{} : hit[0];
+}
+
+/* qfn-on-ds round 56 lever EGN (COORD 03:43 gap (a), DEV note 03:26; RADIANCE_PREFIX_EXACT bit 1). Request 1 computes a
+ * 336-token prompt in its own blocks with snapshots at 160 and 320 and publishes; the pool's pressure erases every entry
+ * (no host copy) while the snapshots stay in the store. Request 2 computes the head again in ITS blocks (another step
+ * shape: other bytes) and publishes it. Today (bits 0, the negative control) a hit resumes request 1's state over request
+ * 2's bytes -- the answer is not the cold one; under EGN no snapshot is handed out over an entry indexed after its owner's
+ * publish, and the publish that re-indexes it retires those it can see on its chain. Two shapes: request 2 publishes the
+ * whole 320 (both stale snapshots on its chain), or only 160 (the one at 320 lies past it) and request 3 adopts that head
+ * and publishes the rest with its own snapshot at 256. A re-reservation at a snapshot hands it to the new saver. */
+TEST(egn_a_snapshot_is_not_resumed_over_an_entry_evicted_under_it_and_indexed_again) {
+    for (int whole : { 1, 0 }) {
+        for (int bits : { 0, 1 }) {
+            Fixture f;
+            CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/6));
+            f.pc.set_exact(bits);
+            CHECK_EQ(f.pc.exact(), bits);
+            const auto prompt = tok_run(7600, 336);
+            const auto keys = chain_of(prompt);
+            CHECK_OK(f.kv.add_sequence(1));
+            CHECK_OK(f.kv.ensure(1, (int64_t)prompt.size()));
+            const std::vector<int32_t> first = f.kv.block_table(1, G_FULL);
+            ckpt_at(f, 1, keys, 160);
+            ckpt_at(f, 1, keys, 320);
+            CHECK_OK(f.pc.insert(1, prompt, {}, { first }, 320));
+            f.kv.free_sequence(1);
+            f.pc.begin_step();
+            CHECK_EQ(f.pc.evict_lru(1000), 20ll);                     /* no tiers: every entry erased */
+            CHECK_EQ(f.pc.size(), 0ll);
+            CHECK_EQ(f.pc.checkpoints(1).size(), 2u);                 /* the snapshots stay in the store */
+            CacheHit h;
+            CHECK_EQ(hit_blocks(f, prompt, &h).size(), 0u);           /* nothing reachable yet */
+            CHECK_EQ(h.n_linear_tokens, 0);
+            /* request 2: the head again in its own blocks, its own snapshot at 64 */
+            CHECK_OK(f.kv.add_sequence(2));
+            CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+            ckpt_at(f, 2, keys, 64);
+            CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, whole ? 320 : 160));
+            f.kv.free_sequence(2);
+            f.pc.begin_step();
+            if (whole) {
+                const std::vector<int32_t> got = hit_blocks(f, prompt, &h);
+                REQUIRE(got.size() >= 20u);
+                CHECK_EQ(got[0], mine[0]);                            /* the cache's head is request 2's copy */
+                if (bits == 0) {
+                    CHECK_EQ(h.n_linear_tokens, 320);                 /* request 1's state over request 2's bytes (the gap) */
+                    CHECK_EQ(f.pc.stats().egn_retired, 0ll);
+                } else {
+                    CHECK_EQ(h.n_linear_tokens, 64);                  /* request 2's own snapshot, over its own bytes */
+                    CHECK_EQ(f.pc.stats().egn_retired, 2ll);          /* 160 and 320 retired at request 2's publish */
+                    CHECK_EQ(f.pc.checkpoints(2).size(), 1u);
+                }
+                continue;
+            }
+            /* only 160 published: the snapshot at 160 is on request 2's chain, the one at 320 is not */
+            const std::vector<int32_t> got2 = hit_blocks(f, prompt, &h);
+            REQUIRE(got2.size() >= 10u);
+            CHECK_EQ(h.n_attn_tokens, 160);
+            CHECK_EQ(h.n_linear_tokens, bits ? 64 : 160);
+            CHECK_EQ(f.pc.stats().egn_retired, bits ? 1ll : 0ll);
+            /* request 3 adopts the cached head (request 2's), computes 160..336 in its blocks, snapshot at 256, publishes */
+            f.pc.begin_step();
+            CHECK_OK(f.kv.add_sequence(3));
+            std::vector<int32_t> head(got2.begin(), got2.begin() + 10);
+            CHECK_OK(f.kv.adopt(3, G_FULL, head, 160));
+            CHECK_OK(f.kv.ensure(3, (int64_t)prompt.size()));
+            const std::vector<int32_t> third = f.kv.block_table(3, G_FULL);
+            CHECK_EQ(third[0], mine[0]);
+            ckpt_at(f, 3, keys, 256);
+            CHECK_OK(f.pc.insert(3, prompt, {}, { third }, 320));
+            f.kv.free_sequence(3);
+            f.pc.begin_step();
+            const std::vector<int32_t> got3 = hit_blocks(f, prompt, &h);
+            REQUIRE(got3.size() >= 20u);
+            CHECK_EQ(got3[0], mine[0]);
+            CHECK_EQ(got3[15], third[15]);
+            if (bits == 0) {
+                CHECK_EQ(h.n_linear_tokens, 320);                     /* request 1's 320 over requests 2 + 3's bytes */
+            } else {
+                CHECK_EQ(h.n_linear_tokens, 256);                     /* request 3's own */
+                CHECK_EQ(f.pc.stats().egn_retired, 2ll);              /* + the one at 320 at request 3's publish */
+                /* a re-reservation at the 256 snapshot by request 4 makes it request 4's at the commit (its state then);
+                 * unsealed until request 4 publishes */
+                const int64_t before = f.pc.stats().egn_reowned;
+                ckpt_at(f, 4, keys, 256);
+                CHECK_EQ(f.pc.stats().egn_reowned - before, 1ll);
+                f.pc.begin_step();
+                CHECK_EQ(f.pc.lookup(prompt, {}).n_linear_tokens, 256);
+            }
+        }
+    }
+}
+
+/* round 56 EGN beside UNR3 (RADIANCE_PREFIX_EXACT=1 + RADIANCE_PREFIX_UNREST=3): an entry an UNR3 overlay supplies is read from the
+ * overlay, so its cache copy being indexed again (republished) after the snapshot's seal does not make the snapshot stale. F81's
+ * lineage with the other copy's live reader gone: request 2's 320 rests on its overlay for entries 0-1; request 3 resumes it,
+ * publishes deeper and republishes the cache's entry 0-1 with its blocks (= request 2's overlay blocks). Both 320 and 400 must
+ * still resume, over request 2's own head (without the overlay exception in egn_ok the publish of request 3 would retire 320:
+ * its entries 0-1 are born after 320's seal). */
+TEST(egn_keeps_a_snapshot_whose_reindexed_entries_its_unr3_overlay_supplies) {
+    TierFixture x;
+    CHECK_OK(x.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+    x.f.pc.set_unrest_mode(3);
+    x.f.pc.set_exact(1);
+    const auto prompt = tok_run(7600, 336);
+    const auto keys = chain_of(prompt);
+    std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+    const auto tail = tok_run(9600, 32);
+    other.insert(other.end(), tail.begin(), tail.end());
+    publish(x.f, 1, other, (int64_t)other.size());                   /* live on the head */
+    CHECK_OK(x.f.kv.add_sequence(2));
+    CHECK_OK(x.f.kv.ensure(2, (int64_t)prompt.size()));
+    const std::vector<int32_t> mine = x.f.kv.block_table(2, G_FULL);
+    ckpt_at(x.f, 2, keys, 320);
+    CHECK_OK(x.f.pc.insert(2, prompt, {}, { mine }, 320));
+    CHECK_EQ(x.f.pc.stats().unr3_overlays, 1ll);
+    x.f.kv.free_sequence(1);
+    x.f.kv.free_sequence(2);
+    x.f.pc.begin_step();
+    std::vector<int32_t> longer = prompt;
+    const auto more = tok_run(12000, 96);
+    longer.insert(longer.end(), more.begin(), more.end());
+    const auto lkeys = chain_of(longer);
+    std::vector<std::vector<int32_t>> h3;
+    CHECK_EQ(x.f.pc.lookup(longer, {}, &h3, nullptr, 3).n_linear_tokens, 320);
+    h3[0].resize(20);
+    CHECK_OK(x.f.kv.add_sequence(3));
+    CHECK_OK(x.f.kv.adopt(3, G_FULL, h3[0], 320));
+    CHECK_OK(x.f.kv.ensure(3, (int64_t)longer.size()));
+    const std::vector<int32_t> t3 = x.f.kv.block_table(3, G_FULL);
+    ckpt_at(x.f, 3, lkeys, 400);
+    CHECK_OK(x.f.pc.insert(3, longer, {}, { t3 }, 400));
+    CHECK_EQ(x.f.pc.stats().republished, 2ll);                        /* entries 0-1 re-indexed with request 2's bytes */
+    x.f.kv.free_sequence(3);
+    CHECK_EQ(x.f.pc.stats().egn_retired, 0ll);
+    x.f.pc.begin_step();
+    std::vector<std::vector<int32_t>> h4;
+    CHECK_EQ(x.f.pc.lookup(longer, {}, &h4).n_linear_tokens, 400);
+    CHECK_EQ(h4[0][0], mine[0]);
+    x.f.pc.begin_step();
+    std::vector<std::vector<int32_t>> h5;
+    CHECK_EQ(x.f.pc.lookup(prompt, {}, &h5).n_linear_tokens, 320);   /* request 2's, over its overlay (= the cache's now) */
+    CHECK_EQ(h5[0][0], mine[0]);
+    CHECK_EQ(x.f.pc.stats().egn_skipped, 0ll);
+    x.f.pc.begin_step();
+    x.f.pc.clear();
+}
+
+/* qfn-on-ds round 56 lever KOW (COORD 03:43 gap (b), DEV note 03:26; RADIANCE_PREFIX_EXACT bit 2). fn4 preempt_keep parks
+ * a decoding request: it publishes, gives its whole blocks up (KVManager::preempt_keep) and keeps its states, and its
+ * rejoin adopts what a lookup of prompt ++ output hands. (1) Where the cache keeps another publisher's copy of an entry
+ * the request computed itself (that one read by a live sequence, or pinned under its snapshot), today (bits 0, the
+ * negative control) the rejoin adopts the other copy and the request's own blocks went back to the pool at the park;
+ * under KOW keep_own holds the request's own blocks and the rejoin's lookup hands them. (2) An entry evicted while the
+ * request is parked and indexed again by another publisher: today the rejoin adopts the new bytes; under KOW the hit
+ * stops there (the rejoin is refused: recomputed). */
+TEST(kow_a_parked_request_rejoins_over_its_own_copy_and_never_over_bytes_indexed_since) {
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    for (int bits : { 0, 2 }) {
+        for (int reason : { 0, 1 }) {      /* 0: the other copy is read by a live sequence; 1: pinned under its snapshot */
+            Fixture f;
+            CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+            f.pc.set_exact(bits);
+            const auto prompt = tok_run(7600, 336);
+            std::vector<int32_t> other(prompt.begin(), prompt.begin() + 32);
+            const auto tail = tok_run(9600, reason ? 96 : 32);
+            other.insert(other.end(), tail.begin(), tail.end());
+            std::vector<int32_t> theirs;
+            if (reason == 1) {
+                const auto okeys = chain_of(other);
+                CHECK_OK(f.kv.add_sequence(1));
+                CHECK_OK(f.kv.ensure(1, (int64_t)other.size()));
+                ckpt_at(f, 1, okeys, 16);
+                theirs = f.kv.block_table(1, G_FULL);
+                CHECK_OK(f.pc.insert(1, other, {}, { theirs }, (int64_t)other.size()));
+                f.kv.free_sequence(1);
+            } else {
+                publish(f, 1, other, (int64_t)other.size());
+                theirs = f.kv.block_table(1, G_FULL);
+            }
+            /* request 2 decodes at 320 in its own blocks; the park: publish, keep_own, preempt_keep */
+            CHECK_OK(f.kv.add_sequence(2));
+            CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+            const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+            CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+            const int64_t kept = f.pc.keep_own(2, prompt, {}, { mine }, 320);
+            CHECK_EQ(kept, bits ? 2ll : 0ll);                         /* entries 0 and 1 keep the other's copy */
+            CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), bits ? 1 : 0);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[2]), 1);       /* the cache's (request 2 published it) */
+            f.pc.begin_step();
+            CacheHit h;
+            std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+            CHECK_EQ(h.n_attn_tokens, 320);
+            CHECK_EQ(h.n_linear_tokens, 0);
+            REQUIRE(got.size() >= 20u);
+            if (bits == 0) {
+                CHECK_EQ(got[0], theirs[0]);                          /* the gap: its states over the other's bytes */
+                CHECK(got[0] != mine[0]);
+            } else {
+                for (int i = 0; i < 20; ++i) CHECK_EQ(got[(size_t)i], mine[(size_t)i]);
+                CHECK_EQ(f.pc.stats().kow_substituted, 2ll);
+            }
+            got.resize(20);
+            CHECK_OK(f.kv.rejoin(2, G_FULL, got));
+            f.pc.drop_kept(2);
+            /* the rejoined sequence's; the other copy also the cache's (+ its live reader's) */
+            CHECK_EQ(f.kv.block_refcount(G_FULL, got[0]), bits ? 1 : reason == 0 ? 3 : 2);
+            if (reason == 0) f.kv.free_sequence(1);
+            f.kv.free_sequence(2);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 0);
+        }
+        /* (2) parked with nothing conflicting; the pressure erases its entries; request 3 indexes the same tokens anew */
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_exact(bits);
+        const auto prompt = tok_run(7600, 336);
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+        CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(f.pc.keep_own(2, prompt, {}, { mine }, 320), 0ll);
+        CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+        CHECK_EQ(f.pc.evict_lru(1000), 20ll);
+        publish(f, 3, prompt, 320);
+        const std::vector<int32_t> third = f.kv.block_table(3, G_FULL);
+        f.kv.free_sequence(3);
+        f.pc.begin_step();
+        CacheHit h;
+        const std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+        if (bits == 0) {
+            CHECK_EQ(h.n_attn_tokens, 320);                           /* the gap: request 3's bytes under request 2's states */
+            REQUIRE(!got.empty());
+            CHECK_EQ(got[0], third[0]);
+        } else {
+            CHECK_EQ(h.n_attn_tokens, 0);                             /* stopped at entry 0: the rejoin is refused */
+            CHECK_EQ(f.pc.stats().kow_stopped, 1ll);
+        }
+        /* a lookup without the parked request's session is the ordinary one */
+        CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 320);
+        f.pc.release(2);                                              /* finished while parked: gives back what it kept */
+        f.kv.free_sequence(2);
+    }
+}
+
+/* qfn-on-ds round 57 (engine_e2e round57_kow_...'s residual, 2 of 49 runs): KOW keeps the parked request's own copy of every
+ * entry the cache holds another publisher's copy of, but its rejoin's lookup walked the INDEX -- when the other publisher closed
+ * and its entries were evicted during the park, the walk departed at entry 0 although the request held its own blocks of all of
+ * them, so it recomputed (prefill replay: other bytes than its decode). Now a kept entry serves from the request's own copy
+ * whether or not an indexed entry is there. bits 0 = the negative control (no copy kept: nothing to rejoin over). */
+TEST(kow_a_parked_request_rejoins_from_its_own_copy_after_the_other_copy_left_the_index) {
+    static const std::vector<int64_t> kNoSnapshot;
+    HitCap cap;
+    cap.tokens = -1;
+    cap.resume_at = &kNoSnapshot;
+    for (int bits : { 0, 2 }) {
+        Fixture f;
+        CHECK_OK(f.build(/*with_linear=*/true, /*ckpt_slots=*/4));
+        f.pc.set_exact(bits);
+        const auto prompt = tok_run(7600, 336);
+        const std::vector<int32_t> other(prompt.begin(), prompt.begin() + 320);
+        publish(f, 1, other, 320);                                    /* request 1 live on its copy of all 20 entries */
+        CHECK_OK(f.kv.add_sequence(2));
+        CHECK_OK(f.kv.ensure(2, (int64_t)prompt.size()));
+        const std::vector<int32_t> mine = f.kv.block_table(2, G_FULL);
+        CHECK_OK(f.pc.insert(2, prompt, {}, { mine }, 320));
+        CHECK_EQ(f.pc.keep_own(2, prompt, {}, { mine }, 320), bits ? 20ll : 0ll);
+        CHECK_EQ(f.kv.preempt_keep(2, 320), 320ll);
+        f.kv.free_sequence(1);                                        /* the other publisher closes ... */
+        CHECK_EQ(f.pc.evict_lru(1000), 20ll);                         /* ... and its entries leave the index */
+        f.pc.begin_step();
+        CacheHit h;
+        std::vector<int32_t> got = hit_blocks(f, prompt, &h, &cap, 2);
+        if (bits == 0) {
+            CHECK_EQ(h.n_attn_tokens, 0);                             /* nothing to rejoin over: recomputed */
+        } else {
+            CHECK_EQ(h.n_attn_tokens, 320);                           /* the request's own copy, every entry */
+            REQUIRE(got.size() >= 20u);
+            for (int i = 0; i < 20; ++i) CHECK_EQ(got[(size_t)i], mine[(size_t)i]);
+            CHECK_EQ(f.pc.stats().kow_unindexed, 20ll);
+            got.resize(20);
+            CHECK_OK(f.kv.rejoin(2, G_FULL, got));
+            f.pc.drop_kept(2);
+            CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 1);       /* the rejoined sequence's only */
+        }
+        CHECK_EQ(f.pc.lookup(prompt, {}, nullptr, &cap).n_attn_tokens, 0);   /* nothing indexed for anyone else */
+        f.pc.release(2);
+        f.kv.free_sequence(2);
+        CHECK_EQ(f.kv.block_refcount(G_FULL, mine[0]), 0);
+    }
+}
+
 TEST(a_head_a_live_sequence_adopted_keeps_its_bytes_for_that_sequence) {
     /* The old copy goes only when nothing else reads it: a running sequence that adopted the
      * short request's head may have snapshots of its own resting on it. */
@@ -7555,6 +8219,30 @@ TEST(the_bindings_snapshot_key_is_the_chain_the_next_turn_looks_up) {
     const CacheHit h2 = b.lookup(reply, nullptr, nullptr);
     CHECK_EQ(h2.n_attn_tokens, 288);
     CHECK_EQ(h2.checkpoint_slot, -1);
+}
+
+/* qfn-on-ds lever SRB (Qwen loop round 58): IPrefixCache::probe = the tokens the lookup would let the request skip (with linear
+ * state: the deepest snapshot on the hit), with no effect on the cache -- no lookup counted, no snapshot taken over (the next
+ * lookup by another session still finds it), and the same answer twice; a cold prompt probes 0. */
+TEST(srb_probe_is_the_lookups_reusable_tokens_without_its_effects) {
+    Fixture f;
+    REQUIRE_EQ(f.build(/*with_linear=*/true, /*ckpt_slots=*/4), RAD_OK);
+    PCBinding<PrefixCache> b(&f.pc);
+    const Request r = turn(7, tok_run(100, 300), tok_run(9000, 40));
+    const int32_t slot = serve_turn(f, b, r, 320);
+    REQUIRE(slot >= 0);
+    const Request next = turn(8, cat(cat(r.prompt, r.output), tok_run(20000, 50)), {});
+    const int64_t lookups = f.pc.stats().lookups;
+    CHECK_EQ(b.probe(next), (int64_t)320);
+    CHECK_EQ(b.probe(next), (int64_t)320);
+    CHECK_EQ(f.pc.stats().lookups, lookups);            /* the probes counted nothing */
+    const CacheHit h = b.lookup(next, nullptr, nullptr);
+    CHECK_EQ(h.n_linear_tokens, 320);
+    CHECK_EQ(h.checkpoint_slot, slot);
+    CHECK_EQ(f.pc.stats().lookups, lookups + 1);
+    CHECK_EQ(b.probe(turn(9, tok_run(40000, 300), {})), (int64_t)0);   /* cold */
+    /* the same prompt with another reply: the prompt's blocks, no snapshot on that chain -> 0 reusable with linear state */
+    CHECK_EQ(b.probe(turn(10, cat(cat(r.prompt, tok_run(30000, 40)), tok_run(20000, 50)), {})), (int64_t)0);
 }
 
 TEST(the_bindings_snapshot_key_carries_the_requests_pictures) {

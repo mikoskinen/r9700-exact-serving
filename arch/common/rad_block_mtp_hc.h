@@ -82,6 +82,28 @@ namespace arch {
 
 /* fn4 MTP-FLAT switch (mtp_flat 0 / 1; RadMtp* op_enter_flat must be declared: RADIANCE_FN4_MTPFLAT=1 at start). */
 inline std::atomic<int>& fn4_mtpflat_flag() { static std::atomic<int> f{0}; return f; }
+/* qfn-on-ds lever MTD (Qwen loop round 45, QUEUE Q85; pbs1's c32 32-row draft pass 1,078 us: EXL3 in the M > 16 prefill band
+ * 222.7 us where the trunk's fused chain takes ~165 at 32 rows, three connection reads in op_read's tiled forms 113.2 us where
+ * the trunk's bi_dec read takes ~26.7 a read): the head's draft passes in the trunk's decode forms. Drafts only -- the trunk
+ * verifies every draft greedily on batch-invariant rows, so a draft's bytes move acceptance (tokens a step), never an answer.
+ * A mask (fn4 switch mtp_dec 0..31, bits 4 / 8 / 16 libr4d's levers MTE / W2K / W2N; RADIANCE_FN4_MTP_DEC at start, the core's
+ * start-value rule):
+ *   1  the head's MoE is told one row a sequence (MoeFP8::set_qmax(1); every pass that reaches it -- a history pass's round-1
+ *      rows (draft_out_ids) or a later round -- carries one row a drafting sequence), so its 17..RADIANCE_FN4_X3GD_HI-row
+ *      passes take the fused EXL3 decode chain (lever X3GD's rule) instead of the split M > 16 band; unset: INT32_MAX (today)
+ *   2  the attention and feed-forward connection reads (they carry the inject gains) of a pass of at most the bi_dec twin's
+ *      declared rows through HyperConn::read_bd (libr4d's decode forms: G / G16 / HCX + B3X), not read_pieces' op_read; the
+ *      final read (no inject gains: the twin's per-row kernels) keeps op_read. A wider pass (a prompt's last chunk) is today's.
+ * 0 = today's passes, byte for byte. */
+inline std::atomic<int>& fn4_mtpdec_flag() {
+    static std::atomic<int> f{[] {
+        const char* e = std::getenv("RADIANCE_FN4_MTP_DEC");
+        if (!(e && *e && *e != '0')) return 0;
+        const int n = std::atoi(e);
+        return (n > 1 ? n : 1) & 3;
+    }()};
+    return f;
+}
 
 /* Candidates the coarse 2-bit head proposes for exact rescoring (`logit_rerank` against the
  * full-precision head) before column 0 is read. The 2-bit head's top-1 differs from the exact one
@@ -542,7 +564,17 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
               brows(w.hin, T), brows(w.e, T), RAD_W(w_pre_h), RAD_W(w_pre_e),
               RAD_W(w_fc_h), RAD_W(w_fc_e), brows(w.hw, T));
 
-    hc_attn.read_pieces(c, T);
+    /* lever MTD bit 2: the connection reads through the bi_dec twin (one launch up to its declared rows) */
+    const int mtd = fn4_mtpdec_flag().load(std::memory_order_relaxed);
+    const auto read_mtd = [&](const HyperConn& hcx, int64_t n) {
+        if ((mtd & 2) && hcx.op_read_bd && n <= hcx.bd_rows) {
+            const int64_t pc = hcx.bd_piece();
+            for (int64_t p = 0; p < n; p += pc) hcx.read_bd(c, p, n - p < pc ? n - p : pc, false);
+        } else {
+            hcx.read_pieces(c, n);
+        }
+    };
+    read_mtd(hc_attn, T);
 
     /* A history pass with no drafting rows (every prefill chunk but a prompt's last) only stores
      * the head's state: K and V, and the indexer's block keys and tail. `n_draft_out` is the same
@@ -570,7 +602,9 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
         RAD_ISSUE_N(c, op_dback, L, brows(w.hin, L), brows(w.hw, L));
     }
 
-    hc_mlp.read_pieces(c, L);
+    read_mtd(hc_mlp, L);
+    /* lever MTD bit 1: every row here is one drafting sequence's (round 1's rows of a history pass, or a later round's) */
+    mlp.set_qmax((mtd & 1) ? 1 : INT32_MAX);
     mlp.step_rows(c, L);
     hc_mlp.write(c, L, 0, L);
 

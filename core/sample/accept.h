@@ -38,6 +38,20 @@ namespace rad {
 int accept_greedy(const int32_t* draft, int n_draft, const int32_t* target,
                   int32_t* out, int32_t* n_accepted);
 
+/* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only, never exact): the first `n` drafts accepted as drafted,
+ * whatever the target drew there, then the target's token after them (n clipped to [0, n_draft]). The card's
+ * acceptance (sched/advance_impl.h, ADV_ACCEPT under AdvanceArgs::fal) takes the same count from the same draw. */
+inline int accept_forced(const int32_t* draft, int n_draft, const int32_t* target, int32_t n,
+                         int32_t* out, int32_t* n_accepted) {
+    if (!target || !out || !n_accepted || n_draft < 0 || (n_draft > 0 && !draft)) return RAD_E_INVAL;
+    if (n < 0) n = 0;
+    if (n > n_draft) n = n_draft;
+    for (int32_t j = 0; j < n; ++j) out[j] = draft[j];
+    out[n] = target[n];
+    *n_accepted = n;
+    return RAD_OK;
+}
+
 /* The same rule over a tree (rad_drafter_tree). Node 0 is the verify's first row (the bonus token
  * it starts from); node j, 1 <= j <= n_draft, is draft[j - 1], verified at row j, and its parent
  * is node parent[j - 1] (< j), or node j - 1 when `parent` is null (a chain). `target[r]` is the

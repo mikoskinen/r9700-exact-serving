@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -582,6 +583,26 @@ bool Engine::serial_drafting() const {
     return drafter_.kind == RAD_DRAFT_SERIAL && drafter_.depth > 0;
 }
 
+/* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h): the realized acceptance length by the verify's draft count, beside the
+ * target the table gives at that depth (E[min(floor(m) + B(frac), d)] + 1); every 16,384 verifies and at the stop. The
+ * end-of-generation cut over the emitted tokens is the only thing that takes a row below its draw. */
+void Engine::fal_note(bool final_line) {
+    std::string t;
+    int64_t n = 0, a = 0;
+    for (int d = 1; d < (int)kFalDepths; ++d) {
+        if (!fal_n_[d]) continue;
+        const double m = (double)fal_.m[d] / 16777216.0, base = std::floor(m);
+        const double want = 1.0 + (base >= d ? (double)d : m);
+        t += fmt("%sdepth %d: %lld verifies, AL %.4f (target %.4f)", t.empty() ? "" : "; ", d, (long long)fal_n_[d],
+                 1.0 + (double)fal_a_[d] / (double)fal_n_[d], want);
+        n += fal_n_[d];
+        a += fal_a_[d];
+    }
+    RAD_INFO("RADIANCE_DRAFT_FORCE_AL (measurement only)%s: %lld verifies, AL %.4f, %lld cut below their draw by a stop "
+             "token -- %s", final_line ? " at the stop" : "", (long long)n, n ? 1.0 + (double)a / (double)n : 0.0,
+             (long long)fal_cut_, t.empty() ? "none drafted" : t.c_str());
+}
+
 /* One advance on every rank against the scheduler's latest build, over its first `rows` rows
  * when given, else all. */
 int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
@@ -594,6 +615,8 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
         a.st    = rk.step_slots;
         a.eog   = rk.eog;
         a.n_eog = rk.n_eog;
+        /* RADIANCE_DRAFT_FORCE_AL: the acceptance only, with the key collect_step draws with (fal_arm). */
+        if (mode == ADV_ACCEPT && fal_.on) { a.fal = fal_; a.fal.key = fal_key_; }
         if (from_proposal) {
             /* This rank's own handle: a buffer handle indexes the program that declared it, and a
              * plugin may declare a different buffer list on each rank (DeepSeek-V4.1's drafter
@@ -601,26 +624,26 @@ int Engine::advance_all(int mode, int round, bool from_proposal, int rows) {
              * buffer here -- an attention-zero rank then verified garbage proposals at positions
              * of its own while the other ranks verified the head's. */
             const RadDrafterDecl& dd = rk.program.drafter;
-            a.src = static_cast<const int32_t*>(dd.proposal ? rk.ctx.buf_ptr(dd.proposal)
-                                                            : rk.ctx.buf_ptr(rk.tok_buf));
+            a.src = static_cast<const int32_t*>(dd.proposal ? rk.cx().buf_ptr(dd.proposal)
+                                                            : rk.cx().buf_ptr(rk.tok_buf));
             a.src_pitch = (dd.proposal && dd.proposal_pitch > 0) ? dd.proposal_pitch : 1;
             /* A tree drafter's parents, at the proposal's pitch (rad_drafter_tree). */
             if (tree_ && mode == ADV_BTAKE) {
-                a.par = static_cast<const int32_t*>(rk.ctx.buf_ptr(tree_parents_));
+                a.par = static_cast<const int32_t*>(rk.cx().buf_ptr(tree_parents_));
                 if (!a.par) {
                     RAD_ERR("drafter '%s': rank %zu has no parents buffer", drafter_.name, i);
                     return RAD_E_STATE;
                 }
             }
         } else {
-            a.src = static_cast<const int32_t*>(rk.ctx.buf_ptr(rk.tok_buf));
+            a.src = static_cast<const int32_t*>(rk.cx().buf_ptr(rk.tok_buf));
         }
         if (!a.src || !a.st) {
             RAD_ERR("drafter '%s': rank %zu has no %s to advance from", drafter_.name, i,
                     a.st ? "proposal buffer" : "step state");
             return RAD_E_STATE;
         }
-        RAD_TRY(step_advance(a, rk.ctx.stream()));
+        RAD_TRY(step_advance(a, rk.cx().stream()));
     }
     return RAD_OK;
 }
@@ -638,7 +661,7 @@ int Engine::tree_compact(int rows) {
         for (size_t g = 1; g < p.kv_groups.size() && (int)g < a.n_groups; ++g) {
             const int kind = p.kv_groups[g].decl.kind;
             if (kind != RAD_KV_FULL && kind != RAD_KV_WINDOW) continue;
-            const KVPoolBinding* b = rk.ctx.kv_binding((uint32_t)g);
+            const KVPoolBinding* b = rk.cx().kv_binding((uint32_t)g);
             if (!b || !b->base || b->rank != 4) continue;   /* a zero group on this rank */
             const int bits = rad_dtype_bits(b->dtype);
             const int64_t row = bits > 0 ? b->shape[3] * bits / 8 : 0;
@@ -663,7 +686,7 @@ int Engine::tree_compact(int rows) {
             q.row_bytes    = (int32_t)row;
             q.grp          = (int32_t)g;
         }
-        RAD_TRY(step_compact(a, rk.ctx.stream()));
+        RAD_TRY(step_compact(a, rk.cx().stream()));
     }
     return RAD_OK;
 }
@@ -677,6 +700,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     serial_rounds_ = 0;
     serial_rows_   = 0;
     serial_done_   = 0;
+    fal_arm((uint32_t)step, so);   /* RADIANCE_DRAFT_FORCE_AL's draw key for this step's ADV_ACCEPT and collect */
     /* A step issued ahead continues from the card's acceptance, so run it even without drafts. */
     if (!serial_drafting()) {
         if (pipelining_) RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
@@ -723,7 +747,7 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
          * lower acceptance. A head with its own proposal buffer samples nothing (a zero-row
          * chain). */
         for (auto& rk : ranks_) {
-            int s = rk->sampler.build_greedy(drafter_.proposal ? 0 : drafted);
+            int s = rk->smp().build_greedy(drafter_.proposal ? 0 : drafted);
             if (s < 0) {
                 RAD_ERR("drafter '%s': build_greedy: %s", drafter_.name, rad_strerror(s));
                 return s;
@@ -769,15 +793,15 @@ int Engine::issue_serial_drafter(int step, StepOut& so) {
     Rank& r0 = *ranks_[0];
     if (mtp_couple_) {
         /* Rounds 1..done of the drafting rows, on the same stream as the slots below. */
-        const void* state = r0.ctx.buf_ptr(couple_state_buf_);
+        const void* state = r0.cx().buf_ptr(couple_state_buf_);
         if (!state || serial_done_ > (int)drafter_.depth) return RAD_E_STATE;
         const int64_t pitch = couple_rows_ * (int64_t)sizeof(RadMtpCoupleState);
         RAD_TRY(rad_memcpy_2d_async(couple_readback_, pitch, state, pitch,
                                     (int64_t)n * (int64_t)sizeof(RadMtpCoupleState), serial_done_,
-                                    r0.ctx.stream()));
+                                    r0.cx().stream()));
     }
     RAD_TRY(rad_memcpy_async(slots_host_, r0.step_slots,
-                             (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.ctx.stream()));
+                             (int64_t)cfg_.max_seqs * (int64_t)sizeof(StepSlot), r0.cx().stream()));
     return RAD_OK;
 }
 
@@ -815,9 +839,13 @@ int Engine::finish_serial_drafter(const StepOut& so) {
     for (int i = 0; i < serial_rows_; ++i) {
         /* No draft for a request the sampler will not speculate on (a constraining grammar that
          * cannot snapshot its state); the sampler would refuse the next step otherwise. */
-        if (!r0.sampler.allows_speculation(serial_row_[(size_t)i].seq)) continue;
+        if (!r0.smp().allows_speculation(serial_row_[(size_t)i].seq)) continue;
         const uint64_t seq = serial_row_[(size_t)i].seq;
-        const int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        int rc = lsched().set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
+        /* qfn-on-ds lever BGL: a newcomer the BG lane ran whole drafts for its home's next step (the request is there) */
+        if (rc == RAD_E_NOTFOUND && bgl1m_)
+            if (Scheduler* o = lanes_.owner(seq); o && o != &lsched())
+                rc = o->set_draft(seq, &draft_out_[(size_t)i * (size_t)rounds], done);
         if (mtp_couple_)
             RAD_TRY(bind_couple(seq, i, done, rc == RAD_OK, serial_row_[(size_t)i].card));
     }
@@ -1094,6 +1122,7 @@ int Engine::issue_block_drafter(int step, StepOut& so) {
     /* The gate's counts belong to the proposal they cut: a new drafter cycle forgets them. */
     if (conf_buf_ || conf_dbg_) lsched().draft_conf_begin();
 
+    fal_arm((uint32_t)step, so);   /* RADIANCE_DRAFT_FORCE_AL's draw key for this step's ADV_ACCEPT and collect */
     RAD_TRY(advance_all(ADV_ACCEPT, 0, false));
     /* A tree's accepted path into place in the trunk's cache, against the same build (the step
      * just accepted), before any later pass reads it. */

@@ -16,6 +16,7 @@
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "kvstream/plan.h"
 #include "kvstream/stage.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
@@ -312,7 +313,10 @@ Engine::~Engine() {
      * landing in a freed arena is a GPU memory fault. */
     for (auto& r : ranks_)
         if (RadStream s = r->mover.transfer_stream()) (void)rad_stream_sync(s);
-    for (auto& r : ranks_) r->ctx.shutdown();
+    for (auto& r : ranks_) {
+        r->ctx.shutdown();
+        if (r->bg_ready) r->bg_ctx.shutdown();   /* qfn-on-ds lever BGL stage 2 */
+    }
     /* The streamed groups' host mirrors are pinned outside every pool; freed after the contexts,
      * since a pass reads them. Safe after a failed bring-up. */
     for (auto& r : ranks_) r->kv.free_stream(rad_device_allocator());
@@ -799,7 +803,7 @@ void Engine::missl_close() {
 void Engine::rank_loop(int index) {
     Rank& r = *ranks_[(size_t)index];
     MissRank* const ml = missl_ ? missl_->rank(index) : nullptr;
-    if (r.ctx.bind_thread() < 0) {
+    if (r.ctx.bind_thread() < 0 || (r.bg_ready && r.bg_ctx.bind_thread() < 0)) {
         RAD_ERR("rank %d: could not bind its device", index);
         step_status_.store(RAD_E_DEVICE, std::memory_order_release);
     }
@@ -880,12 +884,57 @@ void Engine::rank_loop(int index) {
                     tip_row = 0;
                 }
             }
-            int s = what == kIssueSampler ? RAD_OK : r.ctx.run_step(b);
+            /* qfn-on-ds Qwen tp8 S7b: a leader's HEAD part of a step whose entries take a snapshot at their chunk's END
+             * (RADIANCE_PP_HEAD_SNAP=1): the plugin stages their head layers' rows before X1's send (head_stage) */
+            bool hs_named = false;
+            if (head_snap_ && what == kIssueModel && b->draft_pass == 0 && b->enc == 0 && tip_row == 0 &&
+                (size_t)index < hs_.size() && pp_head_now()) {
+                const StepPlan* hp = &issue_sched_.load(std::memory_order_acquire)->plan();
+                HsRank& h = hs_[(size_t)index];
+                h.cur.clear();
+                h.fail = 0;
+                if (hp->n_tok == b->n_tok) {
+                    const KVManager& kv = r.kv;
+                    for (const StepEntry& e : hp->e) {
+                        if (e.ckpt_slot < 0 || e.ckpt_tok < 0 || e.ckpt_tok != e.n_tokens - 1) continue;
+                        HsEntry x;
+                        x.seq = e.seq;
+                        x.ck = e.ckpt_slot;
+                        if (!state_slots_of(e.seq, &x.slots)) continue;
+                        x.slots.resize((size_t)kv.n_groups(), -1);
+                        x.staged.assign((size_t)kv.n_groups(), {});
+                        for (int32_t g = 0; g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            x.staged[(size_t)g].assign((size_t)std::max<int64_t>(p->n_layers, 0), 0);
+                        }
+                        h.cur.push_back(std::move(x));
+                    }
+                }
+                if (!h.cur.empty()) {
+                    if (fn4::tip_set(index, -1, &Engine::head_stage, &h) <= 0) {
+                        RAD_ERR("rank %d step %d: Qwen tp8 S7b: the plugin refused the head part's snapshot staging "
+                                "(RADIANCE_PP_HEAD_SNAP=1 needs a cut whose head layers hold no attention)", index, b->step);
+                        step_status_.store(RAD_E_STATE, std::memory_order_release);
+                        h.cur.clear();
+                    } else {
+                        hs_named = true;
+                    }
+                }
+            }
+            int s = what == kIssueSampler ? RAD_OK : r.cx().run_step(b);
             if (tip_row > 0) (void)fn4::tip_set(index, 0, nullptr, nullptr);
+            if (hs_named) {
+                (void)fn4::tip_set(index, 0, nullptr, nullptr);
+                HsRank& h = hs_[(size_t)index];
+                std::lock_guard<std::mutex> lk(hs_mu_);
+                for (HsEntry& x : h.cur) h.done.push_back(std::move(x));
+                h.cur.clear();
+            }
             if (hiss) hiss_t1_ = rad_mono_ns();
             if (ml_pass && s >= 0) ml->ran(b->step, b->draft_pass, r.stager.staged());
             if (s < 0) {
-                RAD_ERR("rank %d step %d: %s", index, b->step, r.ctx.step_error());
+                RAD_ERR("rank %d step %d: %s", index, b->step, r.cx().step_error());
                 step_status_.store(s, std::memory_order_release);
             } else if (b->n_out > 0 && what != kIssueModel && what != kIssueFollower) {
                 /* Wait for the scheduler's sampler staging, which runs while the device executes
@@ -901,7 +950,7 @@ void Engine::rank_loop(int index) {
                 if (bst >= 0) {
                     /* The scored rows first: the sampler may rewrite a row in place. */
                     if (b->draft_pass == 0 && !score_rows_.empty()) s = issue_scored_rows(r);
-                    if (s >= 0) s = r.sampler.run(&r.ctx, r.program.logits_buf, r.tok_buf);
+                    if (s >= 0) s = r.smp().run(&r.cx(), r.program.logits_buf, r.tok_buf);
                     if (s < 0) {
                         RAD_ERR("rank %d step %d: sampler: %s", index, b->step, rad_strerror(s));
                         step_status_.store(s, std::memory_order_release);
@@ -971,8 +1020,10 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
-    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_);
-    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
+    /* lever RIDE (RADIANCE_FN4_KVS_RIDE): a trunk MIXED step also gets the prefill sequences' ranges (kvstream_ride_step) */
+    const bool ride = kvstream_ride_step(b);
+    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_, ride ? &ride_runs_ : nullptr);
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_, ride ? &ride_runs_ : nullptr);
     return RAD_OK;
 }
 
@@ -1181,6 +1232,19 @@ int Engine::draft_lend_state(uint64_t* changes) const {
 int Engine::issue_ahead(const RadBatch** out) {
     *out = nullptr;
     if (!pipelining_) return RAD_OK;
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1: lane 0 issues ahead beside lane 1's step on the second Ctx, but not when the loop top
+     * has lane-1 work -- a lane-1 step whose end event has completed (finished there, so its newcomer joins lane 0's next fresh plan;
+     * a step issued ahead copies the plan before it and would leave the newcomer out) or a lent newcomer in lane 1's inbox with lane 1
+     * idle (issued there). Lane 1 itself never issues ahead (its step returns to the loop top before this). */
+    if (bgl_ahead_) {
+        if (cur_sched_ != &sched_) return RAD_OK;
+        if (bgf_.on) {
+            const int q = rad_event_query(bgio_in_ ? step_end_ : bgio_.step_end);
+            if (q != 0) return q < 0 ? q : RAD_OK;
+        } else if (lanes_.inbox_n(1) > 0) {
+            return RAD_OK;
+        }
+    }
     for (int i = 0; i < serial_rows_ && serial_done_ > 0; ++i)
         sched_.expect_draft(serial_row_[(size_t)i].seq, serial_done_);
     /* ds41-acc: a confidence gate waits for the query pass here, so the step built next verifies
@@ -1213,13 +1277,50 @@ int Engine::issue_ahead(const RadBatch** out) {
         return st;
     }
     *out = nb;
+    if (bgl_ahead_) {
+        ++bgl_ahead_steps_;
+        if (bgf_.on) { ++bgl_ahead_beside_; ++bgl_overlap_steps_; }
+    }
     return RAD_OK;
 }
 
 void Engine::phase_mark(int p) {
     const auto now = std::chrono::steady_clock::now();
-    phase_us_[p] += std::chrono::duration<double, std::micro>(now - phase_t_).count();
+    const double us = std::chrono::duration<double, std::micro>(now - phase_t_).count();
+    phase_us_[p] += us;
+    phase_step_us_[p] += us;   /* qfn-on-ds Q92: this step's, for RADIANCE_LOG_STEP_HOST (zeroed by step_host_line) */
     phase_t_ = now;
+}
+
+/* qfn-on-ds Q92 (FINDINGS F78): RADIANCE_LOG_STEP_HOST's line for a step of at least step_host_ms_ -- where the step
+ * thread's time went between this step's plan and the next: the engine's phases (plan = the scheduler's step() and what
+ * precedes it; collect = the device wait), the scheduler's own split of plan (its lock wait, the admission walk, the
+ * restores, every prefix-cache eviction by call site), and the tail after the draft (tier pump, the ticks, publish). */
+void Engine::step_host_line(const RadBatch* b) {
+    double tot = 0;
+    for (int i = 0; i < PH_N; ++i) tot += phase_step_us_[i];
+    if (tot / 1000.0 >= step_host_ms_) {
+        const Scheduler::HostNote& h = lsched().host_note();
+        static const char* const site[Scheduler::kEvSites] = { "prewait", "gate", "ensure", "overdue", "grow", "noa" };
+        std::string ev;
+        for (int k = 0; k < Scheduler::kEvSites; ++k)
+            if (h.ev_n[k] > 0)
+                ev += fmt(" %s %lld/%lld/%.2f", site[k], (long long)h.ev_n[k], (long long)h.ev_got[k], h.ev_ms[k]);
+        RAD_INFO("step-host %d %s: %.2f ms = plan %.2f begin %.2f build %.2f pre %.2f ranks %.2f save %.2f collect %.2f "
+                 "commit %.2f draft+tail %.2f (tier %.2f ticks %.2f publish %.2f) | sched %.2f ms: lock %.2f walk %.2f asked %lld "
+                 "restores %lld / %.2f ms; evict calls/entries/ms:%s | waiting %lld running %lld | agr refused %lld stops %lld "
+                 "on %lld",
+                 b ? b->step : -1, !b ? "-" : b->phase == RAD_PHASE_PREFILL ? "prefill" : b->phase == RAD_PHASE_DECODE ? "decode" : "MIXED",
+                 tot / 1000.0, phase_step_us_[PH_PLAN] / 1000.0, phase_step_us_[PH_BEGIN] / 1000.0,
+                 phase_step_us_[PH_BUILD] / 1000.0, phase_step_us_[PH_PRE] / 1000.0, phase_step_us_[PH_RANKS] / 1000.0,
+                 phase_step_us_[PH_SAVE] / 1000.0, phase_step_us_[PH_COLLECT] / 1000.0, phase_step_us_[PH_COMMIT] / 1000.0,
+                 phase_step_us_[PH_DRAFT] / 1000.0, tail_ms_[0], tail_ms_[1], tail_ms_[2],
+                 h.step_ms, h.lock_ms, h.walk_ms, (long long)h.asked, (long long)h.restores, h.restore_ms,
+                 ev.empty() ? " none" : ev.c_str(), (long long)h.waiting, (long long)h.running,
+                 (long long)h.agr[0], (long long)h.agr[1], (long long)h.agr[2]);
+    }
+    for (int i = 0; i < PH_N; ++i) phase_step_us_[i] = 0;
+    tail_ms_[0] = tail_ms_[1] = tail_ms_[2] = 0;
 }
 
 /* Every error exit from the step loop goes through here, which does three things:
@@ -1269,6 +1370,18 @@ int Engine::step_loop() {
      * one committed: a step issued ahead takes its rows from the leader's cards, which the follower
      * does not have (engine_node.cpp). */
     if (pp_on()) pipelining_ = false;
+    /* qfn-on-ds lever BGL stage 1: lane 1's steps run between lane 0's, so nothing is issued ahead (a step issued ahead is
+     * lane 0's, and lane 1's step would have to wait for its commit) */
+    /* lever BGL stage 2b + RADIANCE_BGL_AHEAD=1 (Qwen loop round 25, QUEUE Q5b): lane 1's steps go out on each rank's second Ctx,
+     * so lane 0's step issued ahead orders against nothing of lane 1's; issue_ahead declines where the loop top has lane-1 work. */
+    {
+        const char* ah = std::getenv("RADIANCE_BGL_AHEAD");
+        bgl_ahead_ = bgl2b_ && ah && !std::strcmp(ah, "1");
+    }
+    if (bgl1m_ && !bgl_ahead_) pipelining_ = false;
+    if (bgl_ahead_ && pipelining_)
+        RAD_INFO("lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): lane 0 issues its decode steps ahead beside lane 1's steps on the "
+                 "second Ctx; none while a finished lane-1 step or a lent newcomer waits at the loop top");
     if (oracle_head)
         RAD_WARN("--debug-draft-oracle beside the draft head '%s': no step is issued ahead of its "
                  "commit, so the harness's ids replace the head's proposals before each verify is "
@@ -1285,7 +1398,15 @@ int Engine::step_loop() {
                 "ahead, and this server issues none; ask the plugin for a chain", drafter_.name);
         return fail_loop(RAD_E_UNSUPPORTED);
     }
-    const bool t_on = (int)log_level() >= (int)Log::Debug;
+    {   /* qfn-on-ds Q92: RADIANCE_LOG_STEP_HOST=<ms> turns the phase marks on and prints a step's split (step_host_line) */
+        const char* e = std::getenv("RADIANCE_LOG_STEP_HOST");
+        step_host_ms_ = e ? std::max(0.0, std::atof(e)) : -1;
+        if (step_host_ms_ >= 0)
+            RAD_INFO("RADIANCE_LOG_STEP_HOST=%g (qfn-on-ds Q92): a 'step-host' line for every step of at least %g ms -- the "
+                     "engine's phases, the scheduler's lock / admission walk / restores / evictions by site, the step's tail",
+                     step_host_ms_, step_host_ms_);
+    }
+    const bool t_on = (int)log_level() >= (int)Log::Debug || step_host_ms_ >= 0;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
     if (std::getenv("RADIANCE_TEST_KV_ROLLBACK_REPORT")) {
         sched_.set_kv_rollback_test_hook([this](uint64_t seq, int proposals, int accepted,
@@ -1318,14 +1439,59 @@ int Engine::step_loop() {
         const bool issued = ahead != nullptr;
         const RadBatch* b = ahead;
         ahead = nullptr;
-        if (issued) sched_.promote_next();
-        else        b = sched_.step();
+        /* qfn-on-ds lever BGL: lane 1 (the BG lane) steps when lane 0 lent it a newcomer; else lane 0, which may lend the next
+         * one to lane 1 (the planners: lane 1 plans before lane 0 plans again) */
+        /* lever BGL stage 2b: a lane-1 step in flight whose end event (stashed while lane 0 is selected) has completed is finished
+         * now -- every rank's first Ctx first waits for its second Ctx's end (bg_done_), so lane 0's next step reads the newcomer
+         * behind it */
+        if (bgl2b_ && bgf_.on && !issued) {
+            const int q = rad_event_query(bgio_in_ ? step_end_ : bgio_.step_end);
+            if (q < 0) return fail_loop(q);
+            if (q == 1) {
+                lane_select(1);
+                for (size_t r = 0; r < ranks_.size(); ++r)
+                    if (const int ws = rad_event_wait(ranks_[r]->ctx.stream(), bg_done_[r]); ws < 0) return fail_loop(ws);
+                StepOut so1 = std::move(bgf_.so);
+                bgf_.so = StepOut{};
+                bgf_.on = false;
+                bgl_flight_ms_ += (double)(rad_mono_ns() - bgf_.t0) / 1e6;
+                if (const int fs = finish_step(bgf_.b, so1, lsched().plan(), bgf_.pf1_tok, t_on); fs < 0) return fail_loop(fs);
+                continue;
+            }
+        }
+        if (bgl1m_ && !issued) {
+            const int lane = (!bgf_.on && lanes_.inbox_n(1) > 0) ? 1 : 0;
+            lanes_.set_planners({ 1 - lane });
+            if (lane == 1 && bgl2b_) {
+                /* stage 2b: the second Ctx waits on the card for everything the first issued so far (a block the commit just freed
+                 * may still be written behind a lane-0 step on a follower rank) -- no host wait */
+                for (size_t r = 0; r < ranks_.size(); ++r) {
+                    if (const int es = rad_event_record(bg_gate_[r], ranks_[r]->ctx.stream()); es < 0) return fail_loop(es);
+                    if (const int ws = rad_event_wait(ranks_[r]->bg_ctx.stream(), bg_gate_[r]); ws < 0) return fail_loop(ws);
+                }
+            } else if (lane == 1 && ranks_[0]->bg_ready) {
+                /* stage 2a (serial): every rank's first Ctx drained before a lane-1 step starts on its second */
+                for (auto& rk : ranks_) (void)rk->ctx.sync_all();
+            }
+            if (lane == 0 && bgf_.on) ++bgl_overlap_steps_;
+            lane_select(lane);
+        }
+        if (issued) lsched().promote_next();
+        else        b = lsched().step();
+        if (b && bgl1m_ && cur_sched_ != &sched_) ++bgl_steps_;
+        if (!b && bgl1m_ && cur_sched_ != &sched_) {
+            /* the BG lane planned nothing from its inbox (its newcomer was cancelled): back to lane 0 */
+            lanes_.set_planners({ 1 });
+            lane_select(0);
+            b = sched_.step();
+        }
         if (!b) {
             /* Idle: back off in small steps instead of spinning; the first wait is short so a new
              * request into an empty engine is not delayed. */
             step_batch_.store(nullptr, std::memory_order_release);
             drain_completed();
             sched_.publish(/*idle=*/true);
+            if (bgl1m_) sched_of(1).publish(/*idle=*/true);   /* lever BGL: the lanes' sum is what /metrics reads */
             /* Work is waiting only on the encoder: loop immediately. */
             if (sched_.encodes_pending()) { idle = 0; continue; }
             /* Release deferred by the last step. A request cancelled while a drafter pass was being
@@ -1334,7 +1500,7 @@ int Engine::step_loop() {
              * may be what blocks the next admission. Drain the streams first so no in-flight pass
              * still reads them. */
             if (sched_.has_deferred()) {
-                for (auto& rk : ranks_) (void)rad_stream_sync(rk->ctx.stream());
+                for (auto& rk : ranks_) (void)rad_stream_sync(rk->cx().stream());
                 sched_.release_deferred();
             }
             tier_tick();
@@ -1352,7 +1518,7 @@ int Engine::step_loop() {
         /* Entries that want logits rows, in BatchBuilder's out_ids order: those with
          * produces_token, 1 + n_spec rows each. Row and sequence indices differ (a mid-prompt
          * chunk produces no row). */
-        const StepPlan& plan = sched_.plan();
+        const StepPlan& plan = lsched().plan();
         /* qfn-on-ds RADIANCE_PF_TIMELINE: this step is a lone prefill chunk with its prompt's first token (the plan is b's here) */
         const bool pf1_tok = pf_tl_ && b->phase == RAD_PHASE_PREFILL && plan.e.size() == 1 && plan.e[0].is_prefill &&
                              plan.e[0].produces_token;
@@ -1394,9 +1560,9 @@ int Engine::step_loop() {
                 if (!rq) continue;
                 bool failed = false;
                 for (auto& rk : ranks_) {
-                    if (rk->sampler.has_request(rq->id)) continue;
+                    if (rk->smp().has_request(rq->id)) continue;
                     std::string err;
-                    if (rk->sampler.begin_request(rq->id, rq->sp, &err) < 0) {
+                    if (rk->smp().begin_request(rq->id, rq->sp, &err) < 0) {
                         RAD_ERR("sampler: request %llu could not be started: %s; cancelling it",
                                 (unsigned long long)rq->id, err.c_str());
                         failed = true;
@@ -1404,11 +1570,11 @@ int Engine::step_loop() {
                     }
                 }
                 if (failed) {
-                    for (auto& rk : ranks_) rk->sampler.end_request(rq->id);
+                    for (auto& rk : ranks_) rk->smp().end_request(rq->id);
                     cancel.push_back(rq->id);
                     continue;
                 }
-                rq->speculation_fixed = ranks_[0]->sampler.speculation_fixed(rq->id);
+                rq->speculation_fixed = ranks_[0]->smp().speculation_fixed(rq->id);
             }
             if (t_on) phase_mark(PH_BEGIN);
             /* Lever SD: a prompt-lookup proposal (the hybrid's, or the lookup filling an empty one) was not drawn
@@ -1419,15 +1585,15 @@ int Engine::step_loop() {
                     if (!e.produces_token || !e.ngram || e.n_spec <= 0) continue;
                     ++couple_n_lookup_;
                     for (auto& rk : ranks_) {
-                        const int cs = rk->sampler.set_mtp_couple(e.seq, nullptr, 0);
+                        const int cs = rk->smp().set_mtp_couple(e.seq, nullptr, 0);
                         if (cs < 0 && cs != RAD_E_NOTFOUND) return cs;
                     }
                 }
             for (auto& rk : ranks_) {
-                const int s = rk->sampler.build_step(so.reqs, b->step);
+                const int s = rk->smp().build_step(so.reqs, b->step);
                 if (s < 0) { RAD_ERR("sampler build_step: %s", rad_strerror(s)); return s; }
                 /* A request the sampler could not serve is cancelled; the step goes on. */
-                for (uint64_t id : rk->sampler.take_failed()) cancel.push_back(id);
+                for (uint64_t id : rk->smp().take_failed()) cancel.push_back(id);
             }
             if (t_on) phase_mark(PH_BUILD);
         }
@@ -1561,12 +1727,51 @@ int Engine::step_loop() {
         /* Then the next step's forward pass, before this step is read back. Its rows continue from
          * the card's acceptance and verify the new drafts; its sampler waits for this step's
          * commit. The card runs straight on while the host waits, commits and stages. */
+        /* lever BGL stage 2b: lane 1's step goes out whole on the second Ctx and is finished by its event at the loop's top
+         * (finish_step), while lane 0 steps on */
+        if (bgl2b_ && cur_sched_ != &sched_) {
+            for (size_t r = 0; r < ranks_.size(); ++r) {
+                st = rad_event_record(bg_done_[r], ranks_[r]->bg_ctx.stream());
+                if (st < 0) return fail_loop(st);
+            }
+            bgf_.b = b;
+            bgf_.so = std::move(so);
+            so = StepOut{};
+            bgf_.pf1_tok = pf1_tok;
+            bgf_.on = true;
+            bgf_.t0 = rad_mono_ns();
+            lane_select(0);
+            continue;
+        }
         st = issue_ahead(&ahead);
         if (st < 0) return fail_loop(st);
+        if (const int fs = finish_step(b, so, plan, pf1_tok, t_on); fs < 0) return fail_loop(fs);
+    }
+    if (fal_.on) fal_note(true);   /* RADIANCE_DRAFT_FORCE_AL: the realized AL by depth at the stop */
+    if (bgl1m_) {   /* qfn-on-ds lever BGL: what the BG lane took (the test side reads this line at the stop) */
+        const LaneSet::Counts c = lanes_.counts();
+        RAD_INFO("lever BGL: %lld newcomer(s) lent whole to the BG lane (%lld rows), %lld BG step(s); kept home: a prefix restore "
+                 "%lld, no room %lld, not a planner %lld", (long long)c.bg, (long long)c.bg_rows, (long long)bgl_steps_,
+                 (long long)c.bg_skip[LaneSet::kBgRestore], (long long)c.bg_skip[LaneSet::kBgRoom],
+                 (long long)c.bg_skip[LaneSet::kBgOrder]);
+        if (bgl2b_)
+            RAD_INFO("lever BGL stage 2b: %lld lane-0 step(s) issued while a lane-1 step was in flight; lane-1 steps %.1f ms issue to "
+                     "finish on average", (long long)bgl_overlap_steps_, bgl_steps_ > 0 ? bgl_flight_ms_ / (double)bgl_steps_ : 0.0);
+        if (bgl_ahead_)
+            RAD_INFO("lever BGL stage 2b ahead (RADIANCE_BGL_AHEAD=1): %lld lane-0 step(s) issued ahead, %lld of them while a lane-1 step "
+                     "was in flight", (long long)bgl_ahead_steps_, (long long)bgl_ahead_beside_);
+    }
+    return RAD_OK;
+}
+
+/* The step's second half: its readback, commit and drafter's finish (step_loop; lever BGL stage 2b: a lane-1 step finished by event).
+ * Returns RAD_OK or the status step_loop fails on. */
+int Engine::finish_step(const RadBatch* b, StepOut& so, const StepPlan& plan, bool pf1_tok, bool t_on) {
+    int st = RAD_OK;
         const uint64_t pf1_f0 = pf_tl_ ? rad_mono_ns() : 0;
         st = embedding_ ? collect_pooled(b, so) : collect_step(b, so);
         if (t_on) phase_mark(PH_COLLECT);
-        if (st < 0) return fail_loop(st);
+        if (st < 0) return st;
         /* tp8 S4: a card's stage op that gave up leaves its ring's abort word set and its pass
          * computed from nothing; the step's tokens are not read. */
         if (pp_link_)
@@ -1576,18 +1781,18 @@ int Engine::step_loop() {
                         RAD_ERR("two-node pipeline: step %d: crossing X%d was aborted (%s): the step's "
                                 "tokens are not used", b->step, k + 1, pp_link_->alive() ? "a stage op gave up"
                                                                                          : pp_link_->why().c_str());
-                        return fail_loop(RAD_E_IO);
+                        return RAD_E_IO;
                     }
         /* The step's sampler chain, verify op included, has returned: one line at the first
          * coupled verify that actually completed. */
         couple_verify_evidence(b->step);
         if (cfg_.kld()) {
             st = score_rows(b, so);
-            if (st < 0) return fail_loop(st);
+            if (st < 0) return st;
         }
 
         /* Buffer probe after the trunk step; drafters dump after their own passes. */
-        dump_buffers(ranks_[0]->ctx, b->step);
+        dump_buffers(ranks_[0]->cx(), b->step);
 
         /* --profile-ops also prints during the run. Counters are cumulative, so each dump covers
          * the run so far. Every 32 steps by default (RADIANCE_PROFILE_EVERY): per-op timing
@@ -1599,7 +1804,7 @@ int Engine::step_loop() {
             return n > 0 ? n : 32;
         }();
         if (cfg_.profile_ops && b->step > 0 && (b->step % prof_every) == 0) {
-            for (auto& rk : ranks_) rk->ctx.dump_profile();
+            for (auto& rk : ranks_) rk->cx().dump_profile();
             /* RADIANCE_DEBUG_MISS_LOG: which step this table set stands behind. */
             if (missl_) missl_->profile_mark(b->step, false);
         }
@@ -1615,8 +1820,8 @@ int Engine::step_loop() {
             std::string ids;
             const int64_t n = std::min<int64_t>(b->n_tok, 32);
             std::vector<int32_t> host((size_t)n);
-            if (rad_memcpy_async(host.data(), b->token_ids, n * 4, ranks_[0]->ctx.stream()) >= 0 &&
-                rad_stream_sync(ranks_[0]->ctx.stream()) >= 0) {
+            if (rad_memcpy_async(host.data(), b->token_ids, n * 4, ranks_[0]->cx().stream()) >= 0 &&
+                rad_stream_sync(ranks_[0]->cx().stream()) >= 0) {
                 for (int64_t i = 0; i < n; ++i) ids += fmt("%s%d", i ? " " : "", host[(size_t)i]);
                 RAD_TRACE("step %d in: [%s%s]", b->step, ids.c_str(),
                           b->n_tok > n ? " ..." : "");
@@ -1636,9 +1841,9 @@ int Engine::step_loop() {
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
         kv_test_before_commit(plan, so, b->step, ranks_);
 #endif
-        st = sched_.commit(res);
+        st = lsched().commit(res);
         if (t_on) phase_mark(PH_COMMIT);
-        if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return fail_loop(st); }
+        if (st < 0) { RAD_ERR("commit: %s", rad_strerror(st)); return st; }
         pf1_finish(b, pf1_f0, pf1_tok);   /* qfn-on-ds RADIANCE_PF_TIMELINE: a prompt's line at its first token */
         /* ds41-acc: the verifies against the confidence plane and the shadow tree's branches. */
         dconf_commit(plan, so, b->step);
@@ -1647,7 +1852,7 @@ int Engine::step_loop() {
          * a row. */
         if (so.n_rows > 0) {
             st = stream_probe_take(b, res.n_prefill_done > 0, res.n_finished > 0);
-            if (st < 0) return fail_loop(st);
+            if (st < 0) return st;
         }
 
         /* With the ids read ahead of the drafter's passes, the commit streamed the tokens while
@@ -1656,7 +1861,7 @@ int Engine::step_loop() {
         if (so.early) {
             st = rad_event_sync(step_end_);
             if (st < 0) { RAD_ERR("step %d: waiting for its draft passes: %s", b->step,
-                                  rad_strerror(st)); return fail_loop(st); }
+                                  rad_strerror(st)); return st; }
             so.early = false;
         }
 
@@ -1664,22 +1869,40 @@ int Engine::step_loop() {
          * acceptance against the host's and publish its proposals. Each driver returns
          * immediately for a kind that is not its own. */
         st = block_drafting() ? finish_block_drafter(so) : finish_serial_drafter(so);
-        if (st < 0) return fail_loop(st);
+        if (st < 0) return st;
         /* The step ends here, after its draft rounds, so step timing includes them
          * (Scheduler::step_finished). */
-        sched_.step_finished();
+        lsched().step_finished();
+        const uint64_t th0 = step_host_ms_ >= 0 ? rad_mono_ns() : 0;   /* qfn-on-ds Q92: the tail's split */
         tier_tick();
+        const uint64_t th1 = th0 ? rad_mono_ns() : 0;
         loan_tick(/*idle=*/false);
         const uint64_t now = rad_mono_ns();
         arena_tick(now);
         expire_tick(now);
+        const uint64_t th2 = th0 ? rad_mono_ns() : 0;
         drain_completed();
-        sched_.publish(/*idle=*/false);
+        lsched().publish(/*idle=*/false);
+        if (th0) {
+            const uint64_t th3 = rad_mono_ns();
+            tail_ms_[0] = (double)(th1 - th0) / 1e6;
+            tail_ms_[1] = (double)(th2 - th1) / 1e6;
+            tail_ms_[2] = (double)(th3 - th2) / 1e6;
+        }
+        /* lever BGL: back to lane 0 between steps (the HTTP side's reads go to the lane set; lane_select only names the lane the
+         * step loop works on) */
+        if (bgl1m_ && cur_sched_ != &sched_) {
+            /* stage 2 (WIP, serial): the lane-1 step drained on every rank's second Ctx before lane 0 reads its newcomer */
+            if (ranks_[0]->bg_ready && !bgl2b_)
+                for (auto& rk : ranks_) (void)rk->bg_ctx.sync_all();
+            lane_select(0);
+        }
 
         /* One line every 128 steps; the phases sum to the step. `ranks` is the enqueue; device time
          * shows up in `collect`, the step's only host synchronisation. */
         if (t_on) {
             phase_mark(PH_DRAFT);
+            if (step_host_ms_ >= 0) step_host_line(b);
             if (++phase_n_ == 128) {
                 double tot = 0;
                 for (int i = 0; i < PH_N; ++i) tot += phase_us_[i];
@@ -1695,7 +1918,6 @@ int Engine::step_loop() {
                 phase_n_ = 0;
             }
         }
-    }
     return RAD_OK;
 }
 
@@ -1712,28 +1934,28 @@ int Engine::collect_issue(StepOut& so, bool fence) {
     so.early = false;
     if (so.n_rows <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
-    void* src = r0.ctx.buf_ptr(r0.tok_buf);
+    void* src = r0.cx().buf_ptr(r0.tok_buf);
     if (!src) {
         RAD_ERR("the sampler's token buffer has no address -- it was declared but never planned");
         return RAD_E_STATE;
     }
     so.rb = readback_.reserve(so.n_rows);
     if (!so.rb) return RAD_E_NOMEM;
-    RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.ctx.stream()));
+    RAD_TRY(rad_memcpy_async(so.rb, src, (int64_t)so.n_rows * 4, r0.cx().stream()));
 
     /* The first logits row at -vv, the only direct view of the forward pass's output (rad-kbench
      * checks single ops, not whole layers). */
     const int64_t nv = meta_.n_vocab;
     if ((int)log_level() >= (int)Log::Trace && nv > 0) {
-        void* lp = r0.ctx.buf_ptr(r0.program.logits_buf);
+        void* lp = r0.cx().buf_ptr(r0.program.logits_buf);
         if (lp) {
             so.lg.resize((size_t)nv);
-            rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.ctx.stream());
+            rad_memcpy_async(so.lg.data(), lp, nv * 4, r0.cx().stream());
         }
         return RAD_OK;
     }
     if (fence && early_ids_) {
-        RAD_TRY(rad_event_record(tok_end_, r0.ctx.stream()));
+        RAD_TRY(rad_event_record(tok_end_, r0.cx().stream()));
         so.early = true;
     }
     return RAD_OK;
@@ -1766,7 +1988,7 @@ int Engine::stream_probe_issue(const RadBatch* b) {
         /* Zeroed, so a group whose first copy has not landed reads as no calls yet. */
         std::memset(stream_ctl_p_, 0, n * 16 * sizeof(int32_t));
     }
-    RadStream st = ranks_[0]->ctx.stream();
+    RadStream st = ranks_[0]->cx().stream();
     for (size_t i = 0; i < n; ++i) {
         const RadKVStream* sv = b->kv[i].stream;
         if (!sv || !sv->ctl) continue;
@@ -1787,7 +2009,7 @@ int Engine::stream_probe_take(const RadBatch* b, bool prefill_done, bool request
     if (!b || !stream_ctl_p_ || b->n_kv_groups <= 0) return RAD_OK;
     const size_t n = (size_t)b->n_kv_groups;
     if (stream_prev_.size() < n) stream_prev_.assign(n, StreamRead{});
-    RadStream st = ranks_[0]->ctx.stream();
+    RadStream st = ranks_[0]->cx().stream();
     bool       overflowed = false;
     std::string overflow_why;
     for (size_t i = 0; i < n; ++i) {
@@ -1855,7 +2077,7 @@ void Engine::stream_report(const char* when, const StreamRead& r, const StreamRe
 int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
     if (embedding_) RAD_TRY(collect_pooled_issue(b, so));
     else if (so.n_rows > 0 && !so.rb) RAD_TRY(collect_issue(so));
-    return rad_event_record(step_end_, ranks_[0]->ctx.stream());
+    return rad_event_record(step_end_, ranks_[0]->cx().stream());
 }
 
 /* Issue the copy of an embedding step's pooled rows (the first n_seq) into pinned memory on rank
@@ -1863,14 +2085,14 @@ int Engine::mark_step_end(const RadBatch* b, StepOut& so) {
 int Engine::collect_pooled_issue(const RadBatch* b, StepOut& /*so*/) {
     if (b->n_seq <= 0) return RAD_OK;
     Rank& r0 = *ranks_[0];
-    const void* src = r0.ctx.buf_ptr(r0.program.pooled_buf);
+    const void* src = r0.cx().buf_ptr(r0.program.pooled_buf);
     if (!src) {
         RAD_ERR("the pooled output was declared but never planned");
         return RAD_E_STATE;
     }
     return rad_memcpy_async(pooled_host_, src,
                             (int64_t)b->n_seq * pooled_dim_ * (int64_t)sizeof(float),
-                            r0.ctx.stream());
+                            r0.cx().stream());
 }
 
 /* Hand each sequence's vector to its sink, and set eos for every sequence so the commit finishes
@@ -1930,7 +2152,7 @@ int Engine::restore_checkpoints() {
                 if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                 const int s = rk->kv.checkpoint_restore(ckpt_slots_.data(),
                                                         (int)ckpt_slots_.size(),
-                                                        e.ckpt_restore, rk->ctx.stream(),
+                                                        e.ckpt_restore, rk->cx().stream(),
                                                         &ckpt_win_);
                 if (s < 0) {
                     RAD_ERR("could not restore sequence %llu from checkpoint slot %d on "
@@ -2010,7 +2232,7 @@ int Engine::save_checkpoints() {
                                     st = RAD_E_STATE;
                                     break;
                                 }
-                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->ctx.stream());
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->cx().stream());
                             }
                         }
                         t.row = 0; t.ck = -1;
@@ -2026,6 +2248,55 @@ int Engine::save_checkpoints() {
                              "%llu state rows staged on rank 0 so far, %llu snapshots)", (unsigned long long)e.seq,
                              (long long)(e.ctx_len + e.ckpt_tok + 1), (int)e.n_tokens, (int)e.ckpt_tok + 1,
                              (unsigned long long)tip_[0].rows, (unsigned long long)tip_saves_);
+                    continue;
+                }
+                /* qfn-on-ds Qwen tp8 S7b (RADIANCE_PP_HEAD_SNAP=1, a leader): a chunk-end snapshot whose head layers' rows its HEAD
+                 * part staged (head_stage); the rest -- the tail layers, which no other lane's pass wrote since -- saved as the step
+                 * leaves them. Not staged in its head part: refused (the head layers' state may be another chunk's by now). */
+                if (head_snap_ && !inside) {
+                    for (auto& rk : ranks_) {
+                        if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
+                        HsEntry x;
+                        bool found = false;
+                        {
+                            std::lock_guard<std::mutex> lk(hs_mu_);
+                            std::vector<HsEntry>& dn = hs_[(size_t)rk->index].done;
+                            for (size_t i = 0; i < dn.size(); ++i)
+                                if (dn[i].seq == e.seq && dn[i].ck == e.ckpt_slot) {
+                                    x = std::move(dn[i]);
+                                    dn.erase(dn.begin() + (ptrdiff_t)i);
+                                    found = true;
+                                    break;
+                                }
+                        }
+                        int st = RAD_OK;
+                        if (!found || x.rows <= 0) {
+                            RAD_ERR("rank %d: Qwen tp8 S7b: sequence %llu's snapshot (slot %d, position %lld) was not staged in its head "
+                                    "part; the head layers' state may be a later chunk's", rk->index, (unsigned long long)e.seq,
+                                    (int)e.ckpt_slot, (long long)(e.ctx_len + e.ckpt_tok + 1));
+                            st = RAD_E_STATE;
+                        }
+                        const KVManager& kv = rk->kv;
+                        for (int32_t g = 0; st >= 0 && g < kv.n_groups(); ++g) {
+                            const KVGroupPlan* p = kv.plan(g);
+                            if (!p || !p->stateful()) continue;
+                            for (int64_t l = 0; st >= 0 && l < p->n_layers; ++l) {
+                                if ((size_t)g < x.staged.size() && (size_t)l < x.staged[(size_t)g].size() &&
+                                    x.staged[(size_t)g][(size_t)l]) continue;
+                                st = kv.stage_state_row(g, (int32_t)l, ckpt_slots_[(size_t)g], e.ckpt_slot, rk->cx().stream());
+                            }
+                        }
+                        if (st < 0) {
+                            if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                            return st;
+                        }
+                        hs_rows_ += (uint64_t)x.rows;
+                    }
+                    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+                    if (++hs_saves_ == 1 || hs_saves_ % 256 == 0)
+                        RAD_INFO("Qwen tp8 S7b: %llu chunk-end snapshots saved with their head layers staged in the head part "
+                                 "(%llu head rows staged over the ranks)", (unsigned long long)hs_saves_,
+                                 (unsigned long long)hs_rows_);
                     continue;
                 }
                 int64_t row0 = 0;
@@ -2045,7 +2316,7 @@ int Engine::save_checkpoints() {
                     if (ranks_.size() > 1) (void)rad_dev_set(rk->device);
                     const int s = rk->kv.checkpoint_save(ckpt_slots_.data(),
                                                          (int)ckpt_slots_.size(),
-                                                         e.ckpt_slot, rk->ctx.stream(),
+                                                         e.ckpt_slot, rk->cx().stream(),
                                                          &ckpt_win_);
                     if (s < 0) {
                         RAD_ERR("rank %d could not snapshot sequence %llu into checkpoint slot "
@@ -2065,7 +2336,7 @@ int Engine::save_checkpoints() {
                             return RAD_E_STATE;
                         }
                         const int ps = rk->kv.checkpoint_patch_conv(
-                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->ctx.stream());
+                            e.ckpt_slot, (const char*)ids + (first - ctx) * 4, ctx, rk->cx().stream());
                         if (ps < 0) {
                             if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
                             return ps;
@@ -2087,7 +2358,7 @@ int Engine::tip_stage(void* u, int group, int layer, void* stream) {
     TipRank* t = static_cast<TipRank*>(u);
     if (!t || !t->e || t->row <= 0 || t->ck < 0) return RAD_E_STATE;
     Rank& rk = *t->e->ranks_[(size_t)t->rank];
-    const int64_t li = rk.ctx.kv_layer_index((rad_kvgroup)group, layer);
+    const int64_t li = rk.cx().kv_layer_index((rad_kvgroup)group, layer);
     if (group < 0 || (size_t)group >= t->slots.size() || t->slots[(size_t)group] < 0 || li < 0 ||
         (size_t)li >= t->staged[(size_t)group].size()) {
         ++t->fail;
@@ -2098,6 +2369,29 @@ int Engine::tip_stage(void* u, int group, int layer, void* stream) {
     if (s < 0) { ++t->fail; return s; }
     t->staged[(size_t)group][(size_t)li] = 1;
     ++t->rows;
+    return RAD_OK;
+}
+
+/* qfn-on-ds Qwen tp8 S7b: the plugin's staging callback in a leader's HEAD part (rad_tip_set row -1), on the rank's thread
+ * inside its issue: copy (group, model layer)'s state row of every chunk-end snapshot entry of the issue into its slot. */
+int Engine::head_stage(void* u, int group, int layer, void* stream) {
+    HsRank* h = static_cast<HsRank*>(u);
+    if (!h || !h->e || h->cur.empty()) return RAD_E_STATE;
+    Rank& rk = *h->e->ranks_[(size_t)h->rank];
+    const int64_t li = rk.cx().kv_layer_index((rad_kvgroup)group, layer);
+    for (HsEntry& x : h->cur) {
+        if (group < 0 || (size_t)group >= x.slots.size() || x.slots[(size_t)group] < 0 || li < 0 ||
+            (size_t)li >= x.staged[(size_t)group].size()) {
+            ++h->fail;
+            RAD_ERR("rank %d: Qwen tp8 S7b: no state row for group %d layer %d (layer row %lld)", h->rank, group, layer,
+                    (long long)li);
+            return RAD_E_STATE;
+        }
+        const int s = rk.kv.stage_state_row((int32_t)group, (int32_t)li, x.slots[(size_t)group], x.ck, (RadStream)stream);
+        if (s < 0) { ++h->fail; return s; }
+        x.staged[(size_t)group][(size_t)li] = 1;
+        ++x.rows;
+    }
     return RAD_OK;
 }
 
@@ -2160,7 +2454,7 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
     bool host_failed = false;
     int64_t failed_rows = 0;
     for (auto& rk : ranks_) {
-        const int64_t width = rk->sampler.config().n_vocab_local;
+        const int64_t width = rk->smp().config().n_vocab_local;
         /* In floats: n logits rows, or the bf16 hidden and table rows of a scored step. */
         int64_t rows = n;
         if (score_only_) {
@@ -2188,8 +2482,8 @@ int Engine::stage_scored_rows(const StepPlan& plan, const StepOut& so,
 }
 
 int Engine::issue_scored_rows(Rank& r) {
-    const int64_t width = r.sampler.config().n_vocab_local;
-    char* const logits = static_cast<char*>(r.ctx.buf_ptr(r.program.logits_buf));
+    const int64_t width = r.smp().config().n_vocab_local;
+    char* const logits = static_cast<char*>(r.cx().buf_ptr(r.program.logits_buf));
     if (!logits || !r.score_host) return RAD_E_STATE;
     if (score_only_) {
         /* The plugin left the hidden rows and ran no lm_head: read back each scored row's hidden
@@ -2197,23 +2491,23 @@ int Engine::issue_scored_rows(Rank& r) {
          * about to read, so the token it draws (and the caller discards) is drawn from defined
          * values. One rank (BatchBuilder). */
         const int64_t rb = score_embd_ * (int64_t)sizeof(uint16_t);
-        const char* hid = static_cast<const char*>(r.ctx.buf_ptr(r.program.score_hidden));
-        const char* tab = static_cast<const char*>(r.ctx.weight_ptr(r.program.score_table));
+        const char* hid = static_cast<const char*>(r.cx().buf_ptr(r.program.score_hidden));
+        const char* tab = static_cast<const char*>(r.cx().weight_ptr(r.program.score_table));
         if (!hid || !tab) return RAD_E_STATE;
         char* host = reinterpret_cast<char*>(r.score_host);
         const int64_t n = (int64_t)score_rows_.size();
         for (int64_t k = 0; k < n; ++k)
             RAD_TRY(rad_memcpy_async(host + k * rb, hid + (int64_t)score_rows_[(size_t)k].first * rb,
-                                     rb, r.ctx.stream()));
+                                     rb, r.cx().stream()));
         for (size_t j = 0; j < score_ids_.size(); ++j)
             RAD_TRY(rad_memcpy_async(host + (n + (int64_t)j) * rb, tab + (int64_t)score_ids_[j] * rb,
-                                     rb, r.ctx.stream()));
-        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.ctx.stream());
+                                     rb, r.cx().stream()));
+        return rad_memset_async(logits, 0, n * width * (int64_t)sizeof(float), r.cx().stream());
     }
     for (size_t k = 0; k < score_rows_.size(); ++k)
         RAD_TRY(rad_memcpy_async(r.score_host + (int64_t)k * width,
                                  logits + (int64_t)score_rows_[k].first * width * 4,
-                                 width * 4, r.ctx.stream()));
+                                 width * 4, r.cx().stream()));
     return RAD_OK;
 }
 
@@ -2260,7 +2554,7 @@ int Engine::collect_scored_rows() {
         for (size_t j = 0; j < ts.tokens.size(); ++j) {
             const int64_t t = ts.tokens[j];
             for (auto& rk : ranks_) {
-                const SamplerConfig& sc = rk->sampler.config();
+                const SamplerConfig& sc = rk->smp().config();
                 if (t < sc.vocab_off || t >= sc.vocab_off + sc.n_vocab_local) continue;
                 ts.logits[j] = rk->score_host[(int64_t)k * sc.n_vocab_local + (t - sc.vocab_off)];
                 break;
@@ -2279,7 +2573,7 @@ int Engine::row_logprobs(StepOut& so, int32_t row, int32_t token, int32_t at) {
     if (at < 0) at = row;
     if (row < 0 || row >= so.n_rows || at >= so.n_rows) return RAD_E_STATE;
     TokenLogprobs& lp = so.lp[(size_t)at];
-    const int s = ranks_[0]->sampler.logprobs_for(row, token, &lp);
+    const int s = ranks_[0]->smp().logprobs_for(row, token, &lp);
     if (s == RAD_E_INVAL) { lp = TokenLogprobs{}; return RAD_OK; }
     return s;
 }
@@ -2347,22 +2641,38 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
              * tree), as the card's acceptance does; `path` names the accepted nodes. */
             int32_t path[RAD_SCHED_MAX_SPEC] = { 0 };
             const bool tree = plan.spec_is_tree;
+            int32_t fal_drawn = -1;   /* RADIANCE_DRAFT_FORCE_AL: the draw's count before the cut */
             if (tree)
                 RAD_TRY(accept_tree(e.draft, e.draft_parent, e.n_spec,
                                     &so.rows[(size_t)so.first_row[i]], out, path, &acc));
-            else
+            else if (fal_.on) {
+                /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h, measurement only): the card's count from the same draw
+                 * (its ADV_ACCEPT ran with so.fal_key; without one, nothing on the card to agree with: the step). */
+                fal_drawn = fal_count(fal_, so.fal_has ? so.fal_key : (uint32_t)b->step, e.card, e.n_spec);
+                RAD_TRY(accept_forced(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], fal_drawn, out, &acc));
+            } else
                 RAD_TRY(accept_greedy(e.draft, e.n_spec, &so.rows[(size_t)so.first_row[i]], out,
                                       &acc));
 
             /* Truncated at the first end-of-generation token, so `accepted` and `token` (which
              * drive the KV rollback, the conv cursor and the emitted text) say how far the step
              * really got. */
-            acc = accept_cut_at_eog(out, acc,
-                                    [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
+            /* RADIANCE_DRAFT_FORCE_AL: a drafted stop token cuts the count only where it would end the request -- not under
+             * ignore_eos (the card's row carries kAdvAuxKeepEos), nor with RADIANCE_DRAFT_FORCE_AL_CUT=0 (FINDINGS F77). */
+            if (fal_drawn < 0 || !(fal_.nocut || e.req->ignore_eos))
+                acc = accept_cut_at_eog(out, acc,
+                                        [&](int32_t t) { return vocab_ && vocab_->is_eog(t); });
 
             so.accepted[i] = acc;
             so.token[i]    = out[acc];
             so.eos[i]      = vocab_ && vocab_->is_eog(so.token[i]) ? 1 : 0;
+            if (fal_drawn >= 0) {
+                const int dq = e.n_spec < (int32_t)kFalDepths ? e.n_spec : (int32_t)kFalDepths - 1;
+                ++fal_n_[dq];
+                fal_a_[dq] += acc;
+                fal_cut_ += acc < fal_drawn;
+                if ((++fal_rows_ & 16383) == 0) fal_note(false);
+            }
             if (tree) {
                 if (so.path.empty()) so.path.assign(plan.e.size() * RAD_SCHED_MAX_SPEC, 0);
                 for (int32_t t = 0; t < acc; ++t) so.path[i * RAD_SCHED_MAX_SPEC + t] = path[t];
@@ -2381,7 +2691,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
             if (e.req)
                 for (auto& rk : ranks_)
                     for (int32_t j = 0; j <= acc; ++j) {
-                        const int as = rk->sampler.accept_token(e.req->id, out[j]);
+                        const int as = rk->smp().accept_token(e.req->id, out[j]);
                         /* A parse that outgrew the grammar's bounds fails the request at its next
                          * mask; not an engine defect. */
                         if (as == RAD_E_FULL || as == RAD_E_NOMEM)
@@ -2405,8 +2715,10 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         /* Advance the grammar on every rank: each builds the mask for its own vocabulary shard from
          * its own automaton. */
         if (e.req)
-            for (auto& rk : ranks_) rk->sampler.accept_token(e.req->id, so.token[i]);
+            for (auto& rk : ranks_) rk->smp().accept_token(e.req->id, so.token[i]);
     }
+
+    so.fal_has = false;   /* RADIANCE_DRAFT_FORCE_AL: the next step's ADV_ACCEPT arms its own key */
 
     /* Update may_speculate here, because a lazy grammar becomes constraining inside accept_token
      * above; a stale value would give a constrained request a draft the sampler refuses. */
@@ -2414,7 +2726,7 @@ int Engine::collect_step(const RadBatch* b, StepOut& so) {
         const StepEntry& e = plan.e[i];
         if (!e.req) continue;
         Request* r = const_cast<Request*>(e.req);
-        r->may_speculate = ranks_[0]->sampler.allows_speculation(r->id);
+        r->may_speculate = ranks_[0]->smp().allows_speculation(r->id);
     }
     return RAD_OK;
 }
@@ -2769,6 +3081,101 @@ void Engine::expire_tick(uint64_t now_ns) {
     (void)pc.expire(now_ns, (uint64_t)cfg_.prefix_cache_ttl * 1000000000ull);
 }
 
+/* qfn-on-ds F79 (Qwen loop round 53, QUEUE Q102; RADIANCE_PREFIX_UNREST=2): PrefixCache::same_bytes_fn. How many leading
+ * entries of `a` and `b` (n entries' block ids each, entry-major in the cache's entry_groups() order) hold the same bytes
+ * on every rank, in every layer of every cached group; -1 on a failure (then nothing counts as equal, and the F72 rule
+ * retires as it always did). A streamed group's rows are its pinned host mirror, read in place. A resident group's
+ * fragments come to the host in runs of consecutive block ids, every layer in one 2-D copy a run and side, on the mover's
+ * transfer stream (the compute stream on a rank without one), a chunk of entries at a time. Both copies are finished
+ * when this runs: the cache's was published by an earlier request, and this request publishes its blocks after the step
+ * that wrote them was collected; a copy still in flight could only read as different, never as equal. */
+int64_t Engine::prefix_same_bytes(const std::vector<int32_t>& a, const std::vector<int32_t>& b, int64_t n) {
+    if (n <= 0) return 0;
+    const std::vector<int32_t>& cg = ranks_[0]->prefix.entry_groups();
+    const size_t W = cg.size();
+    if (W == 0 || a.size() < (size_t)n * W || b.size() < (size_t)n * W) return -1;
+    int64_t eq = n;
+    constexpr int64_t kChunk = 2048;             /* entries a host buffer holds, every layer */
+    std::vector<char> ha, hb;
+    std::vector<std::pair<int64_t, int64_t>> runs;   /* (first entry, entries) of consecutive ids, one side */
+    int st = RAD_OK;
+    for (auto& r : ranks_) {
+        for (size_t k = 0; k < W && eq > 0 && st == RAD_OK; ++k) {
+            const KVGroupPlan* p = r->kv.plan(cg[k]);
+            if (!p) { st = RAD_E_STATE; break; }
+            if (p->zero || !p->paged()) continue;    /* no bytes of this group on this rank */
+            const int64_t L = std::max<int64_t>(1, p->n_layers);
+            auto bad_id = [&](int32_t x) { return x < 0 || (int64_t)x >= p->n_blocks; };
+            if (p->streamed()) {
+                const RadKVStream* v = r->kv.stream_view(cg[k]);
+                if (!v || !v->host || v->block_bytes <= 0) { st = RAD_E_STATE; break; }
+                for (int64_t i = 0; i < eq; ++i) {
+                    const int32_t x = a[(size_t)i * W + k], y = b[(size_t)i * W + k];
+                    if (x == y) continue;
+                    if (bad_id(x) || bad_id(y)) { eq = i; break; }
+                    bool same = true;
+                    for (int64_t l = 0; l < L && same; ++l) {
+                        const uint8_t* lb = v->host + l * v->host_layer_stride;
+                        same = std::memcmp(lb + (int64_t)x * v->block_bytes, lb + (int64_t)y * v->block_bytes,
+                                           (size_t)v->block_bytes) == 0;
+                    }
+                    if (!same) { eq = i; break; }
+                }
+                continue;
+            }
+            const int64_t frag = p->layer_bytes_per_block(), stride = p->layer_stride();
+            const char* base = static_cast<const char*>(p->base);
+            if (!base || frag <= 0) { st = RAD_E_STATE; break; }
+            if ((st = rad_dev_set(r->device)) != RAD_OK) break;
+            RadStream s = r->mover.transfer_stream();
+            if (!s) s = r->ctx.stream();
+            for (int64_t c0 = 0; c0 < eq && st == RAD_OK; c0 += kChunk) {
+                const int64_t cn = std::min<int64_t>(kChunk, eq - c0);
+                ha.resize((size_t)(L * cn * frag));
+                hb.resize((size_t)(L * cn * frag));
+                for (int side = 0; side < 2 && st == RAD_OK; ++side) {
+                    const std::vector<int32_t>& ids = side ? b : a;
+                    char* h = side ? hb.data() : ha.data();
+                    runs.clear();
+                    for (int64_t i = c0; i < c0 + cn; ++i) {
+                        const int32_t x = ids[(size_t)i * W + k];
+                        if (bad_id(x)) { st = RAD_E_INVAL; break; }
+                        if (!runs.empty() && ids[(size_t)(runs.back().first + runs.back().second - 1) * W + k] + 1 == x)
+                            ++runs.back().second;
+                        else
+                            runs.push_back({ i, 1 });
+                    }
+                    /* layer l of entry i lands at h + l * cn * frag + (i - c0) * frag */
+                    for (size_t q = 0; q < runs.size() && st == RAD_OK; ++q) {
+                        const int64_t i0 = runs[q].first, m = runs[q].second;
+                        const int32_t id0 = ids[(size_t)i0 * W + k];
+                        st = rad_memcpy_2d_async(h + (i0 - c0) * frag, cn * frag, base + (int64_t)id0 * frag, stride,
+                                                 m * frag, L, s);
+                    }
+                }
+                if (st == RAD_OK) st = rad_stream_sync(s);
+                if (st != RAD_OK) break;
+                for (int64_t i = c0; i < c0 + cn; ++i) {
+                    bool same = true;
+                    for (int64_t l = 0; l < L && same; ++l) {
+                        const int64_t off = l * cn * frag + (i - c0) * frag;
+                        same = std::memcmp(ha.data() + off, hb.data() + off, (size_t)frag) == 0;
+                    }
+                    if (!same) { eq = i; break; }
+                }
+            }
+        }
+        if (st != RAD_OK || eq == 0) break;
+    }
+    if (ranks_.size() > 1) (void)rad_dev_set(ranks_[0]->device);
+    if (st != RAD_OK) {
+        RAD_WARN("prefix cache: comparing %lld entries' two copies failed (%s): F72's rule retires as written",
+                 (long long)n, rad_strerror(st));
+        return -1;
+    }
+    return eq;
+}
+
 bool Engine::flush_copies() {
     if (!pump_ || !ranks_[0]->tierx.enabled()) return false;
     TierPump& P = *pump_;
@@ -2816,11 +3223,11 @@ void Engine::drain_completed() {
     /* Taken, not read: HTTP cancels append to the list, and nothing else consumes it, so each id
      * is seen exactly once. */
     sched_.take_completed(&done_);
-    for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+    for (uint64_t id : done_) for (auto& rk : ranks_) { rk->sampler.end_request(id); if (rk->bg_ready) rk->bg_sampler.end_request(id); }
     /* tp8 S5: every lane's (none on one lane) */
     for (auto& ls : lane_sched_) {
         ls->take_completed(&done_);
-        for (uint64_t id : done_) for (auto& rk : ranks_) rk->sampler.end_request(id);
+        for (uint64_t id : done_) for (auto& rk : ranks_) { rk->sampler.end_request(id); if (rk->bg_ready) rk->bg_sampler.end_request(id); }
     }
 }
 
@@ -2847,6 +3254,75 @@ void Engine::clear_fresh_states() {
 }
 
 namespace { void install_follower_stop_signals(); }
+
+/* qfn hero image (Qwen loop round 26, COORD 10:35): the image's runtime switch values -- the file RADIANCE_IMAGE_SWITCHES names,
+ * else radiance_home + "/switches.json"; no file = nothing (today). The same body POST /admin/fn4 takes ({"<switch>": n, ...};
+ * "epoch_bump" skipped), every key checked before any is queued, queued for the first step exactly as a POST right after start
+ * is (the published start's switches.sh). A refused key stops the start with the reason: an image whose defaults do not take
+ * would serve something else than it says. */
+int Engine::image_switch_defaults() {
+    std::string path;
+    if (const char* e = std::getenv("RADIANCE_IMAGE_SWITCHES")) {
+        if (!*e) return RAD_OK;
+        path = e;
+    } else {
+        path = cfg_.radiance_home + "/switches.json";
+    }
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return RAD_OK;
+    std::string body;
+    char buf[4096];
+    size_t n = 0;
+    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) body.append(buf, n);
+    std::fclose(f);
+    std::vector<std::pair<std::string, int>> sets;
+    std::string list;
+    /* a flat {"name": int|bool, ...} object: no nesting, no strings as values */
+    size_t i = body.find('{');
+    while (i != std::string::npos) {
+        const size_t q0 = body.find('"', i);
+        if (q0 == std::string::npos) break;
+        const size_t q1 = body.find('"', q0 + 1);
+        const size_t c = q1 == std::string::npos ? q1 : body.find(':', q1);
+        if (c == std::string::npos) break;
+        size_t v = body.find_first_not_of(" \t\r\n", c + 1);
+        if (v == std::string::npos) break;
+        const std::string k = body.substr(q0 + 1, q1 - q0 - 1);
+        int val = 0;
+        size_t e = v;
+        if (body.compare(v, 4, "true") == 0) { val = 1; e = v + 4; }
+        else if (body.compare(v, 5, "false") == 0) { val = 0; e = v + 5; }
+        else {
+            char* end = nullptr;
+            const long x = std::strtol(body.c_str() + v, &end, 10);
+            if (end == body.c_str() + v) {
+                RAD_ERR("image defaults: %s: switch '%s' has no integer or boolean value", path.c_str(), k.c_str());
+                return RAD_E_INVAL;
+            }
+            val = (int)x;
+            e = (size_t)(end - body.c_str());
+        }
+        if (k != "epoch_bump") {
+            std::string why;
+            if (!fn4::check(k, val, &why)) {
+                RAD_ERR("image defaults: %s: switch '%s' = %d refused: %s", path.c_str(), k.c_str(), val, why.c_str());
+                return RAD_E_INVAL;
+            }
+            sets.emplace_back(k, val);
+            list += (list.empty() ? "" : ", ") + k + " " + std::to_string(val);
+        }
+        i = body.find(',', e);
+    }
+    for (const auto& kv : sets) {
+        std::string why;
+        if (!fn4::request(kv.first, kv.second, &why)) {
+            RAD_ERR("image defaults: %s: switch '%s' = %d not queued: %s", path.c_str(), kv.first.c_str(), kv.second, why.c_str());
+            return RAD_E_INVAL;
+        }
+    }
+    RAD_INFO("image defaults (%s): %zu switches queued for the first step [%s]", path.c_str(), sets.size(), list.c_str());
+    return RAD_OK;
+}
 
 int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
@@ -2964,6 +3440,42 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
      * without it, or the other way round. Zero with no vector loaded, and then every chain hashes
      * exactly as it did before the feature existed. */
     static_cast<PCBinding<PrefixCache>*>(pc_iface_.get())->salt_id = cvec_salt_;
+    /* qfn-on-ds F79 (RADIANCE_PREFIX_UNREST=2): the comparer F72's rule asks before it retires a publisher's snapshots
+     * over an entry the cache keeps another copy of (PrefixCache::same_bytes_fn). Called inside insert(), on the step
+     * thread under the scheduler's lock, like restore_fn below. */
+    /* Not on a two-node pipeline: the other node's layers are not here to compare, so mode 2 retires as mode 1 there. */
+    if (ranks_[0]->prefix.unrest_mode() == 2 && cfg_.pp_nodes > 1) {
+        RAD_WARN("prefix cache: RADIANCE_PREFIX_UNREST=2 compares the copies on this node only; on a two-node pipeline it "
+                 "retires as =1 does");
+    } else if (ranks_[0]->prefix.unrest_mode() == 2) {
+        ranks_[0]->prefix.same_bytes_fn = [this](const std::vector<int32_t>& a, const std::vector<int32_t>& b,
+                                                 int64_t n) { return prefix_same_bytes(a, b, n); };
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=2 (Qwen loop F79) -- a publisher's snapshots over an entry the cache "
+                 "keeps another publisher's copy of are retired only from the first entry whose two copies' bytes differ "
+                 "(every rank, every layer of every cached group, compared at the publish)");
+    } else if (ranks_[0]->prefix.unrest_mode() == 3) {
+        const char* pe = std::getenv("RADIANCE_PREFIX_UNREST3_PCT");
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_UNREST=3 (Qwen loop F81, lever UNR3) -- where the cache keeps another "
+                 "publisher's copy of an entry a request's snapshots rest on, the request's own copy stays beside it as an "
+                 "overlay of those snapshots and a hit resuming one of them adopts it; no snapshot is retired for it, nothing "
+                 "is compared; overlays capped at %s %% of the cached pool's entries",
+                 pe && *pe ? pe : "10");
+    }
+    if (const char* re = std::getenv("RADIANCE_FN4_KVS_RIDE"); re && *re && *re != '0') {
+        if (kvstream_ride())
+            RAD_INFO("kv streaming: RADIANCE_FN4_KVS_RIDE=1 (Qwen loop round 56, Form A step (1), lever RIDE) -- a trunk MIXED "
+                     "pass stages only its prefill sequences' blocks; its decode rows resolve and attend on the ring (needs "
+                     "fn4 att_bi >= 1: a riding pass the plugin cannot serve so fails its step)");
+        else
+            RAD_WARN("kv streaming: RADIANCE_FN4_KVS_RIDE=1 needs RADIANCE_FN4_KVS_APART=1 (the ring must stay valid in a "
+                     "staged pass): inert");
+    }
+    if (const int ex = ranks_[0]->prefix.exact())
+        RAD_INFO("prefix cache: RADIANCE_PREFIX_EXACT=%d (Qwen loop round 56)%s%s", ex,
+                 (ex & 1) ? " -- lever EGN: no snapshot is resumed over an entry indexed again since its owner published "
+                            "(evicted under it, re-published with other bytes); insert retires such snapshots" : "",
+                 (ex & 2) ? " -- lever KOW: a request fn4 preempt_keep parks keeps its own copies of the entries the cache "
+                            "holds another publisher's copy of, and its rejoin stops at an entry indexed again since" : "");
     /* The restore path, installed only when the tiers are on. The scheduler calls it before the
      * admission lookup without knowing about tiers, so it is a callable rather than an include in
      * core/sched.
@@ -3087,11 +3599,40 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else {
+    /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1, Qwen loop round 24): two lanes on one machine, lane 1 the BG lane */
+    if (!pp_on() && LaneSet::bg1m_env()) {
+        if (embedding_ || cfg_.kld() || cfg_.calib() || block_drafting() || tree_ || cfg_.draft_coupling) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=1 (lever BGL): a text model with a serial drafter or none, not an embedding model, "
+                    "the KL / calibration modes, a block drafter, a tree drafter or --draft-coupling");
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg_.max_seqs < 2) {
+            RAD_ERR("RADIANCE_BG_LANE_1M=1 (lever BGL): --max-num-seqs %lld leaves no card for the decode lane",
+                    (long long)cfg_.max_seqs);
+            return RAD_E_INVAL;
+        }
+        if (LaneSet::bg1m2_env()) {
+            const char* as = std::getenv("RADIANCE_AR_SETS");
+            if (!as || std::strcmp(as, "all")) {
+                RAD_ERR("RADIANCE_BG_LANE_1M=2 (lever BGL stage 2) needs RADIANCE_AR_SETS=all: a kernel instance holding device "
+                        "counters must not be shared by the two Ctx");
+                return RAD_E_INVAL;
+            }
+        }
+        n_lanes_ = 2;
+        bgl1m_ = true;
+        bgl2b_ = LaneSet::bg1m3_env();
+        if (bgl2b_) RAD_TRY(bgl2b_setup());
+    }
     /* tp8 S5: lane 0 takes its share of the cards before init */
-    if (pp_on() && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
+    if ((pp_on() || bgl1m_) && n_lanes_ > 1) sched_.set_lanes(n_lanes_, &lanes_);
     RAD_TRY(sched_.init(ranks_[0]->program, cfg_, kv_iface_.get(), pc_iface_.get(), rio, &geo_));
     /* tp8 S5: the other lanes' schedulers (engine_lanes.cpp) */
-    if (pp_on() && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
+    if ((pp_on() || bgl1m_) && n_lanes_ > 1) RAD_TRY(lanes_init(rio));
+    /* qfn hero image: the image's switch values, queued for the first step. After the schedulers' init (Qwen loop round 44, FINDINGS
+     * F76): fn4::check refuses the drafter's switches (draft_dcap / draft_dcap_n / ...) until Scheduler::init has registered its drafter
+     * (fn4::draft_register, core/sched/scheduler.cpp), so at serve()'s top the hero image R60 stopped on its own draft_dcap 3. */
+    if (int r = image_switch_defaults(); r < 0) return r;
     /* tp8 S4: the rings, the second rendezvous and the link's threads. */
     if (pp_on()) {
         if (embedding_ || generator) {
@@ -3164,7 +3705,10 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         for (auto& ls : lane_sched_) ls->set_tail_inner_capable(ti_capable_);   /* tp8 S5 */
     }
 
-    for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
+    for (auto& r : ranks_) {
+        r->sampler.attach_vocab(vocab_view_.get());
+        if (r->bg_ready) r->bg_sampler.attach_vocab(vocab_view_.get());   /* qfn-on-ds lever BGL stage 2 */
+    }
 
     if (const int xs = xstats_open(); xs < 0) return xs;
     (void)missl_open();

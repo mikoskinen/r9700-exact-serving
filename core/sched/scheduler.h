@@ -60,6 +60,12 @@ struct SchedReq {
      * the pool (it yielded / waited): until it plans a chunk again it chooses nobody, so the prompts sitting out for it may run
      * (they hold KV this one cannot take from another lane; a pipeline lane preempts only its own). */
     bool     srf_kv = false;
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58): the rows this waiting prompt would prefill past the
+     * prefix cache's hit (PrefixCache::probe, once; -1 not probed), when the pool last refused its SRB admission (0 never),
+     * and since when a running prefill waits for its next piece (0: it just ran one / not yet seen) */
+    int64_t  srb_est = -1;
+    int64_t  srb_refused_us = 0;
+    int64_t  srb_since_us = 0;
 
     /* Wall clock, for the live request table; `arrival` is a counter and cannot measure time. */
     int64_t  arrived_us = 0;
@@ -247,6 +253,10 @@ public:
         : mu_(lane0.mu_), step_(lane0.step_), lane_(lane), n_lanes_(n_lanes), lanes_(set) {}
     Scheduler(const Scheduler&) = delete;
     Scheduler& operator=(const Scheduler&) = delete;
+    /* RADIANCE_DRAFT_FORCE_AL (sched/force_al.h; Qwen loop round 46, FINDINGS F77): set once at declare while the env is set
+     * (every lane) -- a verify row's ADV_ACCEPT number then carries kAdvAuxKeepEos when its request runs under ignore_eos,
+     * so the card's forced count cuts at a drafted stop token only where that stop would end the request. false = today. */
+    static inline bool fal_eos_bit = false;
     /* Lane 0 of a pipeline with lanes: before init. */
     void set_lanes(int n_lanes, LaneSet* set) { n_lanes_ = n_lanes; lanes_ = set; lane_ = 0; }
     int  lane() const { return lane_; }
@@ -743,6 +753,15 @@ public:
      * grid with this bit (Request::tail_grid = F | kTifBit), so tail_checkpoint plans its fine tail by the TIF rule at
      * every call (the last chunk's shape decides inside / cut / none) whatever the switch reads later. */
     static constexpr int32_t kTifBit = 1 << 30;
+    /* F71 (qfn-on-ds, Qwen loop round 26; sched_tail_inner 4 = 3 + this, latched with kTifBit): every TIF inside snapshot and
+     * every TIF / off-grid resume point leaves MORE than kTailMinPiece rows to its end (kTailMinPiece + 1). The Qwen line's
+     * BI-wide forms (rad_fp8.h kBiWideRows = 128: bit 4 the fused router, bit 8 the fused attention / QSA prologues) run up
+     * to AND INCLUDING 128 rows, so a lone 128-row resume step took them where the cold run's same rows, inside a wider
+     * piece, took the tiled forms (F71: u7s1 t9's 128-row hit != cold, u14s0 t11's 142-row hit = cold). */
+    static constexpr int32_t kTifStrictBit = 1 << 29;
+    /* the fewest rows a TIF point leaves under the request's latched grid (kTailMinPiece, + 1 with kTifStrictBit) */
+    static int64_t tail_min_of(int64_t fine) { return (fine & kTifStrictBit) ? kTailMinPiece + 1 : kTailMinPiece; }
+    static int64_t tail_grid_f(int64_t fine) { return fine & ~(int64_t)(kTifBit | kTifStrictBit); }
     /* The least recompute a snapshot at a shared head (CacheHit::branch_at) must save each later
      * request for the chunk split that takes it. */
     static constexpr int64_t kSharedHeadMin = 256;
@@ -816,6 +835,31 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         for (int k = 0; k < kSrfN; ++k) out[k] = srf_n_[k];
     }
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt): BI5 lone steps it chose, of them a prompt other than FIFO's (a running one or a
+     * waiting one admitted ahead), waiting prompts admitted ahead, choices by the age bound, cache probes, admissions the pool
+     * refused. Takes the lock. */
+    enum { kSrbSteps, kSrbAhead, kSrbAdmitAhead, kSrbAged, kSrbProbe, kSrbRefused, kSrbN };
+    void    srb_counts(int64_t out[kSrbN]) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (int k = 0; k < kSrbN; ++k) out[k] = srb_n_[k];
+    }
+
+    /* qfn-on-ds Q92 (FINDINGS F78; RADIANCE_LOG_STEP_HOST): the step thread's host time inside the LAST step() by phase,
+     * filled only while the env is set (host_note_on); the engine prints it beside its own phases. `ev_*` by call site
+     * (kEvSite*): every pc_->evict a site made, the ms they took and the entries they freed. `agr` = lever AGR's counters
+     * (RADIANCE_SCHED_ADMIT_GATE), cumulative: [0] fresh prompts refused before any restore or eviction (the room gate
+     * counted first), [1] walks ended at a refused fresh prompt, [2] fresh prompts the early gate let on. Read on the
+     * step thread only (no lock: step() writes it on that thread). */
+    enum { kEvPreWait, kEvGate, kEvEnsure, kEvOverdue, kEvGrow, kEvNoa, kEvSites };
+    struct HostNote {
+        double  step_ms = 0, lock_ms = 0, walk_ms = 0, restore_ms = 0;
+        int64_t asked = 0, restores = 0, waiting = 0, running = 0;
+        int64_t ev_n[kEvSites] = {}, ev_got[kEvSites] = {};
+        double  ev_ms[kEvSites] = {};
+        int64_t agr[3] = {};
+    };
+    bool            host_note_on() const { return hn_on_; }
+    const HostNote& host_note() const { return hn_; }
 
 private:
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -971,6 +1015,17 @@ private:
                                 bool share = false);
     /* qfn-on-ds: the Qwen line's (fn4-x3-pf) BI chunking 5 / 6, resume_cold and preempt_keep state */
     bool          bi_lone_last_ = false;   /* fn4 BI chunking 5: the last step was a lone prefill step */
+    /* qfn-on-ds lever SRB (fn4 sched_bi_srpt): the waiting prompt this BI5 lone step admits (-1: the queue's head, as
+     * today), the counters (srb_counts), the clock (tests may set it) */
+    int32_t       srb_wslot_ = -1;
+    int64_t       srb_n_[kSrbN] = {};
+    std::function<int64_t()> srb_clock_;
+    int64_t       srb_logged_ = 0;
+    int           pcr_sel_ = 0;   /* qfn-on-ds lever PCR: RADIANCE_PC_KEEP / 4 (the publish trim's reserve; 0 = a quarter, today) */
+    void          srb_choose(bool admit_possible, int v, int32_t& lone_slot);
+public:
+    void          set_srb_clock(std::function<int64_t()> now_us) { srb_clock_ = std::move(now_us); }
+private:
     /* fn4 BI chunking 6 (15.11.2026, qwen/build2/LONGPROMPT.md): the request whose alone piece did not fit beside the
      * last step's other work (0 none) -- it takes the next step alone -- and whether the last step was such a lone step
      * beside decoding sequences (the decode rows then get the next one). */
@@ -995,12 +1050,30 @@ private:
     int64_t       pk_n_[3] = {0, 0, 0};
     int           pk_ok_ = -1;
     static constexpr int32_t kKeepTries = 256;
+    /* Qwen loop round 59 (Q118, FINDINGS TEST note 08:20): an overdue kept request the pool cannot take reclaims in the
+     * admission walk (kr_on_, RADIANCE_SCHED_KEEP_RECLAIM unset or 1; 0 = the walk as before); kr_n_ = [0] walks that
+     * evicted for one, [1] keeps dropped on an idle pool (recomputed) */
+    bool          kr_on_ = true;
+    int64_t       kr_n_[2] = {0, 0};
+    /* lever AHA (fn4 sched_ahead_all, Qwen loop round 59, Q119): whether the in-flight step leaves a decoding sequence out
+     * (step_next_locked then plans in full); aha_n_ = such steps so far */
+    bool          ahead_leaves_out() const;
+    mutable std::vector<char> aha_mark_;
+    int64_t       aha_n_ = 0;
+    /* lever TLR (fn4 sched_bi_ride, Qwen loop round 60, Q120): BI5 decode turns a prompt's last piece rode (tlr_n_[0]),
+     * last pieces the turn saw but left to a lone step (over N rows, no room beside the decoders, blocks) ([1]) */
+    int64_t       tlr_n_[2] = {0, 0};
+    int64_t       tlr_logged_ = 0;
     bool          keep_possible();
     int           rejoin_kept(SchedReq& s);
     void          unkeep(SchedReq& s);
 public:
     const int64_t* resume_cold_counts() const { return rc_n_; }
     const int64_t* preempt_keep_counts() const { return pk_n_; }
+    const int64_t* keep_reclaim_counts() const { return kr_n_; }
+    int64_t ahead_all_count() const { return aha_n_; }
+    /* lever TLR: [0] last pieces that rode a BI5 decode turn, [1] last pieces a turn left to their lone step */
+    int64_t tail_ride_count(int k) const { return k == 0 || k == 1 ? tlr_n_[k] : 0; }
 private:
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
@@ -1250,6 +1323,8 @@ private:
         /* The furthest position round 1 can write at: the verify step's last position, reached
          * when every draft is accepted. The card knows the real one; this bounds it. */
         int64_t        base_pos = 0;
+        /* qfn-on-ds lever BGL: a lent entry's home lane (its SchedReq is there, slot -1 here); -1 for this lane's own */
+        int8_t         home = -1;
     };
     std::vector<SerialSeq> serial_;
     StepPlan            serial_plan_;
@@ -1450,6 +1525,9 @@ private:
     /* The live Request behind a snapshot row, or null if it went away. */
     const Request* block_req(const BlockSeq& d) const;
     const Request* serial_req(const SerialSeq& m) const;
+    /* qfn-on-ds lever BGL: the SchedReq of a lent entry (StepEntry::home >= 0) in its home lane's table, or null; the lanes'
+     * one lock held */
+    SchedReq*      home_req(int home, uint64_t seq) const;
     /* Both snapshots resolve the same way; the two wrappers exist because the row types differ. */
     const Request* live_req(int32_t slot, uint64_t id) const;
     bool preempt_back();                                      /* true: the victim published its prefix */
@@ -1482,7 +1560,23 @@ private:
      * Admitting only the first chunk leaves the pool short when the prompt reaches 100%, and
      * preempt_back() then throws away the whole prefill. */
     bool fresh_prefill_can_fit(const SchedReq& s) const;
+    /* qfn-on-ds Q92 lever AGR (RADIANCE_SCHED_ADMIT_GATE bit 1): fresh_prefill_can_fit asked BEFORE the restore, with the
+     * blocks only the prefix cache holds counted as room (what the gate's evict rounds could give back) and the prompt's
+     * blocks the pool already holds as its own: false only where no eviction could make room now. */
+    bool fresh_prefill_room_early(const SchedReq& s) const;
+    /* qfn-on-ds Q103 lever GEV (RADIANCE_SCHED_ADMIT_GATE bit 4; FINDINGS F80): the prefix-cache entries the room gate is
+     * short for a fresh prompt (fresh_prefill_can_fit's full-group count past the available blocks), 0 when they fit */
+    int64_t fresh_prefill_short_entries(const SchedReq& s) const;
     bool preempt_wait_overdue(const SchedReq& s) const;
+    /* qfn-on-ds Q92: lever AGR's mode (bit 1 the early gate, bit 2 a fresh prompt the room gate refuses ends the walk; bit 4
+     * Q103 lever GEV: the gate asks for its shortfall in one evict call);
+     * the step-host note (hn_on_ = RADIANCE_LOG_STEP_HOST set) and pc_->evict counted by call site into it */
+    int      agr_ = 0;
+    bool     hn_on_ = false;
+    bool     hc_log_ = false;   /* Qwen loop round 61: RADIANCE_LOG_HIT_CUT, one line an admission whose hit is cut */
+    HostNote hn_;
+    int64_t  agr_n_[3] = {};
+    int64_t  pc_evict(int site, int64_t n);
     /* Give blocks back from the prefix cache until the pool has headroom again. */
     void trim_prefix_cache();
     /* RAD_OK, or a negative status when the request cannot be admitted now, nor anything behind

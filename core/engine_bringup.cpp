@@ -1469,6 +1469,14 @@ int Engine::declare() {
             RAD_INFO("draft trees: not asked -- %s", why);
             decide("draft trees", "not asked", why);
         }
+        if (const char* fv = std::getenv("RADIANCE_DRAFT_FORCE_AL");
+            draft_tree_ && fv && *fv && std::strcmp(fv, "0")) {
+            /* Qwen loop round 46 (QUEUE Q88): the forced acceptance covers a chain verify only (measurement only). */
+            draft_tree_ = false;
+            const char* why = "RADIANCE_DRAFT_FORCE_AL forces a chain verify's acceptance (measurement only)";
+            RAD_INFO("draft trees: not asked -- %s", why);
+            decide("draft trees", "not asked", why);
+        }
         if (draft_tree_) {
             const char* why = "the model's plugin measured a gain with them";
             RAD_INFO("draft trees: asked -- %s", why);
@@ -1875,6 +1883,55 @@ int Engine::declare() {
                      "its own block of %lld runs its head on the first D rows of each block, D = the head depth in force (no "
                      "cut while draft_sample >= 1, at a short block, or before the first depth is chosen)",
                      drafter_name_.c_str(), (long long)drafter_.block);
+        }
+    }
+    /* RADIANCE_DRAFT_FORCE_AL (core/sched/force_al.h; Qwen loop round 46, QUEUE Q88, COORD 13:17 23.11.: AgentX's
+     * synthetic acceptance): MEASUREMENT ONLY -- a chain verify accepts AL - 1 drafts on average instead of the agreed
+     * ones; never a served form. Unset (or empty / "0"), nothing here or on the step path changes. */
+    fal_ = ForceAl{};
+    Scheduler::fal_eos_bit = false;
+    if (const char* v = std::getenv("RADIANCE_DRAFT_FORCE_AL"); v && *v && std::strcmp(v, "0")) {
+        ForceAl f;
+        std::string why, desc;
+        if (!fal_parse(v, &f, &why, &desc)) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: %s (one AL for every depth, e.g. 2.47, or DEPTH:AL pairs, e.g. "
+                    "1:1.65,2:2.06,3:2.32,4:2.47)", v, why.c_str());
+            return RAD_E_INVAL;
+        }
+        if (tree_) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: drafter '%s' proposes trees; the forced acceptance covers a chain "
+                    "verify only", v, drafter_name_.c_str());
+            return RAD_E_UNSUPPORTED;
+        }
+        if (cfg_.pp_nodes > 1) {
+            RAD_ERR("RADIANCE_DRAFT_FORCE_AL=%s: not covered on a two-node pipeline (both nodes' cards would have to "
+                    "draw alike; one machine only)", v);
+            return RAD_E_UNSUPPORTED;
+        }
+        if (drafter_.kind == RAD_DRAFT_NONE && cfg_.spec_ngram <= 0) {
+            RAD_WARN("RADIANCE_DRAFT_FORCE_AL=%s: this deployment drafts nothing (--num-speculative-tokens 0); ignored", v);
+        } else {
+            if (const char* sd = std::getenv("RADIANCE_DRAFT_FORCE_SEED"); sd && *sd)
+                f.seed = (uint32_t)std::strtoul(sd, nullptr, 0);
+            else
+                f.seed = 0x51ed5eedu;
+            if (const char* ct = std::getenv("RADIANCE_DRAFT_FORCE_AL_CUT"); ct && !std::strcmp(ct, "0")) f.nocut = 1;
+            fal_ = f;
+            Scheduler::fal_eos_bit = true;   /* F77: a request under ignore_eos is never cut at a drafted stop token */
+            for (auto& rk : ranks_) {
+                rk->sampler.set_no_spec_under_grammar(true);
+                rk->bg_sampler.set_no_spec_under_grammar(true);
+            }
+            RAD_WARN("RADIANCE_DRAFT_FORCE_AL=%s: MEASUREMENT ONLY, the answers are not the model's -- a chain verify of d "
+                     "drafts accepts floor(AL - 1) of them and one more with probability frac(AL - 1) (vLLM's "
+                     "minimum-variance schedule; at most d), as drafted, then the target's token after them; the draw "
+                     "hashes (step, sequence slot, seed 0x%08x). AL by the verify's draft count: %s. %s A request "
+                     "whose grammar constrains drafts nothing. The realized AL is logged every 16,384 verifies and at the stop",
+                     v, f.seed, desc.c_str(),
+                     f.nocut ? "RADIANCE_DRAFT_FORCE_AL_CUT=0: no stop-token cut inside a forced verify (every drawn draft "
+                               "counts, as vLLM counts; a stop token inside the step does not end it)."
+                             : "A stop token among the emitted tokens ends the verify there only where it ends the request (not "
+                               "under ignore_eos; the cut is counted).");
         }
     }
     if (tree_)
@@ -2329,6 +2386,9 @@ int Engine::plan() {
                 if (pages > 0 && page > 0) f.host_reserve = (int64_t)pages * page / 8;
             }
             arena_plan_bytes(r->program, nullptr, &f.arena);
+            /* qfn-on-ds lever BGL stage 2: lane 1's Ctx owns a second arena of the full plan (Qwen's sizing declare refuses the
+             * smaller levels under SP-hc today: STATE 22.11. 06:45) */
+            if (!pp_on() && LaneSet::bg1m2_env()) f.arena *= 2;
             f.statics = wf.statics;
             f.experts = wf.experts;
             wfs.push_back(wf);
@@ -2389,11 +2449,13 @@ int Engine::plan() {
                                                         : BatchBuilder::device_bytes(r->program, cfg_, kg);
             if (f.staging < 0) return RAD_E_INVAL;
             /* tp8 S5: every lane of a two-node pipeline has a builder (a slab) of its own */
-            if (pp_on() && cfg_.pp_lanes_now() > 1 && !r->program.is_generator() && !r->program.is_audio_generator() &&
+            /* qfn-on-ds lever BGL (RADIANCE_BG_LANE_1M=1): one machine's two lanes, a slab each */
+            const bool bgl1m = !pp_on() && LaneSet::bg1m_env();
+            if (((pp_on() && cfg_.pp_lanes_now() > 1) || bgl1m) && !r->program.is_generator() && !r->program.is_audio_generator() &&
                 !r->program.is_video_generator() && !r->program.is_shape_generator()) {
                 /* tp8 loop D47 (RADIANCE_PP_BG_ROWS=N with RADIANCE_PP_BG_LANE=k): the k BG lanes' slabs carve N block-table
                  * rows (Scheduler::init); the other lanes' as before. Unset: every lane's slab, today. */
-                const int nl = cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
+                const int nl = bgl1m ? 2 : cfg_.pp_lanes_now(), kbg = LaneSet::bg_env() < nl ? LaneSet::bg_env() : 0;
                 const int64_t bgr = LaneSet::bg_rows_env(), lm = LaneSet::lane_rows_env(), one = f.staging;
                 int64_t sum = 0;
                 for (int l = 0; l < nl; ++l) {   /* each lane's slab at the rows Scheduler::init gives it */
@@ -4904,7 +4966,37 @@ int Engine::start() {
         d.profile_ops = cfg_.profile_ops;
         bind_kv_pools(r->program, [&](int32_t g) { return r->kv.plan(g); }, &d.kv);
         d.registry    = &rad_tools_registry();
+        if (const char* dv = std::getenv("RADIANCE_BGL2_DBG"); dv && dv[0] == '4') d.record_passes = false;   /* WIP isolation: no tapes */
         RAD_TRY(r->ctx.init(d));
+        /* qfn-on-ds lever BGL stage 2: lane 1's Ctx, the same program / pools / plugin step, its own streams and arena, issuing
+         * from pass slot 1 (S0: the second collective / instance set) */
+        if (!pp_on() && LaneSet::bg1m2_env()) {
+            /* qfn-on-ds F65 (Qwen loop round 25): under stage 2b (=3) lane 1's queues leave RADIANCE_BGL_CU_KEEP CUs
+             * (default 8 = one WGP an engine on a 64-CU R9700) to lane 0 alone. bgl3 hung with both Ctx's queues of every
+             * rank at r4dchain_ar_hc_write_wide<4>: two queues whose collectives and chained launches spin on peer cards are
+             * two engines on one card (libr4d r4d_ar_entry.hip R4D_AR_MAX_BLOCKS note), and one queue's spinners can hold
+             * the slots the other's collective needs while its twin on a peer waits behind the first. Lane 0 never waits
+             * on lane 1 on the card (bg_done_ is issued after lane 1's end event has completed), so a region lane 1 cannot
+             * enter keeps lane 0 moving, and lane 0's progress frees lane 1's. Unset under =2 (one step at a time). */
+            CtxDesc bd = d;
+            if (LaneSet::bg1m3_env()) {
+                const char* ck = std::getenv("RADIANCE_BGL_CU_KEEP");
+                bd.cu_keep = ck && *ck ? std::atoi(ck) : 8;
+            }
+            RAD_TRY(r->bg_ctx.init(bd));
+            r->bg_ctx.set_ar_set(1);
+            RAD_TRY(r->bg_sampler.clone_from(r->sampler));
+            r->bg_ready = true;
+            if (const char* dv = std::getenv("RADIANCE_BGL2_DBG"); dv && *dv) {
+                r->dbg_sp = dv[0] != '1' && dv[0] != '3';
+                r->dbg_cx = dv[0] != '2';
+                if (dv[0] == '3') r->bg_ctx.set_ar_set(0);   /* WIP isolation: the second Ctx on the first instance set */
+            }
+            if (r->index == 0)
+                RAD_INFO("lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): a second Ctx a rank for lane 1's steps, its own streams and a "
+                         "second %s arena (the full plan), issuing from pass slot 1 (RADIANCE_AR_SETS=%s)",
+                         humanb(r->program.arena_bytes).c_str(), std::getenv("RADIANCE_AR_SETS") ? std::getenv("RADIANCE_AR_SETS") : "unset");
+        }
 
         /* The mover orders every transfer against the kernels reading its slot via an event on the
          * compute stream (Mover::record_gate), which exists only after Ctx::init. Bound even for a

@@ -25,3 +25,11 @@ extern "C" void r4d_cfg_gemm(const RadArgs* a, R4dGemmCfg* out) {
     out->npw = (int)rad_args_geti_or(a, "npw", 0);
     out->nt = (int)rad_args_geti_or(a, "nt", 0);
 }
+
+/* r4d_gdn_recurrent_update_k128_v128_bf16_fp32state.hip (in the emu build for qfn-on-ds lever EPD's gdnepd test) checks libr4d's
+ * compiled GDN geometry, which the chunk-scan unit (r4d_gdn_chunk_scan_k128_v128_c64_bf16.hip, not in this build) defines. */
+extern "C" void r4d_gdn_dims(int* head_k, int* head_v, int* chunk) {
+    if (head_k) *head_k = 128;
+    if (head_v) *head_v = 128;
+    if (chunk) *chunk = 64;
+}

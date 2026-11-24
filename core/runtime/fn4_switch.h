@@ -769,7 +769,13 @@
  *                   wave (W2); 64 / 128 / 256 / 512 / 1024 the bi_dec kernel-A' forms (G16, PF2 column split, G16p, scales
  *                   once, G16q); 2048 / 4096 / 6144 (qfn-on-ds lever B3R, 20.11.2026) kernel B3 under bi_dec past 16 rows
  *                   with 2 / 4 / every 16-row group(s) a block, W_up loaded once a block (the same bytes); 8192 (qfn-on-ds lever
- *                   HWC, 21.11.2026) hc_write's chained forms up to 128 rows (the same bodies); 0..16383
+ *                   HWC, 21.11.2026) hc_write's chained forms up to 128 rows (the same bodies); 16384 (qfn-on-ds PF probe HCF,
+ *                   Qwen loop round 28) every decode read of more than 16 rows reads 16 (WRONG BYTES, timing only); 32768
+ *                   (qfn-on-ds lever HCX, Qwen loop round 34) kernel A' with RADIANCE_FN4_HC_X (5) W_down tiles a block, N
+ *                   built once a block, from RADIANCE_FN4_HC_X_MIN (32) rows (the same bytes); 65536 (qfn-on-ds lever B3X,
+ *                   round 34) kernel B3 with a 128-channel quantiser group a block, from RADIANCE_FN4_HC_B3X_MIN (32) rows (the
+ *                   same bytes); 131072 (qfn-on-ds lever SSB, round 35; with bits 3 + 8) kernel A' takes the norm scales its
+ *                   hc_write handed (`ss`) from 32 rows: no norm pass, no scale launch (the same bits); 0..262143
  *   ar_lanethreads  libr4d (rad_fn4_switch): the prefill all-reduce lane's block    RADIANCE_FN4_AR_LANE_THREADS
  *                   width -- 0 the resolved tunable, 256 / 512 / 1024
  *   hc_upmix        libr4d (rad_fn4_switch): hc_read's up-mix tile                  RADIANCE_FN4_HC_UPMIX
@@ -810,7 +816,10 @@
  *                   step (no sparse sequence) through the same per-sequence launches (its one attn_paged over
  *                   n_seq sequences splits a row's keys by n_seq); 6 (20.11., qwen loop round 3) + every sparse
  *                   decode row at any verify depth, alone too, on the depth-3 split law (split_rows 4): answers
- *                   the same at every draft depth (a depth rule's enabler); 0 today's launches    RADIANCE_FN4_ATT_BI
+ *                   the same at every draft depth (a depth rule's enabler); 7 (24.11., Qwen loop round 63, lever
+ *                   DSP) + every DECODE sequence sparse at every context, alone and beside load (a decode row's path
+ *                   no longer follows its verify block's start: the 1,024-key edge); 0 today's launches
+ *                                                                                                  RADIANCE_FN4_ATT_BI
  *   arw_rows        architecture plugin (rad_fn4_switch): fn4 ARW -- the four-rank fused exact write / gather-write
  *                   (one-shot) only up to this many rows, above them the separate all-reduce (two-shot) and write;
  *                   byte-identical; 0 = today                                                      RADIANCE_FN4_ARW_ROWS
@@ -886,6 +895,9 @@
  *   rg_tail         libr4d (qfn-on-ds lever RGT, 21.11.2026): the fused decode router (router_gemm_topk_scatter) ranks
  *                   each 16-row tile's rows in that tile's last block and sorts in the last tile's, from N rows (at
  *                   least two tiles); the same bytes; 0 today (the grid's last block ranks every row)  RADIANCE_FN4_RG_TAIL
+ *                   + lever RGU's form (Qwen loop round 36): 256 / 512 = the router GEMM's 20 / 40-step load batch,
+ *                   1024 / 2048 / 3072 = at most 4 / 2 / 1 column tiles a block; the same bytes; range 0..4095 (libr4d
+ *                   refuses a row field above 128 and 768 in the batch field)
  *   gnq8            qwen4exp (qfn-on-ds lever GNQ8, 21.11.2026): a delta-net layer's prefill rows take gdn_gated_rmsnorm_i8g
  *                   (the gated norm writes quant_act_i8g's codes of its output in the same pass; the pair's bytes) instead
  *                   of gdn_gated_rmsnorm + quant_act_i8g; RADIANCE_FN4_GNQ8 declares it; 0 today        RADIANCE_FN4_GNQ8
@@ -909,6 +921,93 @@
  *                   every start -- when a step's decode entries carry proposals of two depths (the context-limit cut beside
  *                   full-depth rows, a newcomer drafted in another cycle), every one is cut to the shallowest (cap_rows, the
  *                   cut draft_dmask already takes); 0 today (mixed depths planned as drafted)        RADIANCE_FN4_DRAFT_UNI
+ *   ar_lanethreads_s / ar_laneblocks_s  libr4d (rad_fn4_switch; qfn-on-ds lever LSK, Qwen loop round 27, QUEUE Q51): the lane
+ *                   form's SECOND pair (the values ar_lanethreads / ar_laneblocks take), used by the rows collectives whose op
+ *                   declares lane_kind 1 -- qwen4exp's SP-serial ops, declared on their own only with RADIANCE_FN4_SPSER_LANE=1
+ *                   at start (MIXED and serial prefill steps); lone pipelined prefill keeps the first pair. 0 = the first
+ *                   pair's value (today); the bytes do not depend on either pair       RADIANCE_FN4_AR_LANE_THREADS_S
+ *                                                                                    RADIANCE_FN4_AR_LANE_BLOCKS_S
+ *   f8_pp           libr4d (rad_fn4_switch; qfn-on-ds lever F8P, Qwen loop round 37, QUEUE Q66): 1 = the int8 narrow decode
+ *                   GEMM (gemm_nt_q / gemm_nt_q_dec at MW 4-16: GDN in / out, attention, shared down) runs its twin with two
+ *                   weight K tiles in flight a wave; the same bytes; 0 today                        RADIANCE_FN4_F8_PP
+ *   hc_x_lb         libr4d (rad_fn4_switch; qfn-on-ds lever XLB, Qwen loop round 38, QUEUE Q67): a mask 0..3 for the bi_dec
+ *                   hc read's kernel A' in HCX's PRE form at 4 tiles a block (the hero's HXS): bit 1 an LDS-only barrier at
+ *                   each W_down tile boundary, bit 2 the group-scale fold on its own tile's scales (no mid-tile loadcnt 0);
+ *                   the same bytes; 0 today                                                       RADIANCE_FN4_HC_X_LB
+ *   hc_b3x_e        libr4d (rad_fn4_switch; qfn-on-ds lever B3E, Qwen loop round 38, QUEUE Q68): 1 = kernel B3X's pass
+ *                   epilogue operands issued as one batch in the pass's last quarter step; the same bytes; 0 today
+ *                                                                                                  RADIANCE_FN4_HC_B3X_E
+ *   hc_b3x_p        libr4d (rad_fn4_switch; qfn-on-ds lever B3P, Qwen loop round 39, QUEUE Q71): N = kernel B3X with a pair
+ *                   of 16-row groups a block (each W_up fragment loaded and converted once for both) at reads of >= N rows
+ *                   (N < 32 taken as 32); the same bytes; 0 today                                  RADIANCE_FN4_HC_B3X_P
+ *   hc_b3x_d        libr4d (rad_fn4_switch; qfn-on-ds lever B3D, Qwen loop round 40, QUEUE Q74): 1 = kernel B3X (B3E's form) with
+ *                   its d rows padded by 8 bf16 in LDS, so the d fragment reads leave a 4-way bank conflict; the same bytes;
+ *                   0 today                                                                        RADIANCE_FN4_HC_B3X_D
+ *   gdn_epd         libr4d (rad_fn4_switch; qfn-on-ds lever EPD, Qwen loop round 41, QUEUE Q78): 1 = the GDN decode update (conv
+ *                   fold, anchor fp32 state) runs its per-token row norm, bf16 output and the out projection's codes + scales after
+ *                   its token loop (two barriers a call, no spill) instead of inside every token; the same bytes; 0 today
+ *                   2 = 1 + lever QKS (QUEUE Q79): each token's l2-normalised q and k staged once in LDS as f32 instead of
+ *                   converted, summed and scaled by every thread in every token; the same bytes
+ *                   3 = 1 + lever GRP (QUEUE Q80): the A replayed tokens' factor blocks staged into LDS in one batch beside
+ *                   the state load instead of one block loaded at the head of each replay step; the same bytes
+ *                   4 = lever QSC (Qwen loop round 47, QUEUE Q84; WITHOUT EPD's deferred epilogue): the T tokens' q / k l2
+ *                   scales once a call (STG's staging after the convolution's barrier: one lane per (token, half) sums its 64
+ *                   squares in the per-row order) instead of every thread summing the same 2 x 64 squares in every token;
+ *                   the same bytes
+ *                   8 = lever ZXL (Qwen loop round 48, QUEUE Q90): today's update with its prologue's 16-bit loads (conv
+ *                   inputs, history taps, bias, a / b, gate rows) each in a whole register, issued together, instead of packed
+ *                   two to a VGPR (every d16_hi load waited for its other half: a chain of memory round trips before the state
+ *                   load); the same bytes. 12 = 4 + 8. libr4d refuses 5..7 and 9..11
+ *                                                                                                  RADIANCE_GDN_EPD
+ *   hc_rf           libr4d (rad_fn4_switch; qfn-on-ds lever HRF, Qwen loop round 44): N = from N (>= 32) rows the bi_dec read's
+ *                   served HXS form (A' on the write's scales, NTS 4, XLB 3; B3X with B3E + B3D) runs as ONE launch, hc_read_hrf:
+ *                   role by ticket, a row group's B3X blocks wait for that group's A' blocks only; the same bytes; 0 today
+ *                                                                                                  RADIANCE_FN4_HC_RF
+ *   mtp_dec         qwen4exp (rad_fn4_switch; qfn-on-ds lever MTD, Qwen loop round 45, QUEUE Q85): the MTP head's draft passes
+ *                   in the trunk's decode forms (drafts only: the trunk verifies every draft greedily on batch-invariant rows, so
+ *                   a draft's bytes move acceptance, never an answer); a mask: 1 = the head's MoE told one row a sequence
+ *                   (MoeFP8::set_qmax(1): its 17..RADIANCE_FN4_X3GD_HI-row passes take the fused EXL3 decode chain, not the
+ *                   M > 16 prefill band), 2 = the head's attention and feed-forward connection reads through the bi_dec twin
+ *                   (HyperConn::read_bd) up to its declared rows; 4 (libr4d, lever MTE) = mtp_enter at RADIANCE_FN4_MTE_MIN (8)..128
+ *                   tokens in a split-K prefill form (both products one launch, K in RADIANCE_FN4_MTE_SK (4) pieces, a fixed-order sum;
+ *                   other bytes than today's mtp_enter, drafts only); 8 (libr4d, lever W2K, round 47) = the w2a8 draft head's
+ *                   untuned GEMM at sk 4 / nt 0 where DFlash2's SK-8 pin cannot divide K (the Qwen head, K 2,560; slot w1's
+ *                   best point; other bytes, drafts only); 16 (libr4d, lever W2N, round 49) = with 8, the head keeps its non-temporal weight
+ *                   loads (sk 4 / nt 1: line 109's c1 cost of nt 0, a 40 MB temporal read a pass through the 64 MB last-level cache;
+ *                   the same split, so W2K's bytes); 0 today
+ *                                                                                                  RADIANCE_FN4_MTP_DEC
+ *   kvs_flat        libr4d (qfn-on-ds lever KVF, Qwen loop round 52, QUEUE Q101): kv_resolve (a streamed KV group's residency
+ *                   map, ONE workgroup a launch) runs its lookups (step 2) and its rewrite (step 7) over the flat entry space,
+ *                   every thread busy and 8 entries a thread in flight, instead of row by row (one entry a thread a row: at 64
+ *                   rows x 513 half the threads idle and each walks 64 dependent load -> atomic chains); the same placement, maps,
+ *                   counters and rewritten selection (libref's); 0 today
+ *                                                                                                  RADIANCE_FN4_KVS_FLAT
+ *   kvs_fix         libr4d (qfn-on-ds lever KVX, Qwen loop round 54, QUEUE Q105): kv_resolve's passes over EVERY ring slot cut to
+ *                   one -- step 3b's free count also counts step 4b's unstamped slots and their largest heat (4b keeps its pass only
+ *                   after a heat above 3), and 4b's CLOCK rotations list their victims in coalesced windows from the hand, stopping
+ *                   at the window that holds the last one; the same placement, maps, heats, counters and rewritten selection; 0 today
+ *                                                                                                  RADIANCE_FN4_KVS_FIX
+ *   sched_bi_srpt   scheduler (qfn-on-ds lever SRB, Qwen loop round 58, QUEUE Q113): under sched_bi_chunk 5 the lone prefill step
+ *                   goes to the prompt with the FEWEST ROWS LEFT -- among the running prefills (rows to its prompt's end) and, where
+ *                   an admission is possible, the waiting prompts (rows past the prefix cache's hit, PrefixCache::probe, once a
+ *                   request) -- instead of the first running prefill / the queue's head (FIFO); a prefill whose wait for its next
+ *                   piece reaches N ms (N >= 2) goes first, the longest-waiting first. Only WHEN a piece runs changes: every piece
+ *                   keeps its own position, rows and snapshot row (bytes unchanged). 0 today, 1 on, N >= 2 on with the age bound
+ *                                                                                                  RADIANCE_SCHED_BI_SRPT
+ *   sched_ahead_all scheduler (qfn-on-ds lever AHA, Qwen loop round 59, QUEUE Q119): a step issued ahead (step_next) carries the
+ *                   in-flight step's sequences only; where that step left a DECODING sequence out (BI chunking 5's lone step
+ *                   for another request's last piece: that request then decoded ALONE step after step while every other decoder
+ *                   waited -- agx21 105 runs, 6,804 one-sequence steps, 82 s), 1 plans the next step in full instead of issuing
+ *                   it ahead. Which steps carry which rows changes, never a row's arithmetic. 0 today, 1 on
+ *                                                                                                  RADIANCE_SCHED_AHEAD_ALL
+ *   sched_bi_ride   scheduler (qfn-on-ds lever TLR, Qwen loop round 60, QUEUE Q120): under BI chunking 5 every prefill piece takes
+ *                   a lone step and the decode rows the step after it; with N > 0 a running prompt whose alone piece (the piece
+ *                   its BI5 lone step would plan: position, rows, snapshot row) is the prompt's LAST piece and at most N rows
+ *                   rides the decode rows' turn instead -- one such piece a turn, where it fits the step's budget beside every
+ *                   decoder still to plan and its blocks without taking another sequence's. The piece is its alone piece and the
+ *                   decode rows are their decode rows (a MIXED step; on a streamed form with lever RIDE, RADIANCE_FN4_KVS_RIDE=1,
+ *                   the riders stay on the ring -- without it the step stages every sequence). Non-last pieces never ride (FINDINGS
+ *                   DEV answer 10:30: RIDE beside non-last pieces is not exact yet). 0 today, N = rows        RADIANCE_SCHED_BI_RIDE
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -959,6 +1058,19 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kAqlChi,   /* qfn-on-ds lever CHI (Qwen loop round 8, COORD 05:43): core/device, chained records without the packet fences */
               kExl3Drz,  /* qfn-on-ds lever DRZ (Qwen loop round 13): exl3r4d, the prefill band's ZERO entries write nothing */
               kDraftUni,   /* qfn-on-ds Qwen loop round 14 (F42 / Q33): the scheduler, one draft depth a step at every start */
+              kArLaneThreadsS, kArLaneBlocksS,   /* qfn-on-ds lever LSK (Qwen loop round 27, Q51): libr4d, the lane form's second pair */
+              kF8Pp,     /* qfn-on-ds lever F8P (Qwen loop round 37, Q66): libr4d, the int8 narrow decode GEMM's two-tiles-in-flight twin */
+              kHcXLb, kHcB3xE,   /* qfn-on-ds levers XLB / B3E (Qwen loop round 38, Q67 / Q68): libr4d, the HXS hc read's load streams */
+              kHcB3xP,   /* qfn-on-ds lever B3P (Qwen loop round 39, Q71): libr4d, B3X with a pair of 16-row groups a block */
+              kHcB3xD,   /* qfn-on-ds lever B3D (Qwen loop round 40, Q74): libr4d, B3X's d rows padded in LDS (no bank conflict) */
+              kGdnEpd,   /* qfn-on-ds lever EPD (Qwen loop round 41, Q78): libr4d, the GDN decode update's epilogue after its token loop */
+              kHcRf,     /* qfn-on-ds lever HRF (Qwen loop round 44): libr4d, the HXS hc read's A' + B3X as one launch, a row group at a time */
+              kMtpDec,   /* qfn-on-ds lever MTD (Qwen loop round 45, Q85): qwen4exp, the MTP head's draft passes in the trunk's decode forms */
+              kKvsFlat,  /* qfn-on-ds lever KVF (Qwen loop round 52, Q101): libr4d, kv_resolve's lookups / rewrite over the flat entry space */
+              kKvsFix,   /* qfn-on-ds lever KVX (Qwen loop round 54, Q105): libr4d, kv_resolve's passes over every ring slot cut to one */
+              kSchedBiSrpt,   /* qfn-on-ds lever SRB (Qwen loop round 58, Q113): the scheduler, BI5's lone step by fewest rows left */
+              kSchedAheadAll, /* qfn-on-ds lever AHA (Qwen loop round 59, Q119): the scheduler, no step issued ahead that leaves a decoder out */
+              kSchedBiRide,   /* qfn-on-ds lever TLR (Qwen loop round 60, Q120): the scheduler, a prompt's last piece rides BI5's decode turn */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
@@ -982,6 +1094,9 @@ int  kvs_bi();
 int  draft_dmask();                           /* lever DLM: the scheduler's mask of counts (0 = DLH's threshold) */
 int  aql_chi();                               /* lever CHI: chained records play without the packet fences under IKA */
 int  draft_uni();                             /* Q33: one draft depth a step (cap_rows' cut at every start) */
+int  sched_bi_srpt();                         /* lever SRB (round 58): 0 off, 1 fewest rows left first, N >= 2 + an N-ms age bound */
+int  sched_ahead_all();                       /* lever AHA (round 59): 1 = a step that would leave a decoder out is planned in full */
+int  sched_bi_ride();                         /* lever TLR (round 60): N > 0 = a prompt's last piece of at most N rows rides BI5's decode turn */
 /* Whether switch i is one of the Qwen line's (kQwenFirst on). */
 inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by

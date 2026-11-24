@@ -80,8 +80,22 @@ void LaneSet::init(std::vector<Scheduler*> lanes) {
     }
 }
 
+bool LaneSet::bg1m_env() {   /* qfn-on-ds lever BGL */
+    const char* v = std::getenv("RADIANCE_BG_LANE_1M");
+    return v && (!std::strcmp(v, "1") || !std::strcmp(v, "2") || !std::strcmp(v, "3"));
+}
+bool LaneSet::bg1m2_env() {   /* qfn-on-ds lever BGL stage 2 (2a serial, 3 = 2b overlapped) */
+    const char* v = std::getenv("RADIANCE_BG_LANE_1M");
+    return v && (!std::strcmp(v, "2") || !std::strcmp(v, "3"));
+}
+bool LaneSet::bg1m3_env() {   /* qfn-on-ds lever BGL stage 2b */
+    const char* v = std::getenv("RADIANCE_BG_LANE_1M");
+    return v && !std::strcmp(v, "3");
+}
+
 int LaneSet::bg_env() {
     const char* v = std::getenv("RADIANCE_PP_BG_LANE");
+    if ((!v || !*v) && bg1m_env()) return 1;   /* qfn-on-ds lever BGL: one machine's lane 1 */
     if (!v || !*v) return 0;
     char* end = nullptr;
     const long k = std::strtol(v, &end, 10);
@@ -640,7 +654,6 @@ void Scheduler::lane_split_own() {
     if (!lanes_ || n_lanes_ <= 1 || !lanes_->split_on()) return;
     const std::vector<int>& order = lanes_->planners_locked();
     if (order.empty()) return;
-    const bool hold = lanes_->head_state();
     /* tp8 S5 review: a borrower's rows within the shared budget under a span -- a step carrying another lane's chunk
      * is a shared step and a step wider than the shared budget must be one sequence (RadBuildCtx::max_mixed_tok); two
      * lenders lending non-wide chunks into one borrower (three lanes or more) would pass max_tok alone */
@@ -676,7 +689,7 @@ void Scheduler::lane_split_own() {
         }
         if (e.home >= 0 || !e.is_prefill || e.produces_token || e.slot < 0 || (size_t)e.slot >= reqs_.size()) continue;
         if (e.cr_replay || e.n_spec != 0) continue;
-        if (hold && e.ckpt_slot >= 0 && e.ckpt_tok >= 0) {
+        if (e.ckpt_slot >= 0 && e.ckpt_tok >= 0 && lanes_->snap_holds(e.ckpt_tok, e.n_tokens)) {
             if (reqs_[(size_t)e.slot]) lane_why(*reqs_[(size_t)e.slot], LaneSet::kSnap);
             continue;
         }
@@ -776,7 +789,7 @@ void Scheduler::lane_split_own() {
             any = true;
             p += n;
             if (pc.e.produces_token) { tok = true; break; }
-            if (hold && pc.e.ckpt_slot >= 0) { s.lent_hold = true; why = LaneSet::kSnap; break; }
+            if (pc.e.ckpt_slot >= 0 && lanes_->snap_holds(pc.e.ckpt_tok, pc.e.n_tokens)) { s.lent_hold = true; why = LaneSet::kSnap; break; }
         }
         if (why < 0 && !tok && p < (dpiece ? s.bi_end : target) && j >= order.size()) why = LaneSet::kNoLane;
         if (dpiece && rows > 0) lanes_->note_dpiece_locked();
@@ -917,7 +930,7 @@ bool Scheduler::lane_split_bg(StepEntry& e, int* why) {
     s.lent_tok = true;
     s.lent_next = e.ctx_len;
     /* at W(h > 0, t) a lent snapshot holds its sequence until its commit (lane_split_own's rule) -- it is held anyway (lent_tok) */
-    if (lanes_->head_state() && pc.e.ckpt_slot >= 0) s.lent_hold = true;
+    if (pc.e.ckpt_slot >= 0 && lanes_->snap_holds(pc.e.ckpt_tok, pc.e.n_tokens)) s.lent_hold = true;
     return true;
 }
 

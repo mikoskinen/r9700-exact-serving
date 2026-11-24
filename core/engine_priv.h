@@ -97,6 +97,18 @@ struct Engine::Rank {
     FileStager  fstager;
     StagerChain stagers;
     Ctx       ctx;
+    /* qfn-on-ds lever BGL stage 2 (RADIANCE_BG_LANE_1M=2): the second Ctx lane 1's steps are issued on -- its own streams, arena
+     * and collective / instance set 1 (RADIANCE_AR_SETS=2 or all); built only under it (bg_ready) */
+    Ctx       bg_ctx;
+    bool      bg_ready = false;
+    /* lane 1's sampler driver (Sampler::clone_from: the same ops, its own pinned staging) */
+    Sampler   bg_sampler;
+    /* The Ctx / sampler the step path works on: lane 1's while the step loop works on a lane-1 step under stage 2 (Engine::lane_select
+     * sets use_bg with the ranks parked), else the rank's own. Bring-up and the tiers always use `ctx` / `sampler`. */
+    bool      use_bg = false;
+    bool      dbg_cx = true, dbg_sp = true;   /* WIP: RADIANCE_BGL2_DBG=1 keeps the sampler, =2 keeps the Ctx (isolation runs) */
+    Ctx&      cx()  { return use_bg && dbg_cx ? bg_ctx : ctx; }
+    Sampler&  smp() { return use_bg && dbg_sp ? bg_sampler : sampler; }
     Sampler   sampler;          /* one per rank: each samples its own vocab shard (spec §9) */
     /* Scored rows' logits (Request::token_scores), this rank's vocabulary shard, copied into pinned
      * memory ahead of the sampler. Grown to the most rows a step has scored. */

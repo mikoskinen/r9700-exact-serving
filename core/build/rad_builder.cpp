@@ -600,6 +600,10 @@ void Builder::resolve_bands(OpInfo& oi) {
 static int ar_sets() {
     static const int v = [] {
         const char* e = std::getenv("RADIANCE_AR_SETS");
+        /* qfn-on-ds lever BGL stage 2 (Qwen loop round 24): "all" = a second instance for EVERY row with an init, not only the
+         * collectives -- a kernel instance that holds device counters (libr4d's fused router slots, exl3r4d's D18 blocks) is
+         * then never shared by a pass on a rank's second Ctx and one on its first */
+        if (e && !std::strcmp(e, "all")) return 3;
         return e && e[0] == '2' && !e[1] ? 2 : 1;
     }();
     return v;
@@ -619,8 +623,8 @@ void Builder::finish_instances() {
                 int s = reg_.init_instance(r, prog_.ctx.rank, prog_.ctx.world_size);
                 /* tp8 loop M6F (RADIANCE_AR_SETS=2): a collective row's second instance set, right after the first, so every
                  * rank builds both in the same declared order */
-                if (s >= 0 && ar_sets() >= 2 && r.row->collective && !prog_.ctx.shape_probe) {
-                    s = reg_.init_instance_set(r, prog_.ctx.rank, prog_.ctx.world_size, 1);
+                if (s >= 0 && ar_sets() >= 2 && (r.row->collective || ar_sets() >= 3) && !prog_.ctx.shape_probe) {
+                    s = reg_.init_instance_set(r, prog_.ctx.rank, prog_.ctx.world_size, 1, ar_sets() >= 3);
                     sets1 += s >= 0 && r.instance1 ? 1 : 0;
                 }
                 if (s >= 0) continue;
@@ -635,9 +639,10 @@ void Builder::finish_instances() {
             }
         }
     }
-    if (sets1 > 0 && prog_.ctx.rank == 0)
-        RAD_INFO("RADIANCE_AR_SETS=2 (tp8 loop M6F): %d collective instance(s) have a second set, taken by passes issued from "
-                 "a rank's second pass slot (Ctx::set_ar_set 1; qfn-on-ds Q5b S0)", sets1);
+    if ((sets1 > 0 || ar_sets() >= 3) && prog_.ctx.rank == 0 && !prog_.ctx.shape_probe)
+        RAD_INFO("RADIANCE_AR_SETS=%s (tp8 loop M6F): %d %s instance(s) have a second set, taken by passes issued from "
+                 "a rank's second pass slot (Ctx::set_ar_set 1; qfn-on-ds Q5b S0%s)", ar_sets() >= 3 ? "all" : "2", sets1,
+                 ar_sets() >= 3 ? "kernel" : "collective", ar_sets() >= 3 ? "; every row with an init: lever BGL stage 2" : "");
 }
 
 /* Hand each tune request the instance finish_instances() made for its kernel: a collective's

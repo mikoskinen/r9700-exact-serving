@@ -3472,6 +3472,13 @@ constexpr long long kRgMaxM = 128;   /* fn4 BI wide: 64 before 14.11.2026 (the a
 namespace {
 
 constexpr int kRgKU = 8;                  /* r4d_gemm_bf16_nt_m64's KU: the unroll, not the order */
+/* qfn-on-ds lever RGU (Qwen loop round 36, QUEUE Q65): the fused router's (tile, split) item with every fragment of KU k
+ * steps loaded before the batch's first WMMA. At Qwen's rank shape (K 2560, split 4) an item is 40 k steps, today 5
+ * batches of 8 loads each waited for in turn (a per-wave latency chain: prof5's stamped call 9.0 / 14.8 / 14.9 / 22.9 us
+ * at 5 / 32 / 64 / 128 rows vs ~4 us of weight bytes); at 20 it is 2 batches. The WMMA chain (k steps ascending from
+ * zero) and everything after it are today's: the same bytes. */
+constexpr int kRgKUWide = 20;
+constexpr int kRgKUWhole = 40;           /* the whole item in one batch at K 2560 / split 4 (the compiler streams it: no drain mid-item) */
 
 typedef __bf16 rg_v8bf __attribute__((ext_vector_type(8)));
 typedef float  rg_v8f  __attribute__((ext_vector_type(8)));
@@ -3496,7 +3503,9 @@ __device__ __forceinline__ unsigned rg_rowGo(unsigned rowstride, int row0, int l
 }
 
 /* One (tile, split) item: the 16 x 16 partial tile r4d_gemm_bf16_nt_m64_kernel's wave (n0, ks)
- * accumulates at MT = 1, with the same loads and WMMA chain from zero. */
+ * accumulates at MT = 1, with the same loads and WMMA chain from zero. KU (lever RGU): kRgKU = today's text; kRgKUWide
+ * loads a batch's KU W and A fragments into registers first, then runs the batch's WMMAs in today's k order. */
+template <int KU = kRgKU>
 __device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
                                           const uint16_t* __restrict__ W, int M, int K, int N,
                                           int n0, int m0, int ks, int SK, int lane) {
@@ -3504,6 +3513,48 @@ __device__ __forceinline__ rg_v8f rg_item(const uint16_t* __restrict__ A,
     rg_v8f acc = (rg_v8f)(0.f);
     const unsigned woff = rg_rowGo((unsigned)K, n0, N - 1, lane) + (unsigned)kbase;
     const unsigned aoff = rg_rowGo((unsigned)K, m0, M - 1, lane) + (unsigned)kbase;
+    if constexpr (KU != kRgKU) {
+        if (n0 < N) {
+            rg_gu2 pw = (rg_gu2)(const unsigned long long*)(W + woff);
+            rg_gu2 pa = (rg_gu2)(const unsigned long long*)(A + aoff);
+            int s = 0;
+            for (; s + KU <= ksteps; s += KU) {
+                rg_v8bf fb[KU], fa[KU];
+#pragma unroll
+                for (int u = 0; u < KU; u++) {
+                    fb[u] = rg_fragU(pw, u);
+                    fa[u] = rg_fragU(pa, u);
+                }
+#ifdef R4D_EMU_HOST
+                if (std::getenv("R4D_EMU_RGU_MUTATE")) {   /* r4d_emu_qrgt's mutation control only: the batch's chain reversed */
+                    for (int u = KU - 1; u >= 0; u--) acc = rg_mma(fa[u], fb[u], acc);
+                } else
+#endif
+                {
+#pragma unroll
+                    for (int u = 0; u < KU; u++) acc = rg_mma(fa[u], fb[u], acc);
+                }
+                pw += KU * 4;
+                pa += KU * 4;
+            }
+            for (; s + kRgKU <= ksteps; s += kRgKU) {   /* a shorter rest (the gate's 8 k steps at split 20): today's batch */
+#pragma unroll
+                for (int u = 0; u < kRgKU; u++) {
+                    const rg_v8bf b = rg_fragU(pw, u);
+                    acc = rg_mma(rg_fragU(pa, u), b, acc);
+                }
+                pw += kRgKU * 4;
+                pa += kRgKU * 4;
+            }
+            for (; s < ksteps; s++) {
+                const rg_v8bf b = rg_fragU(pw, 0);
+                pw += 4;
+                acc = rg_mma(rg_fragU(pa, 0), b, acc);
+                pa += 4;
+            }
+        }
+        return acc;
+    }
     if (n0 < N) {
         rg_gu2 pw = (rg_gu2)(const unsigned long long*)(W + woff);
         rg_gu2 pa = (rg_gu2)(const unsigned long long*)(A + aoff);
@@ -3550,7 +3601,7 @@ struct RgGeom {
 };
 
 /* `lg` is neither const nor __restrict__: every block writes it and the last one reads it back. */
-template <uint32_t MAXOWN, uint32_t NW, bool INV = false>
+template <uint32_t MAXOWN, uint32_t NW, bool INV = false, int KU = kRgKU>
 __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
     const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
@@ -3582,7 +3633,7 @@ __device__ __forceinline__ void router_gemm_topk_scatter_kernel_body(
     if (t > 0) __syncthreads();   /* the previous tile's reduction has read `red` */
     for (uint32_t it = wave; it < items; it += NW) {
         const uint32_t j = it / (uint32_t)SK, ks = it % (uint32_t)SK;
-        const rg_v8f acc = rg_item(A, Wb, (int)g.M, (int)g.K, N, (int)((nt0 + j) * 16u), m0,
+        const rg_v8f acc = rg_item<KU>(A, Wb, (int)g.M, (int)g.K, N, (int)((nt0 + j) * 16u), m0,
                                    (int)ks, SK, (int)lane);
         float* const slot = red + (size_t)it * 256;           /* it == j * SK + ks */
 #pragma unroll
@@ -3710,6 +3761,50 @@ __global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter_
     r4d_chain_done();
 }
 
+/* lever RGU (kRgKUWide note): the same four forms with the wide batch (KU 20 or 40); today's four above keep their text. */
+template <uint32_t MAXOWN, uint32_t NW, int KU>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_ku_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) { R4D_IKA_ENTRY();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, false, KU>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+}
+template <uint32_t MAXOWN, uint32_t NW, int KU>
+__global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter_ku(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot) {
+    r4d_chain_wait();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, false, KU>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot);
+    r4d_chain_done();
+}
+template <uint32_t MAXOWN, uint32_t NW, int KU>
+__global__ __launch_bounds__(NW * kWave) void router_gemm_topk_scatter_inv_ku_kernel(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) { R4D_IKA_ENTRY();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true, KU>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot,
+                                                                     inv);
+}
+template <uint32_t MAXOWN, uint32_t NW, int KU>
+__global__ __launch_bounds__(NW * kWave) void r4dchain_router_gemm_topk_scatter_inv_ku(
+    const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+    const uint16_t* __restrict__ Wg, uint16_t* lg, uint16_t* __restrict__ gate,
+    int32_t* __restrict__ ids, uint16_t* __restrict__ w, int32_t* __restrict__ sorted,
+    int32_t* __restrict__ off, int32_t* __restrict__ cnt, unsigned int* __restrict__ ctr,
+    RgGeom g, Protect prot, int32_t* __restrict__ inv) {
+    r4d_chain_wait();
+    router_gemm_topk_scatter_kernel_body<MAXOWN, NW, true, KU>(A, W, Wg, lg, gate, ids, w, sorted, off, cnt, ctr, g, prot,
+                                                                     inv);
+    r4d_chain_done();
+}
+
 /* The arrival counter belongs to the op instance and is taken at init, not on the launch path.
  *
  * It must persist between launches, zeroed (the last block resets it; a non-zero start would rank
@@ -3791,27 +3886,53 @@ extern "C" void r4d_rad_router_gemm_topk_scatter_fini(void* inst) {
 /* qfn-on-ds lever RGT (Qwen loop round 5; RgGeom note): the fused decode router ranks per row tile from this many rows
  * (0 = today's form at every height). RADIANCE_FN4_RG_TAIL at start, switch rg_tail between steps (r4d_rg_tail_set,
  * reached through r4d_hc_bf16.hip's r4d_fn4_switch_fn). -1 until the environment is read. */
+/* qfn-on-ds lever RGU (Qwen loop round 36, QUEUE Q65): the same switch carries the router's GEMM form above its row
+ * field -- value = rows (0 .. 128, RGT's floor) + 256 x KU code + 1024 x cap code; KU code 1 / 2 (256 / 512) = the load
+ * batch of 20 / 40 k steps (kRgKUWide / kRgKUWhole; 3 refused), cap code 1 / 2 / 3 (1024 / 2048 / 3072) = at most 4 / 2 / 1
+ * sixteen-column tiles a block (more router blocks over the WGPs, each the same items). Every value is the same bytes; a row
+ * field above 128, KU code 3 or a value above 4095 is refused (the value kept). RADIANCE_FN4_RG_TAIL at start takes the
+ * same encoding. */
+constexpr int kRgFormMax = 15;
+static bool rg_tail_known(int v) {
+    return v >= 0 && (v & 255) <= (int)kRgMaxM && (v >> 8) <= kRgFormMax && ((v >> 8) & 3) != 3;
+}
 static std::atomic<int> g_rg_tail{-1};
-static int rg_tail_rows() {
+static int rg_tail_value() {
     int v = g_rg_tail.load(std::memory_order_relaxed);
     if (v < 0) {
         const char* e = std::getenv("RADIANCE_FN4_RG_TAIL");
         int on = (e && *e) ? std::atoi(e) : 0;
-        on = on < 0 ? 0 : on > (int)kRgMaxM ? (int)kRgMaxM : on;
+        if (on < 0) on = 0;
+        if (!rg_tail_known(on)) {   /* today's clamp for a plain row count; an unknown form is dropped */
+            const int rows = (on & 255) > (int)kRgMaxM ? (int)kRgMaxM : (on & 255);
+            const int form = (on >> 8) <= kRgFormMax && ((on >> 8) & 3) != 3 ? (on >> 8) : 0;
+            on = on <= 255 ? (on > (int)kRgMaxM ? (int)kRgMaxM : on) : rows + 256 * form;
+        }
         int want = -1;
-        if (g_rg_tail.compare_exchange_strong(want, on, std::memory_order_relaxed) && on > 0)
-            std::fprintf(stderr, "radiance: libr4d: lever RGT (RADIANCE_FN4_RG_TAIL=%d): the fused decode router ranks per "
-                                 "16-row tile from %d rows (the same bytes)\n", on, on);
+        if (g_rg_tail.compare_exchange_strong(want, on, std::memory_order_relaxed) && on > 0) {
+            if ((on & 255) > 0)
+                std::fprintf(stderr, "radiance: libr4d: lever RGT (RADIANCE_FN4_RG_TAIL=%d): the fused decode router ranks per "
+                                     "16-row tile from %d rows (the same bytes)\n", on, on & 255);
+            if (on >> 8)
+                std::fprintf(stderr, "radiance: libr4d: lever RGU (RADIANCE_FN4_RG_TAIL=%d): the fused decode router's GEMM %s%s"
+                                     "(the same bytes)\n", on, ((on >> 8) & 3) == 1 ? "with the 20-step load batch "
+                                     : ((on >> 8) & 3) == 2 ? "with the 40-step load batch " : "",
+                             ((on >> 10) & 3) ? ((on >> 10) & 3) == 1 ? "at <= 4 tiles a block " : ((on >> 10) & 3) == 2
+                                              ? "at <= 2 tiles a block " : "at 1 tile a block " : "");
+        }
         v = g_rg_tail.load(std::memory_order_relaxed);
     }
     return v;
 }
+static int rg_tail_rows() { return rg_tail_value() & 255; }
 extern "C" int r4d_rg_tail_set(int value) {
-    if (value < 0 || value > (int)kRgMaxM) return -1;
+    if (!rg_tail_known(value)) return -1;
     g_rg_tail.store(value, std::memory_order_relaxed);
     return 1;
 }
-extern "C" int r4d_rg_tail_get() { return rg_tail_rows(); }
+extern "C" int r4d_rg_tail_get() { return rg_tail_value(); }
+/* lever RGU's engagement, once a process: the first launch that takes a non-default form names it (absent = NOT TAKEN) */
+static std::atomic<int> g_rgu_named{0};
 
 /* Operands: a, b (the router), gate_b? -> logits, expert_ids, expert_w, sorted_tok,
  * expert_offset, expert_count, gate?. The two optional ones come together or not at all. The
@@ -3895,6 +4016,22 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
     long long tpb = (long long)nw / cr.sk;
     if (tpb < 1) tpb = 1;
     if (tpb > ntiles) tpb = ntiles;
+    /* lever RGU (the switch note above rg_tail_rows): the op params rg_ku (8 / 20) and rg_tpb (a tile cap) for the bench,
+     * else the switch's form bits. A cap below today's tpb leaves waves idle in the GEMM part (each item is still one
+     * wave's chain, the reduction per tile in split order): more blocks, the same items, the same bytes. */
+    const int rg_form = rg_tail_value() >> 8;
+    const long long ku_v = r4d_geti_or(a, "rg_ku", (rg_form & 3) == 1 ? (long long)kRgKUWide
+                                                   : (rg_form & 3) == 2 ? (long long)kRgKUWhole : (long long)kRgKU);
+    const int rg_kuw = ku_v == kRgKUWide ? 1 : ku_v == kRgKUWhole ? 2 : 0;
+    const bool rg_ku = rg_kuw != 0;
+    const int tcap_code = (rg_form >> 2) & 3;
+    const long long rg_tpb = r4d_geti_or(a, "rg_tpb", tcap_code == 1 ? 4 : tcap_code == 2 ? 2 : tcap_code == 3 ? 1 : 0);
+    if (rg_tpb > 0 && tpb > rg_tpb) tpb = rg_tpb;
+    if ((rg_ku || rg_tpb > 0) && g_rgu_named.exchange(1, std::memory_order_relaxed) == 0)
+        std::fprintf(stderr, "radiance: libr4d: lever RGU (rg_tail form %d): the fused decode router at %lld rows runs %s"
+                             "%lld tiles a block, %lld blocks a row tile (the same bytes)\n", rg_form, M,
+                     rg_kuw == 1 ? "the 20-step load batch, " : rg_kuw == 2 ? "the 40-step load batch, " : "", tpb,
+                     (ntiles + tpb - 1) / tpb);
     const long long nrb = (ntiles + tpb - 1) / tpb;
     size_t lds = (size_t)(tpb * cr.sk) * 256 * sizeof(float);
     if (wg) lds = std::max(lds, (size_t)cg.sk * 256 * sizeof(float));
@@ -3924,7 +4061,12 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
 
 #define R4D_RG_L(OWN, NWV)                                                                      \
     emit_rc = inv                                                                               \
-        ? R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter_inv<OWN, NWV>               \
+        ? R4D_EMIT(stream, (rg_ku ? rg_kuw == 2                                                 \
+                                ? (ch ? &r4dchain_router_gemm_topk_scatter_inv_ku<OWN, NWV, kRgKUWhole>        \
+                                      : &router_gemm_topk_scatter_inv_ku_kernel<OWN, NWV, kRgKUWhole>)         \
+                                : (ch ? &r4dchain_router_gemm_topk_scatter_inv_ku<OWN, NWV, kRgKUWide>         \
+                                      : &router_gemm_topk_scatter_inv_ku_kernel<OWN, NWV, kRgKUWide>)          \
+                                  : ch ? &r4dchain_router_gemm_topk_scatter_inv<OWN, NWV>        \
                                : &router_gemm_topk_scatter_inv_kernel<OWN, NWV>), grid,         \
                    dim3((NWV) * kWave), lds,                                                    \
                    (const uint16_t*)x->data, (const uint16_t*)wr->data,                         \
@@ -3932,7 +4074,12 @@ static int router_gemm_topk_scatter_body(const RadArgs* a, RadStream stream, con
                    (uint16_t*)lg->data, gate ? (uint16_t*)gate->data : (uint16_t*)nullptr,      \
                    (int32_t*)ids->data, (uint16_t*)w->data, (int32_t*)sorted->data,             \
                    (int32_t*)off->data, (int32_t*)cnt->data, ctr, g, prot, (int32_t*)inv->data) \
-        : R4D_EMIT(stream, (ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>                   \
+        : R4D_EMIT(stream, (rg_ku ? rg_kuw == 2                                                 \
+                                ? (ch ? &r4dchain_router_gemm_topk_scatter_ku<OWN, NWV, kRgKUWhole>            \
+                                      : &router_gemm_topk_scatter_ku_kernel<OWN, NWV, kRgKUWhole>)             \
+                                : (ch ? &r4dchain_router_gemm_topk_scatter_ku<OWN, NWV, kRgKUWide>             \
+                                      : &router_gemm_topk_scatter_ku_kernel<OWN, NWV, kRgKUWide>)              \
+                                  : ch ? &r4dchain_router_gemm_topk_scatter<OWN, NWV>            \
                                : &router_gemm_topk_scatter_kernel<OWN, NWV>), grid,             \
                    dim3((NWV) * kWave), lds,                                                    \
                    (const uint16_t*)x->data, (const uint16_t*)wr->data,                         \

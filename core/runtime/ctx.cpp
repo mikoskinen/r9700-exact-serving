@@ -92,6 +92,29 @@ bool ctx_lane_eager() {
 Ctx::Ctx() = default;
 Ctx::~Ctx() { shutdown(); }
 
+/* qfn-on-ds F65 (lever BGL stage 2b): a queue this Ctx made leaves cu_keep_ CUs to the card's other queues. Before the
+ * queue's first dispatch. The host backend has no CUs (RAD_E_UNSUPPORTED): nothing to keep, said once. */
+int Ctx::keep_cus(RadStream s) {
+    if (cu_keep_ <= 0 || !s) return RAD_OK;
+    int cus = 0;
+    const int st = rad_stream_cu_keep(s, cu_keep_, &cus);
+    if (st == RAD_E_UNSUPPORTED) {
+        if (!cu_keep_said_ && rank_ == 0)
+            RAD_INFO("F65 CU keep: the backend has no CU masks (%s); this Ctx's queues use every CU", rad_dev_last_error());
+        cu_keep_said_ = true;
+        return RAD_OK;
+    }
+    if (st < 0) {
+        RAD_ERR("F65 CU keep: rank %d could not leave %d CUs to the other queues: %s", rank_, cu_keep_, rad_dev_last_error());
+        return st;
+    }
+    if (!cu_keep_said_)
+        RAD_INFO("F65 CU keep: rank %d's queue %p dispatches to %d CUs, %d left to the card's other queues alone%s", rank_,
+                 (void*)s, cus, cu_keep_, st == 1 ? " (HSA_CU_MASK reduced it)" : "");
+    cu_keep_said_ = true;
+    return RAD_OK;
+}
+
 int Ctx::init(const CtxDesc& d) {
     if (!d.program) return RAD_E_INVAL;
     program_   = d.program;
@@ -99,6 +122,7 @@ int Ctx::init(const CtxDesc& d) {
     world_size_= d.world_size < 1 ? 1 : d.world_size;
     device_    = d.device;
     record_passes_ = d.record_passes;
+    cu_keep_   = d.cu_keep > 0 ? d.cu_keep : 0;
     residency_ = d.residency;
     registry_ = d.registry;
     kv_        = d.kv;
@@ -128,6 +152,7 @@ int Ctx::init(const CtxDesc& d) {
          * compute stream would preempt the transfers it is about to wait for. */
         RAD_TRY(rad_stream_create(&stream_, 0));
         own_stream_ = true;
+        RAD_TRY(keep_cus(stream_));
     }
 
     /* The second lane's stream: built here, while the card still has the room the VRAM budget kept for it, where the
@@ -139,6 +164,7 @@ int Ctx::init(const CtxDesc& d) {
     if (program_->scratch_regions > 1 && ctx_lane_eager()) {
         const uint64_t t0 = rad_mono_ns();
         RAD_TRY(rad_stream_create(&lane1_spare_, lane1_prio()));
+        RAD_TRY(keep_cus(lane1_spare_));
         for (int i = 0; i < 2; ++i)
             if (!lane_ev_[i]) RAD_TRY(rad_event_create_local(&lane_ev_[i]));
         if (rank_ == 0)
@@ -1059,6 +1085,7 @@ int Ctx::lane_init() {
          * first-use stall waited; said once a rank. */
         const uint64_t t0 = rad_mono_ns();
         RAD_TRY(rad_stream_create(&lane1_, lane1_prio()));
+        RAD_TRY(keep_cus(lane1_));
         RAD_INFO("second lane: rank %d built its stream on first use in %.1f ms (RADIANCE_FN4_LANE_EAGER=0 or no "
                  "second lane declared)", rank_, (double)(rad_mono_ns() - t0) / 1e6);
     }

@@ -3,6 +3,7 @@
 
 #include "device/device.h"
 #include "kvstream/bind.h"
+#include "kvstream/plan.h"
 #include "runtime/fn4_switch.h"
 #include "runtime/wtab.h"
 
@@ -65,6 +66,13 @@ void kvstream_enter(Ctx* c, const RadBatch* b) {
         if (!kb || !kb->has_stage) continue;
         const bool was_stage = kb->depth == 1;
         kv_binding_enter(*kb, kv_pass_view(b->phase, b->n_tok, b->n_seq, b->n_spec));
+        /* lever RIDE: the trunk MIXED pass of a riding step stages the prefill sequences' ranges and its decode rows attend
+         * on the ring; every other pass of the step (the MTP head's history pass, drafts) stages every sequence's */
+        kb->ride = false;
+        if (kb->has_ride_runs) {
+            kb->ride = kb->depth == 1 && kb->stage_apart && kvstream_ride_step(b);
+            kb->stage_runs = kb->ride ? kb->stage_runs_ride : kb->stage_runs_full;
+        }
         /* Back on the ring after a staged pass, the residency maps describe bytes the stage has
          * overwritten. A staged pass copies whole layers to the pool at block-id identity (block b
          * at base + b * block_bytes), which overlaps the ring's slots of other layers, and the
@@ -163,16 +171,40 @@ void kvstream_runs(const std::vector<const std::vector<int32_t>*>& tables, int64
         out->push_back(KVStageRun{ x.first * block_bytes, (x.second - x.first) * block_bytes });
 }
 
+bool kvstream_ride_step(const RadBatch* b) {
+    /* the plugin's per-sequence attention (fn4 att_bi) takes decode rows of one depth only (D x qd == DT) */
+    if (!kvstream_ride() || !b || b->phase != RAD_PHASE_MIXED || b->draft_pass != 0 || b->n_seq_decode <= 0 ||
+        b->n_seq_decode >= b->n_seq || b->max_q_len_decode <= 0 ||
+        (int64_t)b->n_tok_decode != (int64_t)b->n_seq_decode * (int64_t)b->max_q_len_decode ||
+        kv_pass_view(b->phase, b->n_tok, b->n_seq, b->n_spec) != KVView::Stage)
+        return false;
+    int streamed = 0;
+    for (int i = 0; i < b->n_kv_groups; ++i) streamed += b->kv[i].stream ? 1 : 0;
+    return streamed == 1;
+}
+
 void kvstream_step_runs(const KVManager& kv, const RadBatch* b, const std::vector<uint64_t>* seqs,
-                        std::vector<std::vector<KVStageRun>>* runs) {
+                        std::vector<std::vector<KVStageRun>>* runs,
+                        std::vector<std::vector<KVStageRun>>* ride_runs) {
     runs->resize((size_t)std::max(0, (int)kv.n_groups()));
     const bool stages = b && kv_pass_view(b->phase, b->n_tok, b->n_seq, b->n_spec) == KVView::Stage;
+    /* lever RIDE: the prefill sequences' ranges too (the batch's first n_seq_decode sequences decode: batch_split) */
+    const bool ride = ride_runs && stages && seqs && kvstream_ride_step(b) && (int64_t)seqs->size() == (int64_t)b->n_seq;
+    if (ride_runs) {
+        ride_runs->resize(runs->size());
+        for (auto& r : *ride_runs) r.clear();
+    }
     thread_local std::vector<const std::vector<int32_t>*> tables;
     for (int g = 0; g < kv.n_groups(); ++g) {
         std::vector<KVStageRun>& out = (*runs)[(size_t)g];
         out.clear();
         const RadKVStream* st = kv.stream_view(g);
         if (!st || st->block_bytes <= 0) continue;
+        if (ride) {
+            tables.clear();
+            for (size_t i = (size_t)b->n_seq_decode; i < seqs->size(); ++i) tables.push_back(&kv.block_table((*seqs)[i], g));
+            kvstream_runs(tables, st->block_bytes, &(*ride_runs)[(size_t)g]);
+        }
         if (stages && seqs) {
             tables.clear();
             for (const uint64_t q : *seqs) tables.push_back(&kv.block_table(q, g));
@@ -184,12 +216,22 @@ void kvstream_step_runs(const KVManager& kv, const RadBatch* b, const std::vecto
     }
 }
 
-void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs) {
+void kvstream_bound_live(Ctx* c, const std::vector<std::vector<KVStageRun>>& runs,
+                         const std::vector<std::vector<KVStageRun>>* ride_runs) {
     if (!c) return;
     for (size_t g = 0; g < runs.size(); ++g) {
         KVPoolBinding* b = c->kv_binding((int)g);
         if (!b || !b->has_stage) continue;
         b->stage_runs = runs[g];
+        /* lever RIDE: both sets for kvstream_enter to pick from by pass. Every eligible step rides (a recorded pass then
+         * replays against the view it was recorded with): an empty prefill set falls back to the full one (empty = the
+         * whole row), which stages the decode rows' blocks too -- unread, since they attend on the ring. */
+        b->has_ride_runs = ride_runs != nullptr;
+        b->ride = false;
+        if (b->has_ride_runs) {
+            b->stage_runs_full = runs[g];
+            b->stage_runs_ride = g < ride_runs->size() && !(*ride_runs)[g].empty() ? (*ride_runs)[g] : runs[g];
+        }
     }
 }
 
@@ -446,10 +488,11 @@ extern "C" int rad_kv_stage_layer(RadCtx* c, rad_kvgroup group, const RadKVGroup
     using namespace rad;
     if (!c || !kvb || !kvb->stream) return 0;
     const int r = kvstage_wait(static_cast<Ctx*>(c), group, kvb, layer);
-    /* fn4 kvs_apart: 2 = staged on a stage funded beside the ring (the store then also keeps the ring current) */
+    /* fn4 kvs_apart: 2 = staged on a stage funded beside the ring (the store then also keeps the ring current); lever RIDE:
+     * 3 = that, and the pass's decode rows ride the ring (their blocks are not staged: they resolve and attend on the ring) */
     if (r == 1) {
         const KVPoolBinding* b = static_cast<Ctx*>(c)->kv_binding(group);
-        if (b && b->stage_apart) return 2;
+        if (b && b->stage_apart) return b->ride ? 3 : 2;
     }
     return r;
 }
