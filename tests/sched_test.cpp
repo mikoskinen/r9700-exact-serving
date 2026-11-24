@@ -796,6 +796,76 @@ TEST(fn4_bi_chunk_6_runs_alones_pieces_whole_and_a_piece_that_does_not_fit_alone
     rad::fn4::apply_pending(1, da);
 }
 
+/* Qwen loop round 59 lever AHA (fn4 sched_ahead_all, QUEUE Q119): a step issued ahead carries the in-flight step's sequences
+ * only. Under BI chunking 5 a request's LAST piece runs in a lone step and produces a token; the step issued ahead of it then
+ * carries that request's decode ALONE, and so does every step issued ahead after it, while the other decoders wait (agx21:
+ * 105 runs after the same slot's lone piece, 6,804 one-sequence steps, 82 s; the longest 485 steps). 0 = today (the defect:
+ * one sequence issued ahead, d left out); 1 = no step issued ahead there, the full step takes c and d, and an ordinary decode
+ * step with nobody left out is still issued ahead (positive control). Chunking 6 has its own guard (bi6_plan_lone_; with
+ * speculation_fixed set, as the engine sets it, so this case reaches that guard). */
+TEST(qwen_round59_aha_no_step_issued_ahead_leaves_a_decoder_out_after_a_lone_step) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    for (const int chunking : {5, 6})
+        for (const int on : {0, 1}) {
+            CHECK(rad::fn4::request("sched_bi_chunk", chunking, &err));
+            CHECK(rad::fn4::request("sched_ahead_all", on, &err));
+            rad::fn4::apply_pending(0, da);
+            Fixture f;
+            f.build();
+            f.cfg.prefill_span = 2;
+            CHECK_OK(f.start());
+            auto rd = f.request(100, 300);
+            for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;
+            rd->ignore_eos = true;
+            rd->speculation_fixed = true;
+            const uint64_t d = f.add(std::move(rd));
+            for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+            auto rc = f.request(256, 40);
+            rc->speculation_fixed = true;
+            const uint64_t c = f.add(std::move(rc));
+            bool c_lone = false;
+            int ahead_n = -1;
+            for (int k = 0; k < 8 && f.sch.step(); ++k) {
+                const StepPlan& p = f.sch.plan();
+                const bool lone_c = p.e.size() == 1 && p.e[0].seq == c && p.e[0].is_prefill;
+                if (lone_c) {
+                    c_lone = true;
+                    const RadBatch* nb = f.sch.step_next();
+                    ahead_n = nb ? (int)nb->n_seq : 0;
+                    if (nb) break;                 /* the defect's first step issued ahead: c alone */
+                }
+                f.commit_plain();
+                if (lone_c) break;
+            }
+            CHECK(c_lone);
+            if (chunking == 5 && on == 0) {
+                CHECK_EQ(ahead_n, 1);              /* today: c's decode issued ahead alone, d left out */
+            } else {
+                CHECK_EQ(ahead_n, 0);              /* no step issued ahead behind the lone step */
+            }
+            if (chunking == 5 && on == 1) {
+                /* the full step after the lone one carries both decoders; the step issued ahead of it too */
+                REQUIRE(f.sch.step() != nullptr);
+                const StepPlan& p = f.sch.plan();
+                bool has_c = false, has_d = false;
+                for (const StepEntry& e : p.e) {
+                    if (e.seq == c && !e.is_prefill) has_c = true;
+                    if (e.seq == d && !e.is_prefill) has_d = true;
+                }
+                CHECK(has_c && has_d);
+                const RadBatch* nb = f.sch.step_next();
+                CHECK(nb != nullptr);
+                CHECK_EQ(nb ? (int)nb->n_seq : 0, 2);
+                CHECK(f.sch.ahead_all_count() >= 1);
+            }
+            if (on == 0) CHECK_EQ(f.sch.ahead_all_count(), (int64_t)0);
+            CHECK(rad::fn4::request("sched_ahead_all", 0, &err));
+            CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+            rad::fn4::apply_pending(1, da);
+        }
+}
+
 /* Qwen loop round 51 (AgentX c32 arm BI5, READY 'AGX ARMS addendum 2'): under BI chunking 5 no step carries a prefill piece
  * beside a decode row. With a streamed KV group a step that does is a staged pass (kvstream/bind.cpp kv_pass_view: n_tok >
  * decode rows) and kvstream_step_runs stages EVERY sequence's history one layer at a time from the host mirror -- agx4's

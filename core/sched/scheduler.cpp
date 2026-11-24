@@ -5177,6 +5177,22 @@ bool Scheduler::ends_every_request() const {
     return !plan_.e.empty();
 }
 
+/* lever AHA: a running sequence past its prompt (it decodes) that the in-flight step does not carry */
+bool Scheduler::ahead_leaves_out() const {
+    aha_mark_.assign(reqs_.size(), 0);
+    for (const StepEntry& e : plan_.e)
+        if (e.slot >= 0 && (size_t)e.slot < aha_mark_.size()) aha_mark_[(size_t)e.slot] = 1;
+    for (int32_t slot : running_) {
+        if (slot < 0 || (size_t)slot >= reqs_.size() || !reqs_[(size_t)slot]) continue;
+        const SchedReq& s = *reqs_[(size_t)slot];
+        if (!s.req || !s.running || s.req->state != ReqState::Running || s.lent > 0) continue;
+        const Request& r = *s.req;
+        if (r.n_computed < (int64_t)r.prompt.size() || r.n_computed + 1 < s.seq_len()) continue;   /* a prefill */
+        if (!aha_mark_[(size_t)slot]) return true;
+    }
+    return false;
+}
+
 const RadBatch* Scheduler::step_next_locked() {
     if (!step_open_ || next_open_ || plan_.e.empty()) return nullptr;
     /* An admission is a decision about the pool and the queue that the full step makes -- unless lever CBH holds every
@@ -5199,6 +5215,18 @@ const RadBatch* Scheduler::step_next_locked() {
     if (bi_chunk_ == 6 && (bi6_plan_lone_ || bi6_wait_)) return nullptr;
     /* Before the loop below, which reserves the next step's KV. */
     if (ends_every_request()) return nullptr;
+    /* qfn-on-ds lever AHA (fn4 sched_ahead_all, Qwen loop round 59, QUEUE Q119): the step issued ahead carries the in-flight
+     * step's sequences only, so a DECODING sequence that step left out stays out for as long as steps are issued ahead --
+     * BI chunking 5's lone step for a request's last piece (it produces a token) is followed by that request's decode ALONE,
+     * step after step, while every other decoder waits (agx21: 105 runs after the same slot's lone piece, 6,804 one-sequence
+     * steps, 82 s of 1,730; agx20 166 runs, 150 s; the longest 1,487 steps). With the switch such a step is planned in full
+     * (the decode rows' turn takes every decoder). */
+    if (fn4::sched_ahead_all() > 0 && ahead_leaves_out()) {
+        if (aha_n_++ % 4096 == 0)
+            RAD_INFO("fn4 sched_ahead_all: the step in flight leaves a decoding sequence out -- the next one planned in full "
+                     "instead of issued ahead (%lld so far)", (long long)aha_n_);
+        return nullptr;
+    }
     /* The hybrid (scheduler.h): a sequence whose lookup matches long on the text committed so far
      * verifies the lookup's proposal next, which only step() can plan, after the commit. */
     if (hybrid_on() && draft_.head_runs()) {

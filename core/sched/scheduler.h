@@ -1055,6 +1055,11 @@ private:
      * evicted for one, [1] keeps dropped on an idle pool (recomputed) */
     bool          kr_on_ = true;
     int64_t       kr_n_[2] = {0, 0};
+    /* lever AHA (fn4 sched_ahead_all, Qwen loop round 59, Q119): whether the in-flight step leaves a decoding sequence out
+     * (step_next_locked then plans in full); aha_n_ = such steps so far */
+    bool          ahead_leaves_out() const;
+    mutable std::vector<char> aha_mark_;
+    int64_t       aha_n_ = 0;
     bool          keep_possible();
     int           rejoin_kept(SchedReq& s);
     void          unkeep(SchedReq& s);
@@ -1062,6 +1067,7 @@ public:
     const int64_t* resume_cold_counts() const { return rc_n_; }
     const int64_t* preempt_keep_counts() const { return pk_n_; }
     const int64_t* keep_reclaim_counts() const { return kr_n_; }
+    int64_t ahead_all_count() const { return aha_n_; }
 private:
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK
