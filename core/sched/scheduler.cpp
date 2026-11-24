@@ -4076,6 +4076,7 @@ const RadBatch* Scheduler::step() {
      * step a chunk (the stall a per-sequence K pin would save). */
     int32_t bi_lone_slot = -1;
     bool bi_lone_admit = false;
+    srb_wslot_ = -1;   /* lever SRB: this step's choice only (a step under another chunking, or after a POST, carries none) */
     if (bi_chunk_ == 5) {
         bool any_dec = false;
         for (int32_t sl : running_) {
@@ -4090,7 +4091,6 @@ const RadBatch* Scheduler::step() {
                                     (int64_t)running_.size() < cfg_.max_seqs;
         /* qfn-on-ds lever SRB (fn4 sched_bi_srpt, Qwen loop round 58): the lone step's prompt by the fewest rows left, a
          * waiting one admitted ahead where its rows past the cache's hit are fewer (srb_choose); 0 = the FIFO choice above */
-        srb_wslot_ = -1;
         if (const int srb = fn4::sched_bi_srpt(); srb > 0 && !lanes_ && !(any_dec && bi_lone_last_) &&
                                                   (bi_lone_slot >= 0 || admit_possible))
             srb_choose(admit_possible, srb, bi_lone_slot);

@@ -1105,6 +1105,39 @@ TEST(srb_bi5_lone_step_goes_to_the_prompt_with_the_fewest_rows_left) {
     CHECK(!std::get<0>(pn));                  /* whole prompt 2,600 > L's rows left: L first */
     CHECK(std::get<1>(pn) >= 1);
     CHECK_EQ(std::get<2>(ph), std::get<1>(ph));   /* one probe a request: the scheduler's count = the cache's */
+
+    /* The choice is one step's: a POST of sched_bi_chunk 6 right after a step that admitted ahead leaves no stale choice --
+     * a newcomer T is admitted under 6 as today (the walk asks every waiting prompt again) */
+    {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 400, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t sid = 0, tid = 0;
+        int l_pieces = 0, t_steps = -1;
+        bool switched = false;
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            bool s_in = false;
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) ++l_pieces;
+                if (sid && e.seq == sid && e.is_prefill) s_in = true;
+                if (tid && e.seq == tid && e.is_prefill && t_steps < 0) t_steps = k;
+            }
+            f.commit_plain();
+            if (!sid && l_pieces == 2) sid = f.add(distinct(f, 300, 2, 50000));
+            if (s_in && !switched) {                  /* the step that admitted S ahead: switch to 6, T arrives */
+                setsw("sched_bi_chunk", 6);
+                switched = true;
+                tid = f.add(distinct(f, 100, 2, 40000));
+            }
+        }
+        CHECK(switched);
+        CHECK(t_steps >= 0);                          /* T admitted under 6 */
+        setsw("sched_bi_chunk", 5);
+    }
     setsw("sched_bi_srpt", 0);
     setsw("sched_bi_chunk", 0);
 }
