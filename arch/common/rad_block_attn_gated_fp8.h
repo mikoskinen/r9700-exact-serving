@@ -68,10 +68,20 @@ namespace arch {
  * of 7), so without the pin a row's bytes move with its sequence's depth. At a depth-3 start every full-depth row keeps
  * today's bytes; rows below depth 3 (a cut window) and above it take the depth-3 law (a new reference there). Dense rows
  * keep 5's launches (their law gives one-tile segments at any depth up to 4 at gqa 6). The enabler of a depth rule. */
+/* 7 (24.11.2026, Qwen loop round 63, lever DSP; FINDINGS TEST note 13:27 / DEV answer 13:52: the KOW cell's A beside load
+ * differs from A alone at token 105 on the all-VRAM hero form): as 6, and every DECODE sequence of an ordinary pass takes the
+ * SPARSE path through the pinned law at every context -- alone (a dense one-sequence step too), beside load, in a dense step
+ * and in a staged MIXED pass whose reach is dense. Up to 6 a decode sequence's path is its verify BLOCK's (q rows from
+ * ctx_len c: sparse iff q == 1 or bound(c) + q > qsa_exact_to), not its rows': a q = 5 block from c <= 1,024 is dense, from
+ * 1,025 sparse, so a position in 1,025..1,028 (and a cut window's q <= 3 block at 1,025..2,048) takes either path by where
+ * its block starts -- and the blocks follow the drafts' acceptance, which a draft pass beside a longer sequence changes (draft
+ * passes keep the step's path, below). Dense and sparse split a row's keys by different laws (LONGPROMPT.md L1: equal up to
+ * 1,024 keys, different past them). Under 7 a decode row's path is a function of nothing but itself. Prefill sequences keep
+ * 4's alone choice; draft passes are unchanged. Changes the bytes of decode rows the dense path served (alone too). */
 inline std::atomic<int>& fn4_attbi_flag() {
     static std::atomic<int> f{[] { const char* e = std::getenv("RADIANCE_FN4_ATT_BI");
                                    const int v = e && *e ? std::atoi(e) : 0;
-                                   return v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
+                                   return v >= 7 ? 7 : v >= 6 ? 6 : v >= 5 ? 5 : v >= 4 ? 4 : v >= 3 ? 3 : v >= 2 ? 2 : v > 0 ? 1 : 0; }()};
     return f;
 }
 /* fn4 PF probe ATP (Qwen loop round 9, 21.11.2026, QUEUE Q8's upper-bound read; qwen4exp switch sp_route bit 64): every
@@ -971,10 +981,17 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
      * is computed every step); not with a streamed group (the dense path stages the layer itself) */
     const bool dense_bi = !sparse && abf0 >= 5 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_bi &&
                           !(kvb && kvb->stream);
+    /* att_bi 7 (lever DSP): a step the reach left dense that holds a decode sequence takes the per-sequence launches too --
+     * a one-sequence decode step (through lone6 below), a dense step without op_attn_bi's declare, a staged MIXED pass of a
+     * streamed group (staged once per pass by its store's kv_stage_wait: the launches read the stage at block ids, as a
+     * staged sparse MIXED pass's do) -- where every decode sequence is sparse (sp below) */
+    int64_t Ddsp = 0, DTdsp = 0;
+    if (abf0 >= 7) batch_split(batch, &Ddsp, &DTdsp);
+    const bool dsp = abf0 >= 7 && !sparse && Ddsp > 0 && qsa_sel && qsa_sequ && op_attn_gq && op_attn_gq_pin;
     /* att_bi 6: a SPARSE decode step of one sequence (alone) through the same launches, so its rows take the pinned law
-     * as beside load; its dense steps and every prefill stay on today's path */
-    const bool lone6 = abf0 >= 6 && batch->n_seq == 1 && gated && op_attn_gq_pin;
-    if ((gated || dense_bi) && abf0 > 0 && (batch->n_seq > 1 || lone6) && batch->draft_pass == 0 &&
+     * as beside load; its dense steps and every prefill stay on today's path (7: its dense steps too) */
+    const bool lone6 = abf0 >= 6 && batch->n_seq == 1 && (gated || dsp) && op_attn_gq_pin;
+    if ((gated || dense_bi || dsp) && abf0 > 0 && (batch->n_seq > 1 || lone6) && batch->draft_pass == 0 &&
         table && used && kvb && kvb->seqused_h && (!ring_bound || kvs_alone) && qsa_exact_to > 0 && op_attn && op_gq &&
         !(pieces && pieces->cuts(T))) {
         int64_t D = 0, DT = 0;
@@ -992,8 +1009,10 @@ inline void AttnGatedFP8::step(RadCtx* c, const RadBatch* batch, bool own_ar,
                 sp[s2] = fn4_attbi_sparse(abf0, (int64_t)kvb->seqused_h[s2], nr[s2], qsa_exact_to, g.max_ctx);
                 /* kvs_bi bit 1: alone, a streamed decode sequence is ring-bound, hence sparse at every context */
                 if (kvs_alone && s2 < D) sp[s2] = 1;
-                /* att_bi 6 alone: entered only where the step took the sparse path */
+                /* att_bi 6 alone: entered only where the step took the sparse path (7: or held a decode sequence) */
                 if (lone6) sp[s2] = 1;
+                /* att_bi 7 (lever DSP): a decode sequence sparse at every context, its path its rows' own */
+                if (abf0 >= 7 && s2 < D) sp[s2] = 1;
             }
             /* every sequence in launches of its own (12.11. x04c: long prompts): a sparse launch's split law reads its
              * row count as the sequence count (r4d_decode_splits: units = kv_heads x rows), so a sequence's rows inside a

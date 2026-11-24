@@ -4130,7 +4130,10 @@ uint64_t pass_key(RadCtx* c, const RadBatch* batch, const int32_t* used_max_h) {
                 if (abf >= 4 && rows <= 0) return 0;
                 uint64_t h = 1469598103934665603ull;
                 for (int64_t s = 0; s < batch->n_seq; ++s) {
-                    const bool sp = abf >= 4 ? rad::arch::fn4_attbi_sparse(abf, (int64_t)su[s], rows, ex, m.g.max_ctx)
+                    /* att_bi 7 (lever DSP): a decode pass's sequences are sparse at every context (this branch holds decode,
+                     * verify and draft passes; a draft pass keeps the step's path, att_bi does not touch it) */
+                    const bool sp = (abf >= 7 && batch->draft_pass == 0 && batch->phase == RAD_PHASE_DECODE) ? true
+                                  : abf >= 4 ? rad::arch::fn4_attbi_sparse(abf, (int64_t)su[s], rows, ex, m.g.max_ctx)
                                              : (int64_t)su[s] > ex;
                     h = (h ^ (uint64_t)(sp ? 2 : 1)) * 1099511628211ull;
                 }
@@ -4288,7 +4291,7 @@ extern "C" int rad_fn4_switch(const char* name, int value) {
         return 1;
     }
     if (name && std::strcmp(name, "att_bi") == 0) {   /* fn4 BI: a step's prefill sequences' attention, each alone-shaped */
-        if (value < 0 || value > 6) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path; 5: + dense steps; 6: + the depth-3 sparse law at every depth */
+        if (value < 0 || value > 7) return -1;   /* 3: + the dense decode sequences in one pinned launch; 4: + the alone bound's path; 5: + dense steps; 6: + the depth-3 sparse law at every depth; 7: + every decode sequence sparse at every context (lever DSP, Qwen loop round 63) */
         rad::arch::fn4_attbi_flag().store(value, std::memory_order_relaxed);
         return 1;
     }

@@ -275,8 +275,8 @@ TEST(ds41_twin_is_a_follower_plugin_switch_after_pp_bg_join_ms) {
 
 /* qfn-on-ds (Qwen loop round 1, 20.11.2026): the core's range check for the Qwen line's plugin switches takes what the
  * merged libr4d / qwen4exp serve -- hc_readv 0..262143 (bits 11-12: lever B3R; bit 13: lever HWC, loop round 19; bit 14: PF probe HCF,
- * round 28 -- the core held 16383 until round 29, so R58b's POST 24939 was refused; bits 15 / 16: levers HCX / B3X, round 34; bit 17: lever SSB, round 35), att_bi 0..6 (6: loop
- * round 3), bi_seg 0..3, sp_route 0..65535 (bits 1024 / 2048: lever MSP, loop round 20; 4096: lever GPF, round 22; 8192: lever HCP,
+ * round 28 -- the core held 16383 until round 29, so R58b's POST 24939 was refused; bits 15 / 16: levers HCX / B3X, round 34; bit 17: lever SSB, round 35), att_bi 0..7 (6: loop
+ * round 3; 7: lever DSP, round 63), bi_seg 0..3, sp_route 0..65535 (bits 1024 / 2048: lever MSP, loop round 20; 4096: lever GPF, round 22; 8192: lever HCP,
  * round 23; 16384: PF probe QSP, round 27; 32768: lever QRS, round 29), ar_laneblocks_s 0..24 / ar_lanethreads_s 0..1024 (lever LSK, round 27), resume_cold
  * 0..3 (2 / 3: lever TIP's resume points, rounds 21 / 22), rg_tail 0..4095 (rows + 256 x lever RGU's form, round 36), f8_pp 0..1
  * (lever F8P, round 37), hc_x_lb 0..3 / hc_b3x_e 0..1 (levers XLB / B3E, round 38), hc_b3x_p 0..4096 (lever B3P, round 39), hc_b3x_d 0..1 (lever B3D, round 40), gdn_epd 0..12 (levers EPD / QKS / GRP, round 41; QSC, round 47; ZXL 8 / 12, round 48), hc_rf 0..4096 (lever HRF, round 44), mtp_dec 0..31 (levers MTD / MTE, round 45; W2K, round 47; W2N, round 49) -- and
@@ -286,7 +286,7 @@ TEST(qwen_switch_ranges_take_b3r_and_the_round_3_bi_forms) {
     std::vector<int32_t> v0(fn4::kSwitches), v1(fn4::kSwitches);
     std::string why;
     struct R { const char* name; int hi; };
-    for (const R& r : { R{ "hc_readv", 262143 }, R{ "att_bi", 6 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
+    for (const R& r : { R{ "hc_readv", 262143 }, R{ "att_bi", 7 }, R{ "bi_seg", 3 }, R{ "sp_route", 65535 }, R{ "resume_cold", 3 },
                       R{ "ar_laneblocks_s", 24 }, R{ "ar_lanethreads_s", 1024 }, R{ "rg_tail", 4095 },
                       R{ "f8_pp", 1 }, R{ "hc_x_lb", 3 }, R{ "hc_b3x_e", 1 }, R{ "hc_b3x_p", 4096 }, R{ "hc_b3x_d", 1 }, R{ "gdn_epd", 12 }, R{ "hc_rf", 4096 }, R{ "mtp_dec", 31 } }) {
         const int i = fn4::switch_index(r.name);

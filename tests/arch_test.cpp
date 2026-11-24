@@ -2513,6 +2513,126 @@ TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_
     rsd.store(rs0);
 }
 
+/* qfn-on-ds round 63, lever DSP (att_bi 7; Qwen loop FINDINGS TEST note 13:27 / DEV answer 13:52): a decode sequence's attention
+ * path is its rows' own, not its verify block's. Up to att_bi 6 a q-row block from ctx_len c takes the dense path while
+ * bound(c) + q <= qsa_exact_to (2,051 here as in the model: a q = 5 block from c <= 1,024) and the sparse one from c = 1,025, so
+ * position 1,025 is computed dense in a block from 1,023 and sparse in a block from 1,025 -- the KOW cell's A (blocks ... 1,020,
+ * 1,023) vs R (... 1,024, 1,025), token 105 apart. The probe = one decode sequence (rows [0, q), sequence 0) at c in {40, 1,000,
+ * 1,020, 1,023, 1,024, 1,025, 1,500, 3,000} with q in {5, 4, 3, 2}, alone, beside a 172,924-token decode sequence and beside a
+ * 300-token one (both at the probe's q); the path read = the op over the probe's rows in the first full-attention layer. att_bi 7:
+ * one op in every cell (the pinned sparse launch, = the 3,000-token alone cell's under 6 too); att_bi 6 = the negative control:
+ * the blocks from 1,023 and 1,025 (q = 5) take different ops alone and beside the long sequence (the defect). A streamed group
+ * (kvs_bi 3): a STAGED MIXED pass whose reach is dense (the probe at 1,000 + a 24-row prompt) reads the probe's rows on the
+ * pinned op under 7 (= its ring-bound alone step's) and on the dense path under 6. */
+TEST(dsp_a_decode_rows_attention_path_does_not_follow_its_verify_blocks_start) {
+    auto& abf = rad::arch::fn4_attbi_flag();
+    auto& kbf = rad::arch::fn4_kvsbi_flag();
+    const int ab0 = abf.load(), kb0 = kbf.load();
+    setenv("RADIANCE_FN4_BIDEC", "1", 1);   /* declares op_attn_bi / op_attn_gq_bi / op_attn_gq_pin, as the hero's X3DUAL */
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 4; c.max_spec = 4; c.max_ctx = 200000;
+    RadBuilder b;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    unsetenv("RADIANCE_FN4_BIDEC");
+    int64_t blocks = 0, bbytes = 0, pitch = 0;
+    resolve_geom(b, &blocks, &bbytes, &pitch);
+    REQUIRE(blocks > 8);
+    /* the core's batch: ctx_lens / positions / seqused as built, max_ctx_len = bound_bucket(the longest ctx_len, 1024) */
+    auto set_ctx = [&](Kit& k, const std::vector<int32_t>& cx) {
+        int64_t r = 0;
+        int32_t mx = 0;
+        for (size_t s = 0; s < cx.size(); ++s) {
+            const int32_t q = k.qlen[s];
+            k.ctxl[s] = cx[s];
+            for (int i = 0; i < q; ++i) k.pos[(size_t)(r + i)] = cx[s] + i;
+            k.used[s] = cx[s] + q;
+            r += q;
+            mx = std::max(mx, cx[s]);
+        }
+        k.b.max_ctx_len = (int32_t)rad::arch::fn4_alone_ctx_bound(mx, c.max_ctx);
+        for (RadKVGroupBatch& g : k.kv) g.seqused_h = k.used.data();
+        k.b.positions_h = k.pos.data();
+    };
+    /* the op over rows [0, ..) in the first full-attention layer: name, the block table or the selection, the op */
+    auto path_of = [&](const RadCtx& ctx) -> std::string {
+        int64_t best = INT64_MAX;
+        std::string p;
+        for (const RecIssue& is : ctx.issues) {
+            const RecOp* o = b.op_of(is.op);
+            if (!o || (o->op != "attn_paged" && o->op != "attn_paged_pin" && o->op != "attn_paged_gate_quant")) continue;
+            if (is.opd.size() < 3 || is.opd[0].offset != 0 || is.opd[1].kind != RAD_OPK_KV) continue;
+            const int64_t layer = is.opd[1].offset;
+            if (layer >= best) continue;
+            best = layer;
+            p = o->op + (is.opd[2].kind == RAD_OPK_RAW ? "/table#" : "/sel#") + std::to_string((long long)is.op);
+        }
+        return p;
+    };
+    auto probe = [&](int ab, int32_t pc, int q, int32_t other) -> std::string {
+        abf.store(ab);
+        kbf.store(0);
+        auto k = kit(b, other >= 0 ? std::vector<int>{ q, q } : std::vector<int>{ q }, {});
+        set_ctx(*k, other >= 0 ? std::vector<int32_t>{ pc, other } : std::vector<int32_t>{ pc });
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k->b;
+        qwen4exp_fp8::step(&ctx, &k->b);
+        CHECK(ctx.step_fail.empty());
+        return path_of(ctx);
+    };
+    const std::string pin = probe(6, 3000, 5, -1);   /* today's sparse alone step: the pinned launch (lone6) */
+    CHECK(pin.find("attn_paged_gate_quant/sel#") == 0);
+    int cells = 0, same = 0;
+    for (int32_t pc : { 40, 1000, 1020, 1023, 1024, 1025, 1500, 3000 })
+        for (int q : { 5, 4, 3, 2 })
+            for (int32_t other : { -1, 172924, 300 }) {
+                const std::string p7 = probe(7, pc, q, other);
+                ++cells;
+                if (p7 == pin) ++same;
+                else fprintf(stderr, "    att_bi 7: probe at %d, %d rows, beside %d: %s (pinned %s)\n", pc, q, other, p7.c_str(),
+                             pin.c_str());
+            }
+    fprintf(stderr, "    att_bi 7: %d / %d cells on the pinned sparse launch\n", same, cells);
+    CHECK_EQ(same, cells);
+    /* the negative control (att_bi 6 = the defect): position 1,025's path follows its block's start */
+    const std::string a1023 = probe(6, 1023, 5, -1), a1025 = probe(6, 1025, 5, -1);
+    const std::string l1023 = probe(6, 1023, 5, 172924), l1025 = probe(6, 1025, 5, 172924);
+    fprintf(stderr, "    att_bi 6: alone 1,023 %s / 1,025 %s; beside 172,924: 1,023 %s / 1,025 %s\n", a1023.c_str(), a1025.c_str(),
+            l1023.c_str(), l1025.c_str());
+    CHECK(a1023 != a1025);
+    CHECK(l1023 != l1025);
+    CHECK(a1025 == pin);
+
+    /* a streamed group (kvs_bi 3): the staged MIXED pass with a dense reach vs the probe's ring-bound alone step */
+    auto streamed = [&](int ab, bool mixed) -> std::string {
+        abf.store(ab);
+        kbf.store(3);
+        auto k = mixed ? kit(b, { 5 }, { 24 }, 0) : kit(b, { 5 }, {});
+        set_ctx(*k, mixed ? std::vector<int32_t>{ 1000, 0 } : std::vector<int32_t>{ 1000 });
+        StreamRig rig;
+        attach_stream(b, *k, rig, blocks, bbytes);
+        rig.st.slots = blocks / 4;                                   /* a ring smaller than the id space */
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k->b;
+        ctx.stage_on = mixed;                                        /* the MIXED pass staged, the alone step ring-bound */
+        ctx.stage_ret = 2;
+        qwen4exp_fp8::step(&ctx, &k->b);
+        CHECK(ctx.step_fail.empty());
+        return path_of(ctx);
+    };
+    const std::string r6 = streamed(6, false), r7 = streamed(7, false), m6 = streamed(6, true), m7 = streamed(7, true);
+    fprintf(stderr, "    kvs_bi 3: ring-bound alone %s (6) / %s (7); staged dense MIXED %s (6) / %s (7)\n", r6.c_str(),
+            r7.c_str(), m6.c_str(), m7.c_str());
+    CHECK(r6 == r7);
+    CHECK(m7 == r7);                                                 /* 7: the staged pass reads the probe as alone */
+    CHECK(m6 != r6);                                                 /* 6: the corner (dense on the stage) */
+    CHECK(m6.find("/table#") != std::string::npos);
+    abf.store(ab0);
+    kbf.store(kb0);
+}
+
 TEST(qsa_below_the_exact_bound_takes_the_dense_path_without_a_resolve) {
     RadModelMeta meta = qwen4exp_meta();
     RadBuildCtx c = build_ctx(0, 1);
