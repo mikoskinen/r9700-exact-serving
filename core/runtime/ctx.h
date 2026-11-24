@@ -198,6 +198,13 @@ struct KVPoolBinding {
     /* The ranges of a layer's mirror row a staged pass copies (kvstream/stage.h, "Volume"), set
      * each step. Empty copies the whole row. */
     std::vector<KVStageRun> stage_runs;
+    /* Qwen loop Form A step (1), lever RIDE (RADIANCE_FN4_KVS_RIDE=1 with kvs_apart): the step's ranges in full
+     * (stage_runs_full: every sequence's tables) and for a trunk MIXED pass whose decode rows ride the ring
+     * (stage_runs_ride: the prefill sequences' tables only); kvstream_enter makes one of them stage_runs for each pass and
+     * sets `ride` for a pass whose decode rows attend on the ring (rad_kv_stage_layer then answers 3). */
+    std::vector<KVStageRun> stage_runs_full, stage_runs_ride;
+    bool        has_ride_runs = false;
+    bool        ride = false;
 };
 
 /* The KV stage's driver (kvstream/stage.cpp), declared here for Ctx::tape_kv_stage. */

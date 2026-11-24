@@ -16,6 +16,7 @@
 #include "device/device.h"
 #include "format/radfile.h"
 #include "gen_config.h"
+#include "kvstream/plan.h"
 #include "kvstream/stage.h"
 #include "sample/accept.h"
 #include "sched/scheduler.h"
@@ -1019,8 +1020,10 @@ int Engine::prepare_release(const RadBatch* b, bool switches) {
     /* The stage's ranges for every rank (kvstream/stage.h, "Volume"): the blocks the step's own
      * tables name. Rank 0's allocator hands out the block ids every rank uses, and the ranks are
      * parked, so no allocation races the read. */
-    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_);
-    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_);
+    /* lever RIDE (RADIANCE_FN4_KVS_RIDE): a trunk MIXED step also gets the prefill sequences' ranges (kvstream_ride_step) */
+    const bool ride = kvstream_ride_step(b);
+    kvstream_step_runs(ranks_[0]->kv, b, lsched().step_seqs(b), &stage_runs_, ride ? &ride_runs_ : nullptr);
+    for (auto& rk : ranks_) kvstream_bound_live(&rk->ctx, stage_runs_, ride ? &ride_runs_ : nullptr);
     return RAD_OK;
 }
 
@@ -3457,6 +3460,15 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
                  "overlay of those snapshots and a hit resuming one of them adopts it; no snapshot is retired for it, nothing "
                  "is compared; overlays capped at %s %% of the cached pool's entries",
                  pe && *pe ? pe : "10");
+    }
+    if (const char* re = std::getenv("RADIANCE_FN4_KVS_RIDE"); re && *re && *re != '0') {
+        if (kvstream_ride())
+            RAD_INFO("kv streaming: RADIANCE_FN4_KVS_RIDE=1 (Qwen loop round 56, Form A step (1), lever RIDE) -- a trunk MIXED "
+                     "pass stages only its prefill sequences' blocks; its decode rows resolve and attend on the ring (needs "
+                     "fn4 att_bi >= 1: a riding pass the plugin cannot serve so fails its step)");
+        else
+            RAD_WARN("kv streaming: RADIANCE_FN4_KVS_RIDE=1 needs RADIANCE_FN4_KVS_APART=1 (the ring must stay valid in a "
+                     "staged pass): inert");
     }
     if (const int ex = ranks_[0]->prefix.exact())
         RAD_INFO("prefix cache: RADIANCE_PREFIX_EXACT=%d (Qwen loop round 56)%s%s", ex,

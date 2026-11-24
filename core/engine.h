@@ -137,6 +137,7 @@ private:
     /* Per KV group, the ranges a staged pass of the next step copies (kvstream_step_runs), refilled
      * in place each step. */
     std::vector<std::vector<KVStageRun>> stage_runs_;
+    std::vector<std::vector<KVStageRun>> ride_runs_;   /* lever RIDE: the prefill sequences' ranges of a riding step */
     /* The tiers' work in flight: the host-memory copies the transfer streams are running. */
     std::unique_ptr<TierPump> pump_;
     /* serve()'s startup stall watch, released when the server listens (run_server) or the KL

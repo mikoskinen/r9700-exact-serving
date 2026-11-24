@@ -2406,6 +2406,91 @@ TEST(a_staged_prefill_copies_each_layer_before_its_attention) {
  * `sel`. The selection is still produced, but a resolve there would be read by nothing: work on the
  * step path whose only other effect is on the residency map's epoch, in a configuration the design
  * says never sees the op. So the dense step must issue none. */
+/* qfn-on-ds round 56, Form A step (1) lever RIDE (RADIANCE_FN4_KVS_RIDE; core/kvstream/stage.cpp kvstream_ride_step): a trunk
+ * MIXED pass on a streamed group staged beside the ring whose stage holds only the prefill sequences' blocks
+ * (rad_kv_stage_layer answers 3). Two verify-depth decode sequences + one 24-row prefill chunk over 5,000 tokens: every
+ * attention launch over the decode rows takes the RING operand (cols -1) behind a kv_resolve of its rows, every launch over
+ * the prefill rows the stage (no resolve); the control (answer 2 = today's staged MIXED pass beside the ring) reads every row
+ * on the stage and resolves nothing; a riding pass that cannot take the per-sequence launches (att_bi 0) fails the step
+ * (fail closed: its decode rows have no staged blocks). */
+TEST(ride_a_mixed_pass_attends_its_decode_rows_on_the_ring_and_its_prefill_rows_on_the_stage) {
+    auto& abf = rad::arch::fn4_attbi_flag();
+    auto& kbf = rad::arch::fn4_kvsbi_flag();
+    const int ab0 = abf.load(), kb0 = kbf.load();
+    for (int arm : { 2, 3, 0 }) {
+        abf.store(arm == 0 ? 0 : 6);
+        kbf.store(3);
+        RadModelMeta meta = qwen4exp_meta();
+        RadBuildCtx c = build_ctx(0, 1);
+        c.max_tok = 64; c.max_seqs = 4; c.max_spec = 3; c.max_ctx = 200000;
+        RadBuilder b;
+        REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+        int64_t blocks = 0, bbytes = 0, pitch = 0;
+        resolve_geom(b, &blocks, &bbytes, &pitch);
+        REQUIRE(blocks > 8);
+        auto k = kit(b, { 4, 4 }, { 24 }, 5000);
+        StreamRig rig;
+        attach_stream(b, *k, rig, blocks, bbytes);
+        rig.st.slots = blocks / 4;                                   /* a ring smaller than the id space */
+        int attn_gi = -1;
+        for (size_t gi = 0; gi < b.kv_groups.size(); ++gi) {
+            k->kv[gi].seqused_h = k->used.data();
+            if (b.kv_groups[gi].name.find("kv_attn") != std::string::npos) attn_gi = (int)gi;
+        }
+        REQUIRE(attn_gi >= 0);
+        k->b.positions_h = k->pos.data();
+        RadCtx ctx;
+        ctx.b = &b;
+        ctx.batch = &k->b;
+        ctx.stage_on = true;
+        ctx.stage_ret = arm == 2 ? 2 : 3;
+        qwen4exp_fp8::step(&ctx, &k->b);
+        if (arm == 0) {
+            CHECK(ctx.step_fail.find("lever RIDE") != std::string::npos);
+            continue;
+        }
+        CHECK(ctx.step_fail.empty());
+        int ring = 0, stage = 0, resolves = 0, unresolved_ring = 0, order_bad = 0;
+        bool resolved_since = false;
+        int64_t max_ring_q = -1;
+        for (size_t i = 0; i < ctx.issues.size(); ++i) {
+            const RecOp* o = b.op_of(ctx.issues[i].op);
+            if (!o) continue;
+            if (o->op == "kv_resolve") { ++resolves; resolved_since = true; continue; }
+            if (o->op == "kv_store" || o->op == "kv_store_streamed" || o->op == "qk_norm_rope_gate_kv_store_streamed")
+                continue;
+            for (const RadOperand& d : ctx.issues[i].opd) {
+                if (d.kind != RAD_OPK_KV || (int)d.handle != attn_gi + 1) continue;
+                if (d.cols == -1) {
+                    ++ring;
+                    if (!resolved_since) ++unresolved_ring;
+                    resolved_since = false;
+                    max_ring_q = std::max(max_ring_q, ctx.issues[i].opd[0].offset);
+                } else {
+                    ++stage;
+                    /* a prefill row's launch starts past every decode row */
+                    if (ctx.issues[i].opd[0].offset <= max_ring_q) ++order_bad;
+                }
+                break;
+            }
+        }
+        fprintf(stderr, "    stage answer %d: attention launches on the ring %d, on the stage %d, kv_resolve %d\n",
+                ctx.stage_ret, ring, stage, resolves);
+        CHECK(stage > 0);
+        if (arm == 2) {
+            CHECK_EQ(ring, 0);                                       /* today: every row on the stage */
+            CHECK_EQ(resolves, 0);
+        } else {
+            CHECK(ring > 0);
+            CHECK_EQ(unresolved_ring, 0);                            /* each ring launch behind its rows' resolve */
+            CHECK_EQ(resolves, ring);
+            CHECK_EQ(order_bad, 0);
+        }
+    }
+    abf.store(ab0);
+    kbf.store(kb0);
+}
+
 TEST(qsa_below_the_exact_bound_takes_the_dense_path_without_a_resolve) {
     RadModelMeta meta = qwen4exp_meta();
     RadBuildCtx c = build_ctx(0, 1);

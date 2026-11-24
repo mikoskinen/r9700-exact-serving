@@ -2078,6 +2078,46 @@ TEST(the_stage_ranges_leave_out_blocks_no_table_of_the_step_names) {
  * same table is the host mirror's row (`rad_kv_layer_index`, arch/common/rad_arch.h:1028-1032), so
  * mapping every layer to 0 collapses the mirror; and bind_kv_pools derives the table from each
  * layer's position in the group, so an aliased table cannot come from it. */
+/* qfn-on-ds round 56, Form A step (1) lever RIDE: which steps ride (core/kvstream/stage.cpp kvstream_ride_step) -- a trunk MIXED
+ * step with decode rows of one depth beside a prefill chunk, exactly one streamed group, the switch on; never a draft pass, a
+ * decode or prefill step, decode rows of mixed depths (the plugin's per-sequence launches take one depth), a step with two
+ * streamed groups (the other group's readers do not ride), or with the switch off. And the ranges the riding pass stages are
+ * the prefill sequences' (kvstream_runs over those tables only). */
+TEST(ride_takes_only_a_trunk_mixed_step_with_one_streamed_group) {
+    RadKVStream st{};
+    RadKVGroupBatch kg[2]{};
+    kg[0].stream = &st;
+    RadBatch b{};
+    b.kv = kg;
+    b.n_kv_groups = 2;
+    b.phase = RAD_PHASE_MIXED;
+    b.n_seq = 3; b.n_seq_decode = 2; b.n_tok_decode = 8; b.max_q_len_decode = 4; b.n_spec = 3;
+    b.n_tok = 8 + 512;
+    rad::kvstream_ride_test().store(1);
+    CHECK(rad::kvstream_ride_step(&b));
+    rad::kvstream_ride_test().store(0);
+    CHECK(!rad::kvstream_ride_step(&b));                             /* switch off */
+    rad::kvstream_ride_test().store(1);
+    b.draft_pass = -1;  CHECK(!rad::kvstream_ride_step(&b)); b.draft_pass = 0;
+    b.n_tok_decode = 7; CHECK(!rad::kvstream_ride_step(&b)); b.n_tok_decode = 8;   /* mixed depths */
+    kg[1].stream = &st; CHECK(!rad::kvstream_ride_step(&b)); kg[1].stream = nullptr;
+    b.phase = RAD_PHASE_DECODE; CHECK(!rad::kvstream_ride_step(&b));
+    b.phase = RAD_PHASE_PREFILL; CHECK(!rad::kvstream_ride_step(&b));
+    b.phase = RAD_PHASE_MIXED;
+    b.n_seq_decode = 3; CHECK(!rad::kvstream_ride_step(&b)); b.n_seq_decode = 2;   /* no prefill sequence */
+    CHECK(rad::kvstream_ride_step(&b));
+    rad::kvstream_ride_test().store(-1);
+    /* the riding pass's ranges: the prefill table's only */
+    const std::vector<int32_t> d0 = { 0, 1, 2 }, d1 = { 100, 101 }, p0 = { 400, 401, 402, 403 };
+    std::vector<rad::KVStageRun> all, ride;
+    rad::kvstream_runs({ &d0, &d1, &p0 }, 1024, &all);
+    rad::kvstream_runs({ &p0 }, 1024, &ride);
+    REQUIRE_EQ((int)ride.size(), 1);
+    CHECK_EQ(ride[0].off, 400 * 1024ll);
+    CHECK_EQ(ride[0].bytes, 4 * 1024ll);
+    CHECK_EQ((int)all.size(), 3);
+}
+
 TEST(a_streamed_groups_layers_may_all_alias_one_pool_slot) {
     const int64_t n_blocks = 8, heads = 2, block = 4, hd = 4;
     const int64_t lbpb = heads * block * 2 * hd;   /* one block of ONE layer */

@@ -177,6 +177,8 @@ struct RadCtx {
     /* The prefill-stage test: a stage call is recorded at the current issue index so the test can
      * assert it sits between the layer's store and its attention. */
     bool                  stage_on = false;
+    /* what rad_kv_stage_layer answers on a staged layer: 1 staged, 2 beside the ring (kvs_apart), 3 a riding pass (lever RIDE) */
+    int                   stage_ret = 1;
     int                   stage_last = -1;
     std::vector<StageRec> stages;
     /* kv_stage_next: after which issue index the next layer's copy was handed over. */
@@ -512,10 +514,10 @@ extern "C" int rad_kv_layer_index(RadCtx* c, rad_kvgroup g, int layer) {
 extern "C" int rad_kv_stage_layer(RadCtx* c, rad_kvgroup g, const RadKVGroupBatch* kvb, int layer) {
     (void)g;
     if (!c || !kvb || !kvb->stream || !c->stage_on) return 0;
-    if (layer == c->stage_last) return 1;
+    if (layer == c->stage_last) return c->stage_ret;
     c->stage_last = layer;
     c->stages.push_back(StageRec{ c->issues.size(), layer });
-    return 1;
+    return c->stage_ret;
 }
 /* The next layer's copy is handed to the DMA engine after this layer's attention. */
 extern "C" int rad_kv_stage_next(RadCtx* c, rad_kvgroup g, int layer) {

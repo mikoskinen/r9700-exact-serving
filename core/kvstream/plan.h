@@ -13,6 +13,7 @@
  * sized for the whole cache and streaming frees nothing.
  */
 #pragma once
+#include <atomic>
 #include "mem/kv.h"
 
 #include <cstdlib>
@@ -28,6 +29,21 @@ namespace rad {
 inline bool kvstream_stage_apart() {
     static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_KVS_APART"); return e && *e && *e != '0'; }();
     return on;
+}
+
+/* Qwen loop Form A step (1), lever RIDE (24.11.2026; RADIANCE_FN4_KVS_RIDE=1 at start, with kvs_apart; unset = today): a
+ * trunk MIXED pass (decode rows + a prefill piece, staged) stages only the PREFILL sequences' blocks, and its decode rows
+ * resolve their selection on the ring and attend on the ring operand (valid in a staged pass only beside an apart stage).
+ * Only for a step in which exactly one KV group streams (the plugin's attention is the ring's one consumer); every other
+ * pass (the MTP head's history pass, drafts, prefill-only) stages as today. */
+inline std::atomic<int>& kvstream_ride_test() {   /* tests: 0 / 1 in place of the environment, -1 = the environment */
+    static std::atomic<int> v{-1};
+    return v;
+}
+inline bool kvstream_ride() {
+    if (const int t = kvstream_ride_test().load(std::memory_order_relaxed); t >= 0) return t != 0;
+    static const bool on = [] { const char* e = std::getenv("RADIANCE_FN4_KVS_RIDE"); return e && *e && *e != '0'; }();
+    return on && kvstream_stage_apart();
 }
 
 /* Bytes of the ring view: `slots` blocks, every layer. Inline so that a caller that only lays out a
