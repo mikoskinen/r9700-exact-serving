@@ -4089,6 +4089,7 @@ const RadBatch* Scheduler::step() {
      * step a chunk (the stall a per-sequence K pin would save). */
     int32_t bi_lone_slot = -1;
     bool bi_lone_admit = false;
+    bool bi5_turn = false;   /* lever TLR: this step is BI5's decode rows' turn */
     srb_wslot_ = -1;   /* lever SRB: this step's choice only (a step under another chunking, or after a POST, carries none) */
     if (bi_chunk_ == 5) {
         bool any_dec = false;
@@ -4111,6 +4112,7 @@ const RadBatch* Scheduler::step() {
             hold_prefill = true;            /* the decode rows' turn: no prefill, no admission */
             bi_lone_slot = -1;
             bi_lone_last_ = false;
+            bi5_turn = true;
         } else if (bi_lone_slot >= 0 || admit_possible) {
             bi_lone_admit = bi_lone_slot < 0;
             bi_lone_last_ = any_dec;
@@ -4208,6 +4210,11 @@ const RadBatch* Scheduler::step() {
         gate_tokens_ = (double)gate_rows_;
     }
 
+    /* qfn-on-ds lever TLR (fn4 sched_bi_ride, Qwen loop round 60, QUEUE Q120): in BI5's decode rows' turn, one running prompt
+     * whose alone piece is its LAST piece of at most N rows rides the turn (below, at the held-prefill branch) */
+    const int64_t tlr_rows = bi5_turn && !lanes_ ? (int64_t)fn4::sched_bi_ride() : 0;
+    bool tlr_used = false;
+
     /* ---------------------------------------------------------- running requests first */
     /* Continuous batching: requests already holding blocks are served before new ones are
      * admitted, so new work never preempts work half done. */
@@ -4261,7 +4268,48 @@ const RadBatch* Scheduler::step() {
             }
             else { bp = true; psk_ckpt(s, target, &ckpt); }   /* lever PSK design 2: a snapshot at a target only */
         }
+        /* lever TLR (fn4 sched_bi_ride): BI5's decode turn takes one prompt's LAST piece -- its alone piece exactly as its BI5
+         * lone step plans it (the span that step sets, the lone budget, plan_chunk's snapshot row; no lever PSK there either) --
+         * where it is at most N rows, fits the step's budget beside every decoder still to plan, and its blocks come without
+         * another sequence's. A fresh prompt only (no output to replay, no kept request, no replay end inside). Non-last
+         * pieces never ride: the step then carries the piece's rows as its lone step would and the decode rows as their own. */
+        bool tlr = false;
+        if (tlr_rows > 0 && prefill && hold_prefill && !bp && !tlr_used && s.keep_whole < 0 && r.output.empty() &&
+            target == (int64_t)r.prompt.size() && r.n_computed < (int64_t)r.prompt.size() && r.cr_end <= r.n_computed) {
+            const bool keep = span_now_;
+            span_now_ = cfg_.prefill_span > 1 && (span_min_ == 0 || (int64_t)r.prompt.size() >= span_min_);
+            int64_t ck = -1;
+            const int64_t full = plan_chunk(r.n_computed, chunk_end(r, target), span_now_ ? cfg_.max_tok : geo_.shared_tok,
+                                            &ck, r.checkpoint_at, &r);
+            span_now_ = keep;
+            if (full > 0 && r.n_computed + full >= (int64_t)r.prompt.size()) {
+                int64_t dec_rows = 0;   /* the decoders behind it in the walk, each 1 + its deepest window */
+                for (size_t j = i + 1; j < running_.size(); ++j) {
+                    const SchedReq& q = *reqs_[(size_t)running_[j]];
+                    if (!q.req || !q.running) continue;
+                    const Request& qr = *q.req;
+                    if (qr.n_computed < (int64_t)qr.prompt.size() || qr.n_computed + 1 < q.seq_len()) continue;
+                    dec_rows += dec_row_tok;
+                }
+                if (full <= tlr_rows && full + dec_rows <= budget && kv_->can_grow(r.id, r.n_computed + full + dec_rows)) {
+                    want = full;
+                    ckpt = ck;
+                    tlr = true;
+                    tlr_used = true;
+                    ++tlr_n_[0];
+                } else {
+                    ++tlr_n_[1];
+                }
+                if (tlr_n_[0] + tlr_n_[1] - tlr_logged_ >= 2000 || tlr_n_[0] == 1) {
+                    tlr_logged_ = tlr_n_[0] + tlr_n_[1];
+                    RAD_INFO("fn4 sched_bi_ride %lld (Qwen loop lever TLR): %lld prompts' last pieces rode BI5's decode turn, %lld "
+                             "left to their lone step (over N rows, no room beside the decoders, or blocks)", (long long)tlr_rows,
+                             (long long)tlr_n_[0], (long long)tlr_n_[1]);
+                }
+            }
+        }
         if (bp) {
+        } else if (tlr) {
         } else if (prefill && hold_prefill) { ++held_prefill_; ++i; continue; }
         /* fn4 BI chunking 5 / 6 (the Qwen line): a lone step holds its one prefill, nothing else */
         else if ((bi_chunk_ == 5 || bi6_lone) && (bi_lone_admit || (bi_lone_slot >= 0 && slot != bi_lone_slot))) { ++i; continue; }

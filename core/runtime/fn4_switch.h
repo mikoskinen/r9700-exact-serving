@@ -997,6 +997,14 @@
  *                   waited -- agx21 105 runs, 6,804 one-sequence steps, 82 s), 1 plans the next step in full instead of issuing
  *                   it ahead. Which steps carry which rows changes, never a row's arithmetic. 0 today, 1 on
  *                                                                                                  RADIANCE_SCHED_AHEAD_ALL
+ *   sched_bi_ride   scheduler (qfn-on-ds lever TLR, Qwen loop round 60, QUEUE Q120): under BI chunking 5 every prefill piece takes
+ *                   a lone step and the decode rows the step after it; with N > 0 a running prompt whose alone piece (the piece
+ *                   its BI5 lone step would plan: position, rows, snapshot row) is the prompt's LAST piece and at most N rows
+ *                   rides the decode rows' turn instead -- one such piece a turn, where it fits the step's budget beside every
+ *                   decoder still to plan and its blocks without taking another sequence's. The piece is its alone piece and the
+ *                   decode rows are their decode rows (a MIXED step; on a streamed form with lever RIDE, RADIANCE_FN4_KVS_RIDE=1,
+ *                   the riders stay on the ring -- without it the step stages every sequence). Non-last pieces never ride (FINDINGS
+ *                   DEV answer 10:30: RIDE beside non-last pieces is not exact yet). 0 today, N = rows        RADIANCE_SCHED_BI_RIDE
  *
  * Start-time only (not switches): RADIANCE_FN4_HC_SS=1 (qwen4exp declares the hc_write -> hc_read scale buffer),
  * RADIANCE_FN4_CHAIN=1 (qwen4exp's probe says chained launches pay, so the core turns them on at bring-up).
@@ -1059,6 +1067,7 @@ enum Switch { kDraftAdaptive = 0, kGgGemv, kAqlAcq, kDs41Argather, kDs41ShexpLan
               kKvsFix,   /* qfn-on-ds lever KVX (Qwen loop round 54, Q105): libr4d, kv_resolve's passes over every ring slot cut to one */
               kSchedBiSrpt,   /* qfn-on-ds lever SRB (Qwen loop round 58, Q113): the scheduler, BI5's lone step by fewest rows left */
               kSchedAheadAll, /* qfn-on-ds lever AHA (Qwen loop round 59, Q119): the scheduler, no step issued ahead that leaves a decoder out */
+              kSchedBiRide,   /* qfn-on-ds lever TLR (Qwen loop round 60, Q120): the scheduler, a prompt's last piece rides BI5's decode turn */
               kSwitches };
 static constexpr int kQwenFirst = kNoRoute;
 /* The switches the scheduler owns: apply_pending hands their new values over, and the scheduler reports what it
@@ -1084,6 +1093,7 @@ int  aql_chi();                               /* lever CHI: chained records play
 int  draft_uni();                             /* Q33: one draft depth a step (cap_rows' cut at every start) */
 int  sched_bi_srpt();                         /* lever SRB (round 58): 0 off, 1 fewest rows left first, N >= 2 + an N-ms age bound */
 int  sched_ahead_all();                       /* lever AHA (round 59): 1 = a step that would leave a decoder out is planned in full */
+int  sched_bi_ride();                         /* lever TLR (round 60): N > 0 = a prompt's last piece of at most N rows rides BI5's decode turn */
 /* Whether switch i is one of the Qwen line's (kQwenFirst on). */
 inline bool qwen_switch(int i) { return i >= kQwenFirst && i < kSwitches; }
 /* Lever RCO (ds41-launch): the route_copy_ov switch once set, else RADIANCE_AQL_ROUTE_OV (1 = on) at start; read by

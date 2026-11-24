@@ -1060,6 +1060,10 @@ private:
     bool          ahead_leaves_out() const;
     mutable std::vector<char> aha_mark_;
     int64_t       aha_n_ = 0;
+    /* lever TLR (fn4 sched_bi_ride, Qwen loop round 60, Q120): BI5 decode turns a prompt's last piece rode (tlr_n_[0]),
+     * last pieces the turn saw but left to a lone step (over N rows, no room beside the decoders, blocks) ([1]) */
+    int64_t       tlr_n_[2] = {0, 0};
+    int64_t       tlr_logged_ = 0;
     bool          keep_possible();
     int           rejoin_kept(SchedReq& s);
     void          unkeep(SchedReq& s);
@@ -1068,6 +1072,8 @@ public:
     const int64_t* preempt_keep_counts() const { return pk_n_; }
     const int64_t* keep_reclaim_counts() const { return kr_n_; }
     int64_t ahead_all_count() const { return aha_n_; }
+    /* lever TLR: [0] last pieces that rode a BI5 decode turn, [1] last pieces a turn left to their lone step */
+    int64_t tail_ride_count(int k) const { return k == 0 || k == 1 ? tlr_n_[k] : 0; }
 private:
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK

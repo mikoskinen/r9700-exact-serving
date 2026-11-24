@@ -866,6 +866,115 @@ TEST(qwen_round59_aha_no_step_issued_ahead_leaves_a_decoder_out_after_a_lone_ste
         }
 }
 
+/* Qwen loop round 60 lever TLR (fn4 sched_bi_ride, QUEUE Q120): under BI chunking 5 every prefill piece takes a lone step and the
+ * decode rows the step after it; with sched_bi_ride N a prompt's LAST piece of at most N rows rides the decode rows' turn instead
+ * (agx23: 416 lone pieces of <= 2,047 rows a window at 91-241 ms each, ~70 ms of it fixed at ~64k of history, each followed by
+ * a decode step). The piece is its alone piece (position, rows, snapshot row = an idle engine's), non-last pieces never ride,
+ * one ride a turn. Arms: 0 = today (every piece lone, nothing mixed); N = the last piece's rows (it rides beside d's row, the
+ * others stay lone); N - 1 (NEGATIVE CONTROL: over N -> its lone step, counted as left); the same under arm TG256's grid 256 /
+ * inner 4; chunking 6 with the switch on = 6's own plan (the switch acts only in BI5's turn). */
+TEST(qwen_round60_tlr_a_prompts_last_piece_rides_bi5s_decode_turn) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    const int len = 868;   /* interval 256: alone's pieces end at 768, the last one is [768, 868) */
+    auto fixture = [&](Fixture& f) {
+        f.build();                        /* interval 256, budget 512 */
+        f.cfg.prefill_span = 2;
+        f.cfg.prefix_exact = true;
+        CHECK_OK(f.start());
+        f.sch.set_tail_inner_capable(true);
+        f.sch.set_tail_inner_pieces(true);
+    };
+    auto pieces_alone = [&]() {
+        Fixture f;
+        fixture(f);
+        const uint64_t a = f.submit(len, 2);
+        std::vector<int32_t> pc;
+        for (int k = 0; k < 40 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e)
+                if (e.seq == a && e.is_prefill) { pc.push_back(e.ctx_len); pc.push_back(e.n_tokens); pc.push_back(e.ckpt_tok); }
+            f.commit_plain();
+        }
+        return pc;
+    };
+    struct Out { std::vector<int32_t> got; int mixed = 0, mixed_last = 0, mixed_other = 0, lone = 0; int64_t rode = 0, left = 0; };
+    auto run = [&](int bic, int ride) {
+        CHECK(rad::fn4::request("sched_bi_chunk", bic, &err));
+        CHECK(rad::fn4::request("sched_bi_ride", ride, &err));
+        rad::fn4::apply_pending(0, da);
+        CHECK_EQ(rad::fn4::sched_bi_ride(), ride);
+        Out o;
+        Fixture f;
+        fixture(f);
+        auto rd = f.request(100, 300);
+        for (int i = 0; i < 100; ++i) rd->prompt[(size_t)i] = 30000 + i;   /* no prefix shared with `a` */
+        rd->ignore_eos = true;
+        const uint64_t d = f.add(std::move(rd));
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();      /* d decodes */
+        const uint64_t a = f.submit(len, 2);
+        for (int k = 0; k < 60 && f.sch.step(); ++k) {
+            const StepPlan& p = f.sch.plan();
+            bool has_d = false;
+            const StepEntry* pa = nullptr;
+            for (const StepEntry& e : p.e) {
+                if (e.seq == d && !e.is_prefill) has_d = true;
+                if (e.seq == a && e.is_prefill) pa = &e;
+            }
+            if (pa) {
+                o.got.push_back(pa->ctx_len); o.got.push_back(pa->n_tokens); o.got.push_back(pa->ckpt_tok);
+                if (has_d) {
+                    ++o.mixed;
+                    if (pa->ctx_len + pa->n_tokens == len) ++o.mixed_last; else ++o.mixed_other;
+                } else if (p.e.size() == 1) {
+                    ++o.lone;
+                }
+            }
+            f.commit_plain();
+        }
+        o.rode = f.sch.tail_ride_count(0);
+        o.left = f.sch.tail_ride_count(1);
+        CHECK(rad::fn4::request("sched_bi_ride", 0, &err));
+        CHECK(rad::fn4::request("sched_bi_chunk", 0, &err));
+        rad::fn4::apply_pending(1, da);
+        return o;
+    };
+    for (const int gt : { 0, 256 * 1000 + 4 }) {
+        CHECK(rad::fn4::request("resume_cold", gt ? 2 : 0, &err));
+        CHECK(rad::fn4::request("sched_tail_grid", gt / 1000, &err));
+        CHECK(rad::fn4::request("sched_tail_inner", gt % 1000, &err));
+        rad::fn4::apply_pending(0, da);
+        const std::vector<int32_t> ref = pieces_alone();
+        REQUIRE(ref.size() >= 6);                         /* two pieces or more: (position, rows, snapshot row) each */
+        const int32_t last_rows = ref[ref.size() - 2];
+        CHECK_EQ(ref[ref.size() - 3] + last_rows, len);  /* the last piece ends at the prompt's end */
+        CHECK(last_rows > 1 && last_rows < 200);          /* it fits the shared budget (256) beside d's row */
+        const Out off = run(5, 0);
+        CHECK(off.got == ref);                            /* today: alone's pieces ... */
+        CHECK_EQ(off.mixed, 0);                           /* ... each in a lone step */
+        CHECK_EQ(off.rode, (int64_t)0);
+        const Out on = run(5, last_rows);
+        CHECK(on.got == ref);                             /* the same pieces (positions, rows, snapshot rows) */
+        CHECK_EQ(on.mixed_last, 1);                       /* the last one beside d's decode row */
+        CHECK_EQ(on.mixed_other, 0);                      /* a non-last piece never rides */
+        CHECK_EQ(on.lone, (int)ref.size() / 3 - 1);       /* the others in lone steps */
+        CHECK_EQ(on.rode, (int64_t)1);
+        const Out neg = run(5, last_rows - 1);            /* NEGATIVE CONTROL: one row short of the piece */
+        CHECK(neg.got == ref);
+        CHECK_EQ(neg.mixed, 0);
+        CHECK_EQ(neg.rode, (int64_t)0);
+        CHECK(neg.left >= 1);
+        const Out six = run(6, last_rows);                /* chunking 6: its own plan, the switch never acts */
+        const Out six0 = run(6, 0);
+        CHECK(six.got == six0.got);
+        CHECK_EQ(six.mixed, six0.mixed);
+        CHECK_EQ(six.rode, (int64_t)0);
+    }
+    CHECK(rad::fn4::request("resume_cold", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_grid", 0, &err));
+    CHECK(rad::fn4::request("sched_tail_inner", 0, &err));
+    rad::fn4::apply_pending(1, da);
+}
+
 /* Qwen loop round 51 (AgentX c32 arm BI5, READY 'AGX ARMS addendum 2'): under BI chunking 5 no step carries a prefill piece
  * beside a decode row. With a streamed KV group a step that does is a staged pass (kvstream/bind.cpp kv_pass_view: n_tok >
  * decode rows) and kvstream_step_runs stages EVERY sequence's history one layer at a time from the host mirror -- agx4's
