@@ -1062,6 +1062,8 @@ TEST(srb_bi5_lone_step_goes_to_the_prompt_with_the_fewest_rows_left) {
         }
         int64_t c[Scheduler::kSrbN] = {};
         f.sch.srb_counts(c);
+        if (srpt == 1) CHECK_EQ(c[Scheduler::kSrbProbe], (int64_t)(2 + shorts));   /* d, L and every short probed once: a short on
+                                                   * a recycled slot carries no estimate of the short before it */
         return std::make_pair(l_during, c[Scheduler::kSrbAged]);
     };
     const auto s1 = starve(1), s40 = starve(40);
@@ -1137,6 +1139,39 @@ TEST(srb_bi5_lone_step_goes_to_the_prompt_with_the_fewest_rows_left) {
         CHECK(switched);
         CHECK(t_steps >= 0);                          /* T admitted under 6 */
         setsw("sched_bi_chunk", 5);
+    }
+    /* A recycled slot: A (a short) is admitted ahead and FINISHES, then B takes its slot -- B is probed for itself (the
+     * cache's probe count + 1), not ordered by A's estimate */
+    {
+        setsw("sched_bi_srpt", 1);
+        Fixture f;
+        fixture(f);
+        const uint64_t d = f.add([&] { auto r = distinct(f, 100, 600, 30000); r->ignore_eos = true; return r; }());
+        (void)d;
+        for (int k = 0; k < 3 && f.sch.step(); ++k) f.commit_plain();
+        const uint64_t l = f.add(distinct(f, 3000, 2, 20000));
+        uint64_t a = 0, b = 0;
+        int l_pieces = 0, b_first = -1;
+        int64_t p0 = -1;
+        for (int k = 0; k < 80 && f.sch.step(); ++k) {
+            for (const StepEntry& e : f.sch.plan().e) {
+                if (e.seq == l && e.is_prefill) ++l_pieces;
+                if (b && e.seq == b && e.is_prefill && b_first < 0) b_first = k;
+            }
+            f.commit_plain();
+            if (!a && l_pieces == 2) a = f.add(distinct(f, 300, 2, 50000));
+            if (a && !b) {
+                const Request* ra = f.sch.find(a);
+                if (ra && ra->state == ReqState::Finished) {   /* A finished: reaped, its slot is free for B */
+                    CHECK_OK(f.sch.reap(a));
+                    p0 = f.pc.probes;
+                    b = f.add(distinct(f, 300, 2, 45000));
+                }
+            }
+        }
+        CHECK(b != 0);
+        CHECK(b_first >= 0);
+        CHECK_EQ(f.pc.probes, p0 + 1);
     }
     setsw("sched_bi_srpt", 0);
     setsw("sched_bi_chunk", 0);

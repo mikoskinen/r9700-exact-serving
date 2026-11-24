@@ -882,6 +882,11 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     s.bypass_run = false;
     s.noa_starved = false;
     s.noa_displaced = false;
+    /* qfn-on-ds lever SRB: a recycled slot kept the previous request's estimate, refusal stamp and wait stamp -- a stale
+     * estimate would order this request by another's rows */
+    s.srb_est = -1;
+    s.srb_refused_us = 0;
+    s.srb_since_us = 0;
     s.req->state = ReqState::Waiting;
 
     /* The step path appends to `output`, so its capacity is settled here, on the arrival thread.
