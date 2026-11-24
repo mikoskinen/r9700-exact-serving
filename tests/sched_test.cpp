@@ -3297,6 +3297,100 @@ TEST(fn4_preempt_keep_rejoins_a_decoder_at_its_own_position) {
     rad::fn4::apply_pending(1, da);
 }
 
+/* Qwen loop round 59 (FINDINGS TEST note 08:20, QUEUE Q118; gpu02 kow30 stalled 7 min 54 s with 0 running / 2 waiting): two
+ * kept requests, S ahead of A, nothing running. The cache lost S's chain (its hit 0) and holds other entries, so the pool is
+ * one block short of S's rejoin; A's whole chain is cached and A fits. Before the fix the step's overdue reclaim stops at A
+ * (ANY overdue waiter fits) and the admission walk stops at S (the first one, overdue, no reclaim): no step, ever -- the
+ * negative control (RADIANCE_SCHED_KEEP_RECLAIM=0) asserts that stall. With the fix S's walk evicts the cache's LRU entries
+ * until it fits, falls back to a recompute (its chain is gone) and A rejoins at its own position behind it. */
+TEST(qwen_round59_an_overdue_kept_request_reclaims_and_the_kept_one_behind_it_rejoins) {
+    std::string err;
+    int da[rad::fn4::kSwitches];
+    for (const int fix : {0, 1}) {
+        CHECK(rad::fn4::request("preempt_keep", 1, &err));
+        rad::fn4::apply_pending(0, da);
+        if (!fix) setenv("RADIANCE_SCHED_KEEP_RECLAIM", "0", 1);
+        else unsetenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        Fixture f;
+        f.build(/*blocks=*/20, /*states=*/64);
+        f.cfg.preempt_wait_ms = 0;
+        CHECK_OK(f.start());
+        const uint64_t s3 = f.submit(80, 100, /*priority=*/0);
+        const uint64_t a = f.submit(32, 64, /*priority=*/0);
+        const uint64_t b = f.submit(112, 120, /*priority=*/5);
+        REQUIRE(s3 && a && b);
+        /* B squeezes A, then S, off the pool (both decoding: kept); B decodes to its end */
+        for (int k = 0; k < 300; ++k) {
+            const Request* rb = f.sch.find(b);
+            if (!rb || rb->state == ReqState::Finished) break;
+            if (f.sch.step()) f.commit_plain();
+        }
+        REQUIRE(!f.sch.find(b) || f.sch.find(b)->state == ReqState::Finished);
+        REQUIRE(f.kv.kept.count(s3) == 1 && f.kv.kept.count(a) == 1);
+        REQUIRE((int)f.sch.find(s3)->state == (int)ReqState::Preempted);
+        REQUIRE((int)f.sch.find(a)->state == (int)ReqState::Preempted);
+        const int64_t keep_s = f.kv.kept[s3], keep_a = f.kv.kept[a];
+        const int64_t n_s = f.sch.find(s3)->n_computed, n_a = f.sch.find(a)->n_computed;
+        CHECK_EQ(n_s, keep_s);
+        CHECK_EQ(n_a, keep_a);
+        /* the cache: S's chain gone, A's whole, other entries holding the pool one block short of S's next verify */
+        const int64_t need_s = (n_s + 5 + 15) / 16 - (int64_t)f.kv.block_table(s3, 0).size();
+        const int64_t free0 = f.kv.available_blocks(0);
+        REQUIRE(free0 >= need_s && free0 - (need_s - 1) >= keep_a / 16);
+        f.pc.seed((int32_t)((free0 - (need_s - 1)) * 16));
+        REQUIRE(f.kv.available_blocks(0) == need_s - 1);
+        f.pc.attn_by[s3] = 0;
+        f.pc.attn_by[a] = (int32_t)keep_a;
+        f.pc.evict_frees = true;
+        f.pc.evict_grant = 2;                  /* two entries: one makes S's room, the other is spare */
+        bool s_prefill = false, a_rejoin_at = false, a_prefill = false;
+        int planned = 0;
+        /* the step the stall sat on: fix 0 = 40 steps of it; fix 1 = the steps that seat S (recompute) and A (rejoin) */
+        for (int j = 0; j < (fix ? 3 : 40); ++j) {
+            if (f.sch.step()) {
+                for (const StepEntry& e : f.sch.plan().e) {
+                    ++planned;
+                    if (e.seq == s3 && e.is_prefill) s_prefill = true;
+                    if (e.seq == a && e.is_prefill) a_prefill = true;
+                    if (e.seq == a && !e.is_prefill && e.ctx_len == n_a) a_rejoin_at = true;
+                }
+                f.commit_plain();
+            }
+        }
+        if (!fix) {
+            /* the stall: nothing planned in 40 steps, both still kept, no reclaim */
+            CHECK_EQ(planned, 0);
+            CHECK((int)f.sch.find(s3)->state == (int)ReqState::Preempted);
+            CHECK((int)f.sch.find(a)->state == (int)ReqState::Preempted);
+            CHECK(f.kv.kept.count(s3) == 1 && f.kv.kept.count(a) == 1);
+            CHECK_EQ(f.sch.keep_reclaim_counts()[0], (int64_t)0);
+            CHECK_EQ(f.pc.evicted, (int64_t)0);  /* nothing given back: the grant of 2 stands */
+            CHECK_EQ(f.pc.evict_grant, (int64_t)2);
+        } else {
+            CHECK(s_prefill);                      /* S: its chain was gone -- a recompute */
+            CHECK(a_rejoin_at);                    /* A: decodes on from its own position */
+            CHECK(!a_prefill);                     /* nothing replayed for A */
+            CHECK_EQ(f.sch.keep_reclaim_counts()[0], (int64_t)1);
+            CHECK_EQ(f.sch.keep_reclaim_counts()[1], (int64_t)0);   /* the reclaim made the room: no idle drop */
+            CHECK_EQ(f.pc.evicted, (int64_t)2);
+            CHECK_EQ(f.sch.preempt_keep_counts()[1], (int64_t)1);  /* A's rejoin */
+            /* and both run to their ends (the cache gives back what the later squeezes ask) */
+            f.pc.evict_grant = 1 << 30;
+            for (int j = 0; j < 2000; ++j) {
+                const Request* rs = f.sch.find(s3);
+                const Request* ra = f.sch.find(a);
+                if ((!rs || rs->state == ReqState::Finished) && (!ra || ra->state == ReqState::Finished)) break;
+                if (f.sch.step()) f.commit_plain();
+            }
+            CHECK(!f.sch.find(s3) || f.sch.find(s3)->state == ReqState::Finished);
+            CHECK(!f.sch.find(a) || f.sch.find(a)->state == ReqState::Finished);
+        }
+        unsetenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        CHECK(rad::fn4::request("preempt_keep", 0, &err));
+        rad::fn4::apply_pending(1, da);
+    }
+}
+
 /* ================================================================== the step batch */
 /* A PREEMPTED PREFILL WAITS FOR ROOM FOR THE WHOLE RECOMPUTE plus one block per running
  * sequence. Admitting it on a shortfall is what makes the prefill loop: the next decode takes

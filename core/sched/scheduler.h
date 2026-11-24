@@ -1050,12 +1050,18 @@ private:
     int64_t       pk_n_[3] = {0, 0, 0};
     int           pk_ok_ = -1;
     static constexpr int32_t kKeepTries = 256;
+    /* Qwen loop round 59 (Q118, FINDINGS TEST note 08:20): an overdue kept request the pool cannot take reclaims in the
+     * admission walk (kr_on_, RADIANCE_SCHED_KEEP_RECLAIM unset or 1; 0 = the walk as before); kr_n_ = [0] walks that
+     * evicted for one, [1] keeps dropped on an idle pool (recomputed) */
+    bool          kr_on_ = true;
+    int64_t       kr_n_[2] = {0, 0};
     bool          keep_possible();
     int           rejoin_kept(SchedReq& s);
     void          unkeep(SchedReq& s);
 public:
     const int64_t* resume_cold_counts() const { return rc_n_; }
     const int64_t* preempt_keep_counts() const { return pk_n_; }
+    const int64_t* keep_reclaim_counts() const { return kr_n_; }
 private:
     IKVManager*   kv_ = nullptr;
 #ifdef RAD_ENABLE_KV_ROLLBACK_TEST_HOOK

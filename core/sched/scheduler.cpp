@@ -316,6 +316,14 @@ int Scheduler::init(Program& prog, const Config& cfg, IKVManager* kv, IPrefixCac
                      v % 4 ? "; the retention part (value % 4) is not read in this tree: --checkpoint-policy sets it" : "");
         }
     }
+    {   /* Qwen loop round 59 (Q118, FINDINGS TEST note 08:20): the admission walk's reclaim for an overdue kept request
+         * (scheduler.h kr_on_); on unless RADIANCE_SCHED_KEEP_RECLAIM=0 */
+        const char* e = std::getenv("RADIANCE_SCHED_KEEP_RECLAIM");
+        kr_on_ = !(e && !std::strcmp(e, "0"));
+        if (!kr_on_ && lane_ <= 0)
+            RAD_INFO("scheduler: RADIANCE_SCHED_KEEP_RECLAIM=0 -- an overdue fn4 preempt_keep request the pool cannot take holds "
+                     "the admission walk with no reclaim (the walk before Qwen loop round 59; an idle engine can stall there)");
+    }
     {   /* tp8 loop F71: the inbox rows count where a plan takes the step's max_tok room (lanes only; see scheduler.h) */
         const char* e = std::getenv("RADIANCE_PP_PLAN_RESERVED");
         plan_reserved_ = e && !std::strcmp(e, "1");
@@ -4635,8 +4643,33 @@ const RadBatch* Scheduler::step() {
                     ? share_tok : 0;
             /* fn4 preempt_keep: a kept request rejoins at its own position once the pool holds its next verify; it waits
              * as a preempted request does (an overdue one holds the queue behind it) */
+            bool kfit = s.keep_whole >= 0 && preempted_can_prefill(s);
+            /* Qwen loop round 59 (FINDINGS TEST note 08:20, QUEUE Q118): an OVERDUE kept request the pool cannot take reclaims
+             * as admit_one does for an overdue preempted one -- the cache's entries, LRU first (its own chain is the newest:
+             * preempted_can_prefill's lookup just touched it). Before, the walk stopped at it with no reclaim, the step's overdue
+             * reclaim above stopped as soon as ANY overdue waiter fitted (a kept request behind it), and an engine with nothing
+             * running never stepped again (gpu02 kow30: S3 kept at 173,741 tokens, its chain trimmed away, 0 running / 2
+             * waiting for 7 min 54 s). Where the pool is idle and it still does not fit, waiting changes nothing: the keep goes
+             * (a recompute, as rejoin_kept's own fallback) and admit_one below decides as for any preempted request (its own
+             * reclaim; failed where the empty pool cannot hold it). RADIANCE_SCHED_KEEP_RECLAIM=0: the walk as before. */
+            if (s.keep_whole >= 0 && !kfit && kr_on_ && preempt_wait_overdue(s)) {
+                int rounds = 0;
+                while (!kfit && rounds < kEvictRounds && cfg_.prefix_cache && pc_ && pc_evict(kEvPreWait, kEvictBlocks) > 0) {
+                    ++rounds;
+                    kfit = preempted_can_prefill(s);
+                }
+                if (rounds > 0) ++kr_n_[0];
+                if (!kfit && pool_idle() && plan_.e.empty()) {
+                    RAD_WARN("fn4 preempt_keep: request %llu cannot rejoin on an idle pool (kept at %lld tokens, %lld of them "
+                             "whole; the pool cannot take its next verify after %d evict rounds): recomputed",
+                             (unsigned long long)s.req->id, (long long)s.req->n_computed, (long long)s.keep_whole, rounds);
+                    ++pk_n_[2];
+                    ++kr_n_[1];
+                    unkeep(s);
+                }
+            }
             if (s.keep_whole >= 0) {
-                if (!preempted_can_prefill(s)) {
+                if (!kfit) {
                     if (preempt_wait_overdue(s)) break;
                     ++at;
                     continue;
