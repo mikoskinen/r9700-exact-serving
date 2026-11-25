@@ -12,7 +12,7 @@ whether it runs alone or beside other requests. The notes are written for people
 models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
 output from a coding agent.
 
-- **Models** (only these two were optimised)
+- **Models**
   - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
   - Qwen Flash-Next, EXL3 4.05 bits per weight
 - **Hardware and software**
