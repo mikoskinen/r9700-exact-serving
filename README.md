@@ -165,6 +165,8 @@ run/switches.sh run/deepseek-tp8/claude-code-switches.json
 curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
 ```
 
+The KV cache holds 20,502,774 tokens.
+
 ### DeepSeek, 4x R9700
 
 ```bash
@@ -255,8 +257,8 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --e
 
 ## Exact output
 
-Exact means the output is byte-identical to each model's reference engine, and a prompt gets the same
-answer alone or next to other requests. This matters for a coding agent, whose answer to the same
+Exact means deterministic and independent of load: at temperature 0 a prompt gets the same answer every
+time, alone or next to other requests. Each configuration is checked against its own reference run. This matters for a coding agent, whose answer to the same
 context shouldn't change because other sessions are running on the same cards. DeepSeek's reference
 is the build of 15.11.2026, and in a 33-minute run under load all 160 of its answers stay identical.
 Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
