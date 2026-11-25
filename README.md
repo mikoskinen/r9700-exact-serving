@@ -27,7 +27,7 @@ output from a coding agent.
 
 Decode and prefill:
 
-| Measure | Qwen, one machine | DeepSeek, two machines |
+| Measure | Qwen, 4x R9700 | DeepSeek, 8x R9700 (2 nodes) |
 |---|---|---|
 | 1 request | 295 tok/s | 114 prose / 233 code tok/s |
 | 4 requests | 656 tok/s | 482 tok/s |
@@ -41,7 +41,7 @@ Decode and prefill:
 
 AgentX, 32 sessions:
 
-| Measure | Qwen, one machine, 210 W | Qwen, one machine, 300 W | DeepSeek, two machines, 210 W | DeepSeek, two machines, 300 W |
+| Measure | Qwen, 4x R9700, 210 W | Qwen, 4x R9700, 300 W | DeepSeek, 8x R9700 (2 nodes), 210 W | DeepSeek, 8x R9700 (2 nodes), 300 W |
 |---|---|---|---|---|
 | Requests in 20 minutes | 885 | 905 | 733 | 833 |
 | Output, all requests | 440.7 tok/s | 457.4 tok/s | 401.4 tok/s | 490.2 tok/s |
@@ -49,7 +49,7 @@ AgentX, 32 sessions:
 | Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
 | Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
 
-### Qwen Flash-Next, one machine
+### Qwen Flash-Next, 4x R9700
 
 | Measure | Value |
 |---|---|
@@ -127,7 +127,7 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endp
   --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"enable_thinking":true}}'
 ```
 
-### DeepSeek V4.1 Flash, two machines
+### DeepSeek V4.1 Flash, 8x R9700 (2 nodes, 4 cards each)
 
 | Measure | Value |
 |---|---|
@@ -141,7 +141,7 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endp
 | Prefill 64k (65,650 tokens) | 16,964 tok/s (3.87 s) |
 | Prefill 128k (131,137 tokens) | 17,532 tok/s (7.48 s) |
 
-Once on each machine:
+Once on each node:
 
 ```bash
 export MODEL_DIR=~/models/ds41-exl3 LEADER_IP=LEADER_RDMA_ADDRESS FOLLOWER_IP=FOLLOWER_RDMA_ADDRESS
