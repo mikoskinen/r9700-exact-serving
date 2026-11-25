@@ -203,13 +203,7 @@ For Qwen, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, s
 
 ## Exact output
 
-Exact means deterministic and independent of load: at temperature 0 a prompt gets the same answer every
-time, alone or next to other requests. Each configuration is checked against its own reference run. This
-matters for a coding agent, whose answer to the same context shouldn't change because other sessions
-are running on the same cards.
-
-The 4x and the 8x DeepSeek setups give different answers from each other: the 8x setup adds its sums in
-another order and computes prompt rows with an 8-bit twin of the dense weights.
+At temperature 0 a prompt gets the same answer every time, alone or next to other requests.
 
 ## More
 
