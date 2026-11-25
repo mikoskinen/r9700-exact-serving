@@ -23,13 +23,9 @@ output from a coding agent.
 ## Results
 
 Every number in this section is at stock power: 300 W a card with no voltage offset, set with
-`sudo run/power.sh 300` after the [host setup](#host-setup). The cards cool to 45 °C or less before
-each decode and prefill measurement.
+`sudo run/power.sh 300` after the [host setup](#host-setup).
 
 ### Qwen Flash-Next, one machine
-
-Decode is tok/s summed over the concurrent requests. Prefill is one cold prompt, prompt tokens divided
-by the time to first token, with that time in brackets.
 
 | Measure | Value |
 |---|---|
@@ -115,10 +111,6 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endp
 ```
 
 ### DeepSeek V4.1 Flash, two machines
-
-Decode is tok/s summed over the concurrent requests, and 1 request is one request on a prose prompt
-and on a code prompt. Prefill is one cold prompt, prompt tokens divided by the time to first token,
-with that time in brackets.
 
 | Measure | Value |
 |---|---|
