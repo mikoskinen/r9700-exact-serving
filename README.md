@@ -16,9 +16,11 @@ output from a coding agent.
   - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
   - Qwen Flash-Next, EXL3 4.05 bits per weight
 - **Hardware and software**
-  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root complex
-  - AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board
-  - 512 GB of RAM (8 x 64 GB)
+  - One node: 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root
+    complex, an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board, 512 GB of RAM (8 x 64 GB)
+  - Qwen runs on one node (4x R9700)
+  - DeepSeek runs on one node (4x R9700) or on two such nodes (8x R9700) joined by an RDMA link, a
+    ConnectX-6 card in each node
   - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
     [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
   - A LiteLLM proxy between Claude Code and the engine
