@@ -199,11 +199,11 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 For Qwen, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, so send `"temperature": 0` for exact output.
 
-## Benchmarks
+## Reproduce the results
 
-All at `sudo run/power.sh 300`.
+Power: `sudo run/power.sh 300`.
 
-### Qwen, decode and prefill
+Qwen, decode and prefill:
 
 ```bash
 docker run -d --name qwen --init --network host \
@@ -224,30 +224,11 @@ docker run -d --name qwen --init --network host \
   --thinking-token-budget 16000 --default-max-tokens 32768
 ```
 
-### Qwen, AgentX
-
-Server:
+Qwen, AgentX: the [Qwen, 4x R9700](#qwen-4x-r9700) command with `--host 0.0.0.0` and
 
 ```bash
-docker run -d --name qwen --init --network host \
-  --device /dev/kfd --device /dev/dri \
-  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
-  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
-  -v ~/models/flashnext-exl3:/models:ro \
-  -e RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47 -e RADIANCE_SPEC_DECODE_METRICS=1 \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
-  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
-  --host 0.0.0.0 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
-  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 4096 \
-  --prefill-span 2 --prefill-interleave 0 --prefix-resume exact \
-  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
-  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 1024 --checkpoint-policy keep-all \
-  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
-  --thinking-token-budget 16000 --default-max-tokens 32768 \
-  --keep-alive-timeout 1800 --vision-tower-placement ram --kv-resident 32768
+  -e RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47 -e RADIANCE_SPEC_DECODE_METRICS=1
 ```
-
-Client:
 
 ```bash
 AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endpoint /v1/chat/completions \
@@ -256,62 +237,14 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endp
   --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"enable_thinking":true}}'
 ```
 
-### DeepSeek, decode and prefill
+DeepSeek, decode and prefill: the [DeepSeek, 8x R9700 (2 nodes)](#deepseek-8x-r9700-2-nodes) commands.
 
-The [DeepSeek, 8x R9700 (2 nodes)](#deepseek-8x-r9700-2-nodes) commands.
-
-### DeepSeek, AgentX
-
-Follower:
+DeepSeek, AgentX: the same commands with one more option on the follower and on the leader
 
 ```bash
-mkdir -p /dev/shm/ds41ng
-docker run -d --name deepseek-fol --init --network host \
-  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
-  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
-  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
-  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-follower.env \
-  --env-file run/deepseek-tp8/claude-code-agentx-follower.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
-  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
-  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
-  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
-  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
-  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
-  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
-  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
-  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8091 --keep-alive-timeout 1800 \
-  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$LEADER_IP":29517 --node-link verbs --pp-rank 1
+  --env-file run/deepseek-tp8/claude-code-agentx-follower.env
+  --env-file run/deepseek-tp8/claude-code-agentx-leader.env
 ```
-
-Leader:
-
-```bash
-mkdir -p /dev/shm/ds41ng
-docker run -d --name deepseek --init --network host \
-  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
-  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
-  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
-  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
-  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-leader.env \
-  --env-file run/deepseek-tp8/claude-code-agentx-leader.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
-  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
-  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
-  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
-  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
-  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
-  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
-  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
-  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
-  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8090 --keep-alive-timeout 1800 \
-  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$FOLLOWER_IP":29517 --node-link verbs --pp-rank 0 \
-  --draft-short-from 12
-run/switches.sh run/deepseek-tp8/claude-code-switches.json
-curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
-```
-
-Client:
 
 ```bash
 AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --endpoint /v1/chat/completions \
