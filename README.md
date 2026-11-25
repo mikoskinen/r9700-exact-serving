@@ -195,6 +195,8 @@ At temperature 0 a prompt gets the same answer every time, alone or next to othe
 
 - [docs/DETAILS.md](docs/DETAILS.md): the long version of this page, with a source for every number, the
   LiteLLM setup for Claude Code, the engine branches and the BetterBench results
+- [docs/DETAILS.md#host-setup-and-tuning](docs/DETAILS.md#host-setup-and-tuning): the kernel parameters,
+  CPU settings and power script the results ran with
 - [docs/hardware-tuning.md](docs/hardware-tuning.md): the host, memory and PCIe tuning
 - [docs/LEVERS.md](docs/LEVERS.md) and [registry/](registry/): every tested change and its numbers
 - [docs/TESTING.md](docs/TESTING.md): the test method
