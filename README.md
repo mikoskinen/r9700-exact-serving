@@ -67,7 +67,8 @@ images, so the host doesn't need it. The host needs:
 
 - `amdgpu.ppfeaturemask=0xffffffff ttm.pages_limit=104857600` on the kernel command line, which allows
   the voltage offset and lets the driver pin up to 400 GiB of host memory
-- 512 GB of RAM: Qwen uses up to about 346 GiB of host memory and DeepSeek about 276 GiB
+- 512 GB of RAM a node: Qwen uses about 346 GiB of host memory, DeepSeek about 175 GiB a node on two
+  nodes and about 276 GiB on one
 - the CPU settings in `run/host/`, which turn off deep idle states, set the performance governor and
   turn off NUMA balancing. Without them, decode on this host was 15 to 18 % slower.
 
