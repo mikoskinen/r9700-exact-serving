@@ -1,4 +1,4 @@
-# DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on 4x AMD Radeon AI PRO R9700
+# DeepSeek V4.1 Flash and Qwen Flash-Next (EXL3) on AMD Radeon AI PRO R9700
 
 This repository is written for AI coding agents more than for people. Hand it to your agent when you
 set up or tune a similar system.
@@ -13,8 +13,8 @@ models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone wh
 output from a coding agent.
 
 - **Models**
-  - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
-  - Qwen Flash-Next, EXL3 4.05 bits per weight
+  - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight: [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
+  - Qwen Flash-Next, EXL3 4.05 bits per weight: [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
 - **Hardware and software**
   - One node: 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root
     complex, an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board, 512 GB of RAM (8 x 64 GB)
@@ -29,7 +29,7 @@ output from a coding agent.
 
 Decode and prefill:
 
-| Measure | Qwen Flash-Next, 4x R9700 | DeepSeek V4.1 Flash, 8x R9700 (2 nodes) |
+| Measure | Qwen Flash-Next, 4x R9700 * | DeepSeek V4.1 Flash, 8x R9700 (2 nodes) |
 |---|---|---|
 | 1 request | 295 tok/s | 114 prose / 233 code tok/s |
 | 4 requests | 656 tok/s | 482 tok/s |
@@ -53,11 +53,6 @@ AgentX, 32 sessions:
 | Prompt tokens read from the prefix cache | 94.36 % | 94.23 % |
 | Prompt / output tokens a request, mean | 82,949 / 622 | 100,750 / 724 |
 | KV cache | 7,077,888 tokens | 20,502,774 tokens |
-
-## Models
-
-- Qwen Flash-Next, EXL3 4.05 bpw: [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
-- DeepSeek V4.1 Flash, EXL3 2.25 bpw: [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
 
 ## Run
 
@@ -87,6 +82,27 @@ docker run -d --name qwen --init --network host \
   --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
   --thinking-token-budget 16000 --default-max-tokens 32768 \
   --keep-alive-timeout 1800 --vision-tower-placement ram --kv-resident 32768
+```
+
+\* With everything in VRAM (prefill about 10 to 20 % faster, room for fewer long sessions):
+
+```bash
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
+  -e RADIANCE_IMAGE_DEFAULTS=/opt/radiance/share/radiance/bench/defaults.env \
+  -e RADIANCE_IMAGE_SWITCHES=/opt/radiance/share/radiance/bench/switches.json \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume exact \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768
 ```
 
 ### DeepSeek V4.1 Flash, 8x R9700 (2 nodes)
@@ -181,10 +197,6 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 ```
 
 For Qwen Flash-Next, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, so send `"temperature": 0` for exact output.
-
-## Exact output
-
-At temperature 0 a prompt gets the same answer every time, alone or next to other requests.
 
 ## More
 
