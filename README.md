@@ -62,12 +62,7 @@ AgentX, 32 sessions:
 
 ### Host setup
 
-Once on each node, with Docker installed:
-
-```bash
-sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&ttm.pages_limit=104857600 /' /etc/default/grub
-sudo update-grub && sudo reboot
-```
+Docker, and `ttm.pages_limit=104857600` on the kernel command line.
 
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
