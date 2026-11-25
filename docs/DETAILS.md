@@ -411,3 +411,34 @@ This repository has two licenses:
   `node/exl3-test/` outside `runs/`, and `node/host/` and `node/bench/` outside `runs/`.
 
 The engine repositories are forks of Apache 2.0 projects and keep their own LICENSE and NOTICE files.
+
+## BetterBench, DeepSeek
+
+Two machines against one machine. **[BetterBench](https://github.com/GGZ14/BetterBench) 0.6.1 at stock 300 W** on image
+`deepseek-tp8-0735a8e2`, with its default settings (temperature 0.7, 20 runs a task category, 48
+requests a concurrency level) and the server's default thinking. Decode is BetterBench's weighted
+median over its task categories, concurrency N is tok/s summed over N concurrent requests, and prefill
+is the median of cold prompts of each length. The reports are in
+[results/betterbench/](../results/betterbench/).
+
+| BetterBench | Two machines | One machine | Two / one |
+|---|---|---|---|
+| Decode, 1 request | 161.0 tok/s | 153.3 tok/s | 1.05x |
+| Time to first token p50, 1 request | 76 ms | 173 ms | 0.44x |
+| Concurrency 1 / 2 / 4 / 8 | 149.8 / 262.8 / 394.6 / 509.8 tok/s | 139.3 / 197.5 / 252.5 / 302.1 tok/s | 1.08x / 1.33x / 1.56x / 1.69x |
+| Prefill 1.5k / 5.9k / 11.8k tokens | 4,861 / 8,179 / 12,355 tok/s | 3,714 / 6,143 / 7,224 tok/s | 1.31x / 1.33x / 1.71x |
+| Prefill 23.6k / 47.1k tokens | 14,810 / 15,752 tok/s | 7,222 / 8,043 tok/s | 2.05x / 1.96x |
+
+## Images and engine branches
+
+The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
+`deepseek/current` with `exl3/current`, the Qwen images from `qwen/qfn-on-ds` with `exl3/qfn-x3gd`
+(engine commit ff94ef27 for the image in the README). Images `qwen-7d70dccc` and
+`deepseek-tp8-6b0bda62` in the README are built from engine commits 7d70dccc and 6b0bda62,
+which aren't on a branch of this repository. The two-machine image `deepseek-tp8-9061bc79` was
+built from `deepseek/ds41-pp-dev-pf` with `exl3/ds41-swk` compiled with `-DEXL3R4D_X6_SGB=1 -DEXL3R4D_X5_SUM=3
+-DEXL3R4D_SWK_DMOVE=2 -DEXL3R4D_X6_PRE=2 -DEXL3R4D_X15_INSUM=1 -DEXL3R4D_X17_PIN=1
+-DEXL3R4D_X17_FORM=1` (HIP) and `-DEXL3R4D_DK_MAX=64` (C), and image `deepseek-tp8-0735a8e2` from
+`deepseek/ds41-pp-dev` with `exl3/ds41-x7-route` compiled with `-DEXL3R4D_X6_SGB=1
+-DEXL3R4D_X5_SUM=3` (HIP) and `-DEXL3R4D_DK_MAX=64` (C). Every other branch is a single experiment or
+an earlier build, kept for the record.
