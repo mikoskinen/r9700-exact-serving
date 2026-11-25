@@ -23,7 +23,7 @@ output from a coding agent.
 
 ## Results
 
-Decode and prefill at 300 W:
+Decode and prefill:
 
 | Measure | Qwen, one machine | DeepSeek, two machines |
 |---|---|---|
@@ -46,8 +46,6 @@ AgentX, 32 sessions:
 | Output speed of a request, p50 | 21.35 tok/s | 22.72 tok/s | 21.0 tok/s | 24.59 tok/s |
 | Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
 | Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
-
-By model at stock power, 300 W a card, no voltage offset:
 
 ### Qwen Flash-Next, one machine
 
