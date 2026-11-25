@@ -258,18 +258,12 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --e
 ## Exact output
 
 Exact means deterministic and independent of load: at temperature 0 a prompt gets the same answer every
-time, alone or next to other requests. Each configuration is checked against its own reference run. This matters for a coding agent, whose answer to the same
-context shouldn't change because other sessions are running on the same cards. DeepSeek's reference
-is the build of 15.11.2026, and in a 33-minute run under load all 160 of its answers stay identical.
-Qwen's answers to 20 short prompts and to 12 long prompts of up to 5,934 tokens stay identical beside
-up to 31 other requests.
+time, alone or next to other requests. Each configuration is checked against its own reference run. This
+matters for a coding agent, whose answer to the same context shouldn't change because other sessions
+are running on the same cards.
 
-DeepSeek on two machines is its own reference, and its answers differ from the one-machine builds'.
-Its routed-expert, router and compressor kernels add their sums in another order than those builds,
-and its prompt rows use the 8-bit twin that the [DeepSeek, 4x R9700](#deepseek-4x-r9700) command doesn't use. Its
-answers to 20 test prompts are the same in five separate starts and beside 32 concurrent requests
-(c32). With the KV cache cut to 626,480 tokens, 32 requests of 17,603 prompt tokens give the same 32
-answers with 9 preemptions by recompute as without any, in two runs.
+The 4x and the 8x DeepSeek setups give different answers from each other: the 8x setup adds its sums in
+another order and computes prompt rows with an 8-bit twin of the dense weights.
 
 ## More
 
