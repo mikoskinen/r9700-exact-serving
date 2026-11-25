@@ -4,7 +4,8 @@ This repository is written for AI coding agents more than for people. Hand it to
 set up or tune a similar system.
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
-AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
+AMD Radeon AI PRO R9700 cards as the backend for Claude Code. The code and the settings are optimised
+for Claude Code style use: long conversations, coding agents and repeated tool use. A prompt gets byte-identical output
 whether it runs alone or beside other requests. The notes are written for people who run large MoE
 models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
 output from a coding agent.
@@ -22,16 +23,6 @@ output from a coding agent.
 
 ## Results
 
-AgentX, 32 sessions:
-
-| Measure | Qwen, one machine, 210 W | Qwen, one machine, 300 W | DeepSeek, two machines, 210 W | DeepSeek, two machines, 300 W |
-|---|---|---|---|---|
-| Requests in 20 minutes | 885 | 905 | 733 | 833 |
-| Output, all requests | 440.7 tok/s | 457.4 tok/s | 401.4 tok/s | 490.2 tok/s |
-| Output speed of a request, p50 | 21.35 tok/s | 22.72 tok/s | 21.0 tok/s | 24.59 tok/s |
-| Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
-| Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
-
 Decode and prefill at 300 W:
 
 | Measure | Qwen, one machine | DeepSeek, two machines |
@@ -45,6 +36,16 @@ Decode and prefill at 300 W:
 | Prefill 16k | 10,530 tok/s | 13,258 tok/s |
 | Prefill 64k | 10,633 tok/s | 16,964 tok/s |
 | Prefill 128k | 10,615 tok/s | 17,532 tok/s |
+
+AgentX, 32 sessions:
+
+| Measure | Qwen, one machine, 210 W | Qwen, one machine, 300 W | DeepSeek, two machines, 210 W | DeepSeek, two machines, 300 W |
+|---|---|---|---|---|
+| Requests in 20 minutes | 885 | 905 | 733 | 833 |
+| Output, all requests | 440.7 tok/s | 457.4 tok/s | 401.4 tok/s | 490.2 tok/s |
+| Output speed of a request, p50 | 21.35 tok/s | 22.72 tok/s | 21.0 tok/s | 24.59 tok/s |
+| Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
+| Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
 
 By model at stock power, 300 W a card, no voltage offset:
 
