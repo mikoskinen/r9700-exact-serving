@@ -22,7 +22,17 @@ output from a coding agent.
 
 ## Results
 
-Stock power: 300 W a card, no voltage offset.
+AgentX, 32 sessions:
+
+| Measure | Qwen, one machine, 210 W | Qwen, one machine, 300 W | DeepSeek, two machines, 210 W | DeepSeek, two machines, 300 W |
+|---|---|---|---|---|
+| Requests in 20 minutes | 885 | 905 | 733 | 833 |
+| Output, all requests | 440.7 tok/s | 457.4 tok/s | 401.4 tok/s | 490.2 tok/s |
+| Output speed of a request, p50 | 21.35 tok/s | 22.72 tok/s | 21.0 tok/s | 24.59 tok/s |
+| Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
+| Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
+
+By model at stock power, 300 W a card, no voltage offset:
 
 ### Qwen Flash-Next, one machine
 
