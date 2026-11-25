@@ -32,6 +32,20 @@ AgentX, 32 sessions:
 | Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
 | Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
 
+Decode and prefill at 300 W:
+
+| Measure | Qwen, one machine | DeepSeek, two machines |
+|---|---|---|
+| 1 request | 295 tok/s | 114 prose / 233 code tok/s |
+| 4 requests | 656 tok/s | 482 tok/s |
+| 8 requests | 919 tok/s | 619 tok/s |
+| 16 requests | 1,222 tok/s | 871 tok/s |
+| 24 requests | 1,360 tok/s | 935 tok/s |
+| 32 requests | 1,467 tok/s | 998 tok/s |
+| Prefill 16k | 10,530 tok/s | 13,258 tok/s |
+| Prefill 64k | 10,633 tok/s | 16,964 tok/s |
+| Prefill 128k | 10,615 tok/s | 17,532 tok/s |
+
 By model at stock power, 300 W a card, no voltage offset:
 
 ### Qwen Flash-Next, one machine
