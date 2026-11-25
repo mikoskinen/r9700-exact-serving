@@ -62,28 +62,13 @@ AgentX, 32 sessions:
 
 ### Host setup
 
-The results ran on Ubuntu 26.04 with the kernel's own amdgpu driver and Docker. ROCm is inside the
-images, so the host doesn't need it. The host needs:
-
-- `amdgpu.ppfeaturemask=0xffffffff ttm.pages_limit=104857600` on the kernel command line, which allows
-  the voltage offset and lets the driver pin up to 400 GiB of host memory
-- 512 GB of RAM a node: Qwen Flash-Next uses about 346 GiB of host memory, DeepSeek V4.1 Flash about 175 GiB a node on two
-  nodes and about 276 GiB on one
-- the CPU settings in `run/host/`, which turn off deep idle states, set the performance governor and
-  turn off NUMA balancing. Without them, decode on this host was 15 to 18 % slower.
+Ubuntu 26.04 with the kernel's amdgpu driver and Docker, 512 GB of RAM a node, and
+`ttm.pages_limit=104857600` on the kernel command line.
 
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
 cd r9700-exact-serving
-sudo install -m 755 run/host/r9700-host-tuning /usr/local/sbin/
-sudo install -m 644 run/host/r9700-host-tuning.service /etc/systemd/system/
-sudo install -m 644 run/host/90-r9700-numa.conf /etc/sysctl.d/
-sudo systemctl daemon-reload && sudo systemctl enable --now r9700-host-tuning.service && sudo sysctl --system
-sudo run/power.sh 300    # or 210
 ```
-
-[run/power.sh](run/power.sh) sets the power cap, the voltage offset and a flat fan curve on every card
-until the next reboot.
 
 ### Qwen Flash-Next, 4x R9700
 
