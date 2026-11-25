@@ -3,9 +3,11 @@
 This repository is written for AI coding agents more than for people. Hand it to your agent when you
 set up or tune a similar system.
 
+The code and the settings are optimised for Claude Code style use: long conversations, coding agents
+and repeated tool use.
+
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
-AMD Radeon AI PRO R9700 cards as the backend for Claude Code. The code and the settings are optimised
-for Claude Code style use: long conversations, coding agents and repeated tool use. A prompt gets byte-identical output
+AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
 whether it runs alone or beside other requests. The notes are written for people who run large MoE
 models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
 output from a coding agent.
