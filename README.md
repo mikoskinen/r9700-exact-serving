@@ -43,15 +43,15 @@ Decode and prefill:
 
 AgentX, 32 sessions:
 
-| Measure | Qwen, 4x R9700, 210 W | Qwen, 4x R9700, 300 W | DeepSeek, 8x R9700 (2 nodes), 210 W | DeepSeek, 8x R9700 (2 nodes), 300 W |
-|---|---|---|---|---|
-| Requests in 20 minutes | 885 | 905 | 733 | 833 |
-| Output, all requests | 440.7 tok/s | 457.4 tok/s | 401.4 tok/s | 490.2 tok/s |
-| Output speed of a request, p50 | 21.35 tok/s | 22.72 tok/s | 21.0 tok/s | 24.59 tok/s |
-| Time to first token p50 / p90 | 0.68 / 3.89 s | 0.65 / 3.40 s | 0.91 / 4.15 s | 0.83 / 3.46 s |
-| Time between output tokens p50 | 46.8 ms | 44.0 ms | 47.7 ms | 40.7 ms |
-| Prompt tokens read from the prefix cache | 94.36 % | 94.36 % | 94.24 % | 94.23 % |
-| Prompt / output tokens a request, mean | 82,696 / 613 | 82,949 / 622 | 102,038 / 674 | 100,750 / 724 |
+| Measure | Qwen, 4x R9700 | DeepSeek, 8x R9700 (2 nodes) |
+|---|---|---|
+| Requests in 20 minutes | 905 | 833 |
+| Output, all requests | 457.4 tok/s | 490.2 tok/s |
+| Output speed of a request, p50 | 22.72 tok/s | 24.59 tok/s |
+| Time to first token p50 / p90 | 0.65 / 3.40 s | 0.83 / 3.46 s |
+| Time between output tokens p50 | 44.0 ms | 40.7 ms |
+| Prompt tokens read from the prefix cache | 94.36 % | 94.23 % |
+| Prompt / output tokens a request, mean | 82,949 / 622 | 100,750 / 724 |
 
 ## Models
 
