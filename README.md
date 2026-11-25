@@ -18,8 +18,8 @@ output from a coding agent.
 - **Hardware and software**
   - One node: 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root
     complex, an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board, 512 GB of RAM (8 x 64 GB)
-  - Qwen runs on one node (4x R9700)
-  - DeepSeek runs on one node (4x R9700) or on two such nodes (8x R9700) joined by an RDMA link, a
+  - Qwen Flash-Next runs on one node (4x R9700)
+  - DeepSeek V4.1 Flash runs on one node (4x R9700) or on two such nodes (8x R9700) joined by an RDMA link, a
     ConnectX-6 card in each node
   - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
     [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
@@ -29,7 +29,7 @@ output from a coding agent.
 
 Decode and prefill:
 
-| Measure | Qwen, 4x R9700 | DeepSeek, 8x R9700 (2 nodes) |
+| Measure | Qwen Flash-Next, 4x R9700 | DeepSeek V4.1 Flash, 8x R9700 (2 nodes) |
 |---|---|---|
 | 1 request | 295 tok/s | 114 prose / 233 code tok/s |
 | 4 requests | 656 tok/s | 482 tok/s |
@@ -43,7 +43,7 @@ Decode and prefill:
 
 AgentX, 32 sessions:
 
-| Measure | Qwen, 4x R9700 | DeepSeek, 8x R9700 (2 nodes) |
+| Measure | Qwen Flash-Next, 4x R9700 | DeepSeek V4.1 Flash, 8x R9700 (2 nodes) |
 |---|---|---|
 | Requests in 20 minutes | 905 | 833 |
 | Output, all requests | 457.4 tok/s | 490.2 tok/s |
@@ -67,7 +67,7 @@ images, so the host doesn't need it. The host needs:
 
 - `amdgpu.ppfeaturemask=0xffffffff ttm.pages_limit=104857600` on the kernel command line, which allows
   the voltage offset and lets the driver pin up to 400 GiB of host memory
-- 512 GB of RAM a node: Qwen uses about 346 GiB of host memory, DeepSeek about 175 GiB a node on two
+- 512 GB of RAM a node: Qwen Flash-Next uses about 346 GiB of host memory, DeepSeek V4.1 Flash about 175 GiB a node on two
   nodes and about 276 GiB on one
 - the CPU settings in `run/host/`, which turn off deep idle states, set the performance governor and
   turn off NUMA balancing. Without them, decode on this host was 15 to 18 % slower.
@@ -85,7 +85,7 @@ sudo run/power.sh 300    # or 210
 [run/power.sh](run/power.sh) sets the power cap, the voltage offset and a flat fan curve on every card
 until the next reboot.
 
-### Qwen, 4x R9700
+### Qwen Flash-Next, 4x R9700
 
 ```bash
 docker run -d --name qwen --init --network host \
@@ -107,7 +107,7 @@ docker run -d --name qwen --init --network host \
 
 Ready in about two minutes. It uses about 346 GiB of host memory, and the KV cache holds 7,077,888 tokens.
 
-### DeepSeek, 8x R9700 (2 nodes)
+### DeepSeek V4.1 Flash, 8x R9700 (2 nodes)
 
 Once on each node:
 
@@ -168,7 +168,7 @@ curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
 
 The KV cache holds 20,502,774 tokens.
 
-### DeepSeek, 4x R9700
+### DeepSeek V4.1 Flash, 4x R9700
 
 ```bash
 mkdir -p /dev/shm/ds41ng
@@ -200,7 +200,7 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
   "messages": [{"role": "user", "content": "What is the capital of Australia, and in which year did it officially become the capital? Answer in two sentences."}]}'
 ```
 
-For Qwen, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, so send `"temperature": 0` for exact output.
+For Qwen Flash-Next, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, so send `"temperature": 0` for exact output.
 
 ## Exact output
 
