@@ -3,6 +3,23 @@
 This repository is written for AI coding agents more than for people. Hand it to your agent when you
 set up or tune a similar system.
 
+This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
+AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
+whether it runs alone or beside other requests. The notes are written for people who run large MoE
+models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
+output from a coding agent.
+
+- **Models** (only these two were optimised)
+  - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
+  - Qwen Flash-Next, EXL3 4.05 bits per weight
+- **Hardware and software**
+  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root complex
+  - AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board
+  - 512 GB of RAM (8 x 64 GB)
+  - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
+    [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
+  - A LiteLLM proxy between Claude Code and the engine
+
 ## Results
 
 Every number in this section is at stock power: 300 W a card with no voltage offset, set with
@@ -223,25 +240,6 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --e
   --public-dataset semianalysis_cc_traces_weka_062126 --benchmark-duration 1200 \
   --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}}'
 ```
-
-## About this repository
-
-This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
-AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
-whether it runs alone or beside other requests. The notes are written for people who run large MoE
-models on AMD GPUs or EPYC hosts or tune a multi-GPU PCIe box, and for anyone who needs reproducible
-output from a coding agent.
-
-- **Models** (only these two were optimised)
-  - DeepSeek V4.1 Flash, EXL3 2.25 bits per weight
-  - Qwen Flash-Next, EXL3 4.05 bits per weight
-- **Hardware and software**
-  - 4x AMD Radeon AI PRO R9700 (RDNA4, 32 GB each) on PCIe 4.0 x16, one card per CPU root complex
-  - AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board
-  - 512 GB of RAM (8 x 64 GB)
-  - A C++/HIP fork of [radiance](https://codeberg.org/StillDeadcode/radiance) with the
-    [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
-  - A LiteLLM proxy between Claude Code and the engine
 
 ## One machine at both power settings
 
