@@ -201,60 +201,6 @@ curl -s http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/
 
 For Qwen, use `"model": "qwen3.8-flash-next"`. Both servers sample by default, so send `"temperature": 0` for exact output.
 
-## Reproduce the results
-
-Power: `sudo run/power.sh 300`.
-
-Qwen, decode and prefill:
-
-```bash
-docker run -d --name qwen --init --network host \
-  --device /dev/kfd --device /dev/dri \
-  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
-  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
-  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
-  -e RADIANCE_IMAGE_DEFAULTS=/opt/radiance/share/radiance/bench/defaults.env \
-  -e RADIANCE_IMAGE_SWITCHES=/opt/radiance/share/radiance/bench/switches.json \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
-  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
-  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
-  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
-  --prefill-span 4 --prefill-interleave 0 --prefix-resume exact \
-  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
-  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
-  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
-  --thinking-token-budget 16000 --default-max-tokens 32768
-```
-
-Qwen, AgentX: the [Qwen, 4x R9700](#qwen-4x-r9700) command with `--host 0.0.0.0` and
-
-```bash
-  -e RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47 -e RADIANCE_SPEC_DECODE_METRICS=1
-```
-
-```bash
-AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endpoint /v1/chat/completions \
-  --model qwen3.8-flash-next --tokenizer TOKENIZER_DIR --concurrency 32 \
-  --public-dataset semianalysis_cc_traces_weka_062126_256k --benchmark-duration 1200 \
-  --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"enable_thinking":true}}'
-```
-
-DeepSeek, decode and prefill: the [DeepSeek, 8x R9700 (2 nodes)](#deepseek-8x-r9700-2-nodes) commands.
-
-DeepSeek, AgentX: the same commands with one more option on the follower and on the leader
-
-```bash
-  --env-file run/deepseek-tp8/claude-code-agentx-follower.env
-  --env-file run/deepseek-tp8/claude-code-agentx-leader.env
-```
-
-```bash
-AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --endpoint /v1/chat/completions \
-  --model deepseek-v4.1-flash --tokenizer TOKENIZER_DIR --concurrency 32 \
-  --public-dataset semianalysis_cc_traces_weka_062126 --benchmark-duration 1200 \
-  --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}}'
-```
-
 ## Exact output
 
 Exact means deterministic and independent of load: at temperature 0 a prompt gets the same answer every
