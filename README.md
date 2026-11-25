@@ -62,8 +62,12 @@ AgentX, 32 sessions:
 
 ### Host setup
 
-Ubuntu 26.04 with the kernel's amdgpu driver and Docker, 512 GB of RAM a node, and
-`ttm.pages_limit=104857600` on the kernel command line.
+Once on each node, with Docker installed:
+
+```bash
+sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT="/&ttm.pages_limit=104857600 /' /etc/default/grub
+sudo update-grub && sudo reboot
+```
 
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
