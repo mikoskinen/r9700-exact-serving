@@ -202,7 +202,7 @@
   "branch_commit_image": "main image e736c019 (X79_T3_IMAGE, tags x79-225m-*)",
   "run_items": "80, 57-p6b, 57-p4zyzzzzz-ds-c-selftest, 57-p4zyzzzzz-ds-d-t3xab",
   "source_levers_line": "169, 179",
-  "source_run_summary": "gpu02/exl3-test/runs/t3x-selftest-main/SUMMARY.txt",
+  "source_run_summary": "node/exl3-test/runs/t3x-selftest-main/SUMMARY.txt",
   "needs_check": "",
   "notes": "Selftest pass (80). c4 122.2 -> 122.0 (-0.2 %). Identity deep / copy / greedy c1 IDENTICAL. Within the ~1-1.5 % start-to-start floor."
  },
@@ -225,7 +225,7 @@
   "branch_commit_image": "radiance-int7 (kv4 builder)",
   "run_items": "105, 57-p4zyzzzzz-ds-r00zzz-cz-w-kv4 (f9d1ef4b)",
   "source_levers_line": "170",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/nvlat/summary.txt, gpu02/exl3-test/runs/xdsm/kv4/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/nvlat/summary.txt, node/exl3-test/runs/xdsm/kv4/report.txt",
   "needs_check": "",
   "notes": "c8 -4..-6 %, cc 1.042. Bit-exact: values are FP4-rounded before the store anyway, kv4 report: nvfp4 vs bf16 IDENTICAL at 45 compares. KV4 x8 12.11.: resident expert units only +13..+19 a rank (idle KV already lent at c8)."
  },
@@ -271,7 +271,7 @@
   "branch_commit_image": "ds41-kvr d5a0c60 (off 5093ce9), image ds41-kvr-d5a0c602 8d2fbee6119e",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-x-kvr (69d5a856)",
   "source_levers_line": "172",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/kvr/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/kvr/report.txt",
   "needs_check": "",
   "notes": "pct computed (x4.0000). 19/19 strict compares IDENTICAL, tier hit md5-equal to cold. Speed B vs A: essay -0.6 %, code +0.1 %, mb c8 -1.2 % (inside spread). ref12 pins KVR=1 (L243)."
  },
@@ -294,7 +294,7 @@
   "branch_commit_image": "",
   "run_items": "",
   "source_levers_line": "173",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/ngreuse/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/ngreuse/summary.txt",
   "needs_check": "needs-check",
   "notes": "LEVERS: ~-83 s a start after the first (estimate). Local summary: A copy 237 s vs C reuse 196 s (-41 s). Status inferred from later rows (starts 'on ngshare'). Costs ~103 GiB /dev/shm between starts."
  },
@@ -524,7 +524,7 @@
   "branch_commit_image": "ds41-gg 4d70490 (image ds41-gg-4d70490d-5c13e555-l c8d938076fd7), image ds41-gg-8b311fcc (2e3ea030fa04)",
   "run_items": "57-p4zyzzzzz-ds-g-gemv (6ac9aff2), -g0-ggbench (75ecf866), gz-gemvacq (1d05f3e0)",
   "source_levers_line": "195",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/kbench-gg/kbsum-rot.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/kbench-gg/kbsum-rot.txt",
   "needs_check": "",
   "notes": "ABBAAB, 192-entry table: c1 +1.48 % (t95 1.70), c4 +1.89 % (t95 2.86), c8 ms 44.33 -> 41.93. 28k copy + c1 greedy IDENTICAL. A D1 fallback under gg_gemv 2 is a possible small follow-up."
  },
@@ -547,7 +547,7 @@
   "branch_commit_image": "ds41-mr efc420d + 5459114 / 3be3537 / 23ca6cd, image ds41-gg-8b311fcc (2e3ea030fa04)",
   "run_items": "gb-mrbench, gz-gemvacq (1d05f3e0)",
   "source_levers_line": "196",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/mrbench/mrsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/mrbench/mrsum.txt",
   "needs_check": "",
   "notes": "c1 59.52 -> 63.59 (+6.85 %), c4 119.13 -> 131.73 (+10.58 %). Emulator 7980/7980 byte-identical, engine copy + c1 greedy IDENTICAL. Bench geomean x1.18 (M1) .. x2.40 (M48). -> 1U-GQ / 1U-GS."
  },
@@ -708,7 +708,7 @@
   "branch_commit_image": "ds41-tree 9d0ce17 / b2e1064 / 6b143a9 / 2fc434e, images ds41-tree-9d0ce178, ds41-tree-6b143a96, ds41-tree-2fc434eb e53f7e060ccb",
   "run_items": "hsz-tree, hszzzzzzzzzz-tree (xtr), hxzzz-tree2, xtr3, xng (tree4), xtr5, 57-p4zyzzzzz-ds-iejzzzt-tree6",
   "source_levers_line": "205",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/tree5/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/tree5/summary.txt",
   "needs_check": "needs-check",
   "notes": "Exact only at <= 16 verify rows (tree5or IDENTICAL 2/2), 21-row verify DIFFERENT, localised to the EXL3 >16-row form (VX). First card run hit an engine bug (fixed). 1U-T1 row (outside this range) gives the later verdict."
  },
@@ -961,7 +961,7 @@
   "branch_commit_image": "ds41-d3 e37a7b8, image ds41-int11-d3569104 7a2d85b1a13e",
   "run_items": "57-p4zyzzzzz-ds-j-shexplane (3ffedcd3), INT11 screen",
   "source_levers_line": "216, 242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Code -2.37 %. The all-new-levers set N (incl. F4) gave c4 +7.8 %. c1 identity NH vs O IDENTICAL 20/20. -> 1U-F4."
  },
@@ -1214,7 +1214,7 @@
   "branch_commit_image": "ds41-k1 be92b15 + 1d1f782, image ds41-k1-1d1f782b 0175b84e9d1d",
   "run_items": "57-p4zyzzzzz-ds-gzzz-attnfold (3880c2e4), 57-p4zyzzzzz-ds-ha-k1prof",
   "source_levers_line": "225",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/k1prof/p1-summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/k1prof/p1-summary.txt",
   "needs_check": "",
   "notes": "Hypothesis was +11-13 % 1 user, real ~0.3 ms (~2 %): removed launches mostly overlapped. c8 +0.83 % (44.23 -> 43.87 ms). Copy, c1 greedy, 136k deep IDENTICAL. Rule: profiled per-op savings x ~0.15."
  },
@@ -1283,7 +1283,7 @@
   "branch_commit_image": "ds41-drk 61815e6 + 453a163 + a22a5df (image ds41-drk-a22a5dfa 8976ebdfc137), ds41-int2 745ce76 (image ds41-int2-745ce760-5c13e555-l)",
   "run_items": "57-p4zyzzzzz-ds-hp-drkbench (p0-drkbench 5117876e), -hq-drafterkern (9644b787)",
   "source_levers_line": "227",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/drkbench/drksum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/drkbench/drksum.txt",
   "needs_check": "",
   "notes": "Code +4.2 %, edit +5.4 %, c4 +3.1 %, c8 +1.2 %. Identity IDENTICAL (28k copy + 20 greedy), emulator 896/896."
  },
@@ -1306,7 +1306,7 @@
   "branch_commit_image": "ds41-drk 61815e6 + 453a163 + a22a5df",
   "run_items": "-hq-drafterkern (9644b787)",
   "source_levers_line": "227",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/drkbench/drksum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/drkbench/drksum.txt",
   "needs_check": "",
   "notes": "q8_0 at declare was refused by the builder ABI, so (c) became an exact bf16 form."
  },
@@ -1329,7 +1329,7 @@
   "branch_commit_image": "ds41-gg 4675795 (image ds41-gg-4675795f 980cee7ff21c), fix 1b8848a",
   "run_items": "57-p4zyzzzzz-ds-hr-depth0 (37d5f286), hcy-depth0b, hczz-d0attr (xda)",
   "source_levers_line": "228",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/d0attr/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/d0attr/summary.txt",
   "needs_check": "needs-check",
   "notes": "t95 +-40 % at c8, essay +5.7 %, code -5.0 % (noisy), c4 +1.3 %, still below NST 0 + D2 (c8 -13.8 %). Attribution: drafter VRAM (-217 units) the main cost, probes P16 vs P4096 -2.5 %. Status from L230."
  },
@@ -1375,7 +1375,7 @@
   "branch_commit_image": "ds41-dlend 6e02708 + 9461f81 on ds41-stack 57f11bd, image ds41-dlend-9461f81e-5c13e555-l",
   "run_items": "hczzzz-dlend, hxzya-vramstack5, hxzzy-stack2",
   "source_levers_line": "229",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/dlend/summary.txt, gpu02/exl3-test/runs/xdsm/vramstack/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/dlend/summary.txt, node/exl3-test/runs/xdsm/vramstack/summary.txt",
   "needs_check": "",
   "notes": "10.11. +-5.8 %. 11.11. B (lend 1 + backoff 3): c4 +10.1 %, c8 +4.7 %, VRAM start levers + DL vs hx-stack NST 5: c4 +10.5 %, c8 +11.8 %. Identity IDENTICAL under draft_lend -1 and B."
  },
@@ -1444,7 +1444,7 @@
   "branch_commit_image": "ds41-z0 32b96af (H), bc1f764 + 61cbb39 (A), c0cb43c + 3737580 (8-row level fix), image ds41-z0-3737580d-5c13e555-l (18649150e8fd)",
   "run_items": "57-p4zyzzzzz-ds-iej-z0ab (stopped at start guard), iej-z0ad-fix (b39d6a89)",
   "source_levers_line": "230",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/z0ab3/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/z0ab3/summary.txt",
   "needs_check": "",
   "notes": "pct computed. c8 173.0 -> 173.2. Arm C (+ argather 4, folds a / e off): c4 138.1, c8 173.2, no gain. First A/Bs stopped at the start guard (8-row arena level never declared) -> fixed. Identity IDENTICAL (summary)."
  },
@@ -1467,7 +1467,7 @@
   "branch_commit_image": "ds41-z0 7d8d3d9 + db9d30a, image ds41-z0-db9d30a9-5c13e555-l (de54c5376128)",
   "run_items": "iej-z0ac-w (c36b4189, stopped at start guard), iej-z0ad-fix",
   "source_levers_line": "230",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/z0ab3/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/z0ab3/summary.txt",
   "needs_check": "",
   "notes": "pct computed (arm D vs A). c4 136.4 vs 138.2. W adds +46 resident units, hit 97.82 vs 97.68 %, c8 unchanged -> c8 VRAM is not the limit."
  },
@@ -1513,7 +1513,7 @@
   "branch_commit_image": "ds41-z0 a1ca3c9 + 8f171a4, image ds41-z0-8f171a49-5c13e555-l (c51038ba90f4), int5 283c7a16",
   "run_items": "57-p4zyzzzzz-ds-iejzzzu-z0occ (ac7caa9b), r02z-z0occ2",
   "source_levers_line": "230",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/z0occ/summary.txt, gpu02/exl3-test/runs/xdsm/z0occ2/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/z0occ/summary.txt, node/exl3-test/runs/xdsm/z0occ2/summary.txt",
   "needs_check": "",
   "notes": "O6 vs A. z0occ (occ 3): c4 +1.6 %, c8 +0.9 %, c8 sd 2.0 -> 0.3. z0occ2 c8 O6 +1.3 % (T 0), +3.4 % (T 1). Identity IDENTICAL. Followed by draft_depth0 3 (DS-L237-c)."
  },
@@ -1536,7 +1536,7 @@
   "branch_commit_image": "ds41-lf d583904 (off int5), image ds41-lf-d583904e (e921126b6273)",
   "run_items": "r06z-lf (4c7c0732, xlf), RES12",
   "source_levers_line": "231, 244",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/res12/summary.txt, gpu02/exl3-test/runs/xdsm/lf/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/res12/summary.txt, node/exl3-test/runs/xdsm/lf/summary.txt",
   "needs_check": "",
   "notes": "Switched essay '-5.5 % ms' (summary: 19.30 -> 20.37 ms, slower), warm -5.2 %, starved_slab 516 -> 2978. place_test bytes bad=0, every RES12 read IDENTICAL across arms."
  },
@@ -1605,7 +1605,7 @@
   "branch_commit_image": "ds41-psk 4d4da8e (image a35c69a5b9c9), fix ds41-psk-fix cf7bbc7",
   "run_items": "r00z, r00y-pskloc (d1abd2ec), r00y2",
   "source_levers_line": "234",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/psk/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/psk/summary.txt",
   "needs_check": "",
   "notes": "64k -13.0 %, 16k -13.3 %. First build NOT EXACT alone (rank-local indexer mask re-dealt at cut layers) -> fixed cf7bbc7, verified IDENTICAL (r00y2). Staged experts every chunk, so staging-bound."
  },
@@ -1628,7 +1628,7 @@
   "branch_commit_image": "ds41-psk2 14a9831 / d6fcc24 (image ds41-psk2-d6fcc241 747d9ae8dc90), ds41-int7-pskglue 0391a6e",
   "run_items": "r00zz (c6ec2142), r00zz-psk2b (28e49ea0)",
   "source_levers_line": "234",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/psk2/summary.txt, gpu02/exl3-test/runs/xdsm/psk2b/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/psk2/summary.txt, node/exl3-test/runs/xdsm/psk2b/summary.txt",
   "needs_check": "",
   "notes": "35 s target met. K8 31.37 s (-37.9 %). Identity IDENTICAL at 31 + 17 compares. Mid-prompt hit fallback: K4 worst +3.04 s, K8 +4.40 s. K8 default for the next confirmation. 12.11. correction -> PSK-L20 row."
  },
@@ -1674,7 +1674,7 @@
   "branch_commit_image": "",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-ce-d0ab, base1113",
   "source_levers_line": "237",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/d0ab/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/d0ab/summary.txt",
   "needs_check": "",
   "notes": "c1 107.4 fine, the occupancy rule sits inside plan_zero(), which draft_depth0 0 skips. Identity B / C vs A 20/20 IDENTICAL."
  },
@@ -1697,7 +1697,7 @@
   "branch_commit_image": "",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzz-ce-d0ab",
   "source_levers_line": "237",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/d0ab/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/d0ab/summary.txt",
   "needs_check": "",
   "notes": "Occupancy unaffected by code. Identity C vs A 20/20 IDENTICAL."
  },
@@ -1766,7 +1766,7 @@
   "branch_commit_image": "ds41-cap48 e5acfbc (on int9, image ds41-cap48-e5acfbcf), merged ds41-int10 f6ef7cc",
   "run_items": "cap48r",
   "source_levers_line": "238",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/cap48/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/cap48/report.txt",
   "needs_check": "",
   "notes": "D d D d. Under the cap gs16 vs a1 20/20 IDENTICAL, 19266 drafts trimmed in 419 steps, 1u never capped (max 6 rows)."
  },
@@ -1789,7 +1789,7 @@
   "branch_commit_image": "int10 ea613fc / f6ef7cc (image 0a60fffd3b3c)",
   "run_items": "arw, arc2",
   "source_levers_line": "223, 239",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/arc/summary.txt, gpu02/exl3-test/runs/xdsm/arw/arwsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/arc/summary.txt, node/exl3-test/runs/xdsm/arw/arwsum.txt",
   "needs_check": "",
   "notes": "64k 11.98 -> 11.72 s (-2.17 %), c8 -0.14 %, newcomer step -0.80 %. ARW: coded = plain bytes (189 compares). Registered as MAR (L223), Maya's P2P / ReBAR / pipelined AR were already in the engine."
  },
@@ -1835,7 +1835,7 @@
   "branch_commit_image": "image ds41-int11-d3569104 7a2d85b1a13e",
   "run_items": "INT11 screen, c4lev",
   "source_levers_line": "242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "needs-check",
   "notes": "MX12 one pair (confounded per ref12 note), code +2.68 %. WV24: essay +1.40 %, code -0.74 %. On-card mix_wv 18/18 byte-identical. -> 1U-MX."
  },
@@ -1858,7 +1858,7 @@
   "branch_commit_image": "image ds41-int11-d3569104 7a2d85b1a13e",
   "run_items": "INT11 screen",
   "source_levers_line": "242, 243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Code +0.89 %, one launch vs two -11.5..-27 % per op, gq_pair 60/60 byte-identical. -> 1U-GQ."
  },
@@ -1881,7 +1881,7 @@
   "branch_commit_image": "image ds41-int11-d3569104 7a2d85b1a13e",
   "run_items": "INT11 screen",
   "source_levers_line": "242, 243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Code +1.55 %. c1 identity of all new levers vs O IDENTICAL 20/20. -> 1U-E2."
  },
@@ -1904,7 +1904,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 screen",
   "source_levers_line": "242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "needs-check",
   "notes": "C40 +2.09 %, C30 +2.16 % per the summary line, but the coordinator's reading was essay ~+0.5 %, code -2..-3 %, ambiguous. -> 1U-C1T."
  },
@@ -1927,7 +1927,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 screen",
   "source_levers_line": "242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "needs-check",
   "notes": "Spaced H250 -0.89 %, H500 -1.83 %, clustered -0.19 / -0.60 %, TTFT +0.2..+0.5 s. Metric not named in row. c8 hold 500 vs 0 IDENTICAL 20/20. See CBH row (L292)."
  },
@@ -1950,7 +1950,7 @@
   "branch_commit_image": "image ds41-int12-6f3e70df-579d0bc2-l 1aea51ac2f98",
   "run_items": "ref12, prof1, prof2",
   "source_levers_line": "243, 245",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/ref12/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/ref12/summary.txt",
   "needs_check": "",
   "notes": "Reference read, no A/B base. c4 MET (+8.3 % over 160), 1u essay warm 90.46, switched 82.24, c8 184.5 (-7.8 % short), cold 136k 24.66 s MET. Real c16 BI check passed in PROF12 prof1 (gs16 vs a1 20/20). mbt3 harness."
  },
@@ -1973,7 +1973,7 @@
   "branch_commit_image": "",
   "run_items": "RES12",
   "source_levers_line": "244",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/res12/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/res12/summary.txt",
   "needs_check": "needs-check",
   "notes": "c8 -0.2 %. Arm-to-knob mapping (GAIN2 = B5 prefill heat gain) inferred from the arm list. Every read IDENTICAL across arms."
  },
@@ -1996,7 +1996,7 @@
   "branch_commit_image": "",
   "run_items": "RES12",
   "source_levers_line": "244",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/res12/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/res12/summary.txt",
   "needs_check": "needs-check",
   "notes": "c8 +0.1 %. Arm-to-knob mapping (GAIN05 = A8 gain < 1) inferred from the arm list."
  },
@@ -2019,7 +2019,7 @@
   "branch_commit_image": "",
   "run_items": "RES12",
   "source_levers_line": "244",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/res12/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/res12/summary.txt",
   "needs_check": "",
   "notes": "c8 -1.0 %, stream 146 -> 168 MB a step: the extra shadow slots come out of resident weights (2921 -> 2869 units). The switch gap (81.66 vs 90.58 warm) untouched by fill / gain / shadow knobs."
  },
@@ -2042,7 +2042,7 @@
   "branch_commit_image": "ds41-slot 4cf3501 (image ds41-slot-4cf3501f d79926039d6b), ds41-epb f637982 (image 5dc295f627ec)",
   "run_items": "57-p4zyzzzzz-ds-p-slotsum (c10529e9), -q-epbal (d2adb010, held), zepb, zepb2 (cancelled)",
   "source_levers_line": "199, 212, 246",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/slotsum/selftest/SUMMARY.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/slotsum/selftest/SUMMARY.txt",
   "needs_check": "",
   "notes": "E hot-8 vs O idle extras, all arms ~-30..-34 % vs int12 184.0 (declared extras cost residency). Changes the reference once by design, strict staggered check FAILED 1/20 (BI hole). User: measure only. F1 (cost-based rebalance) folded in."
  },
@@ -2065,7 +2065,7 @@
   "branch_commit_image": "ds41-launch 0f65666, image ds41-launch-0f65666a-38b88ec6-l af80cdf344f9",
   "run_items": "zzzlaunch (ef3f6a0f), zzzfuse arm R",
   "source_levers_line": "248",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zzzlaunch/lchsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zzzlaunch/lchsum.txt",
   "needs_check": "",
   "notes": "Stamped: four sites 821.5 -> 514.8 us, real c8 agg 190.85 -> 191.10 (+0.13 %). Lesson: stamped gaps overstate real launch time ~5x. Chained forms (c) not built. int16 = int15 + rfuse 2 + route_copy_ov 1 (L249)."
  },
@@ -2088,7 +2088,7 @@
   "branch_commit_image": "ds41-fuse-e231d919-38b88ec6-l 4419a17d60a7",
   "run_items": "zsoak16, zzzc16, rfst",
   "source_levers_line": "250",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zsoak16/soaksum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zsoak16/soaksum.txt",
   "needs_check": "",
   "notes": "RFST M 49..170 PASS (450 of 450 byte-identical), identity 5/5 IDENTICAL, 8 cycles x 20 probes, 0 differing, 0 errors, pin held 8/8, over 36.3 min. Speed confirmation in runs/xdsm/zzzc16/zc16sum.txt (1u 90.77 tok/s)."
  },
@@ -2134,7 +2134,7 @@
   "branch_commit_image": "ds41-fuse (image ds41-fuse-e231d919-38b88ec6-l 4419a17d60a7), RFST dcee256 (st2 be78eec84ba0)",
   "run_items": "57-p4zyzzzzz-ds-r92zzzzzz-ref12zzzzzz-zzzb-fuse, zzzc16, int16 soak",
   "source_levers_line": "249, 252",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zzzfuse/fusesum.txt, gpu02/exl3-test/runs/xdsm/zzzc16/zc16sum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zzzfuse/fusesum.txt, node/exl3-test/runs/xdsm/zzzc16/zc16sum.txt",
   "needs_check": "",
   "notes": "F (rfuse 2 + RCO) c8 agg +0.13 % (inconclusive), c16 step -0.46 %, int16 1u ABBA 90.24 -> 90.77. Identity gate 6/6 incl. staggered. Launch-gap line CLOSED: ~0.15 % c8, ~0.5 % c16 in total."
  },
@@ -2157,7 +2157,7 @@
   "branch_commit_image": "ds41-fuse (image 4419a17d60a7)",
   "run_items": "zzzb-fuse singles",
   "source_levers_line": "249, 252",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zzzfuse/fusesum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zzzfuse/fusesum.txt",
   "needs_check": "",
   "notes": "Pre-build reading: removes no critical-path gap (mix_finish carries the barrier the next GEMV needs). Fits the earlier MIX_FUSE loss (L168)."
  },
@@ -2180,7 +2180,7 @@
   "branch_commit_image": "ds41-fuse (image 4419a17d60a7)",
   "run_items": "zzzb-fuse P0 per-call gate",
   "source_levers_line": "249, 252",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zzzfuse/fusesum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zzzfuse/fusesum.txt",
   "needs_check": "",
   "notes": "pct computed (fused vs pair). pcn -> router GEMM and AR -> pcn fusions not built (no clean form, AR_PCN measured ~0 on 10.11.)."
  },
@@ -2203,7 +2203,7 @@
   "branch_commit_image": "plugin ds41-k25u 38b88ec (off 579d0bc), image ds41-k25u-678c176f-38b88ec6-l bc91c460c13f",
   "run_items": "zzk25 (one card), zzk25s",
   "source_levers_line": "253",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zzk25s/k25sum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zzk25s/k25sum.txt",
   "needs_check": "",
   "notes": "c16 +0.81 %, 1u 89.49 -> 89.91 (+0.47 %), decode p50 -0.97 %. One card: gate_up -5.5 %, down -1.8 % at M 1-16, bytes PASS on 408 rows, CPU check. Identity IDENTICAL incl. strict staggered."
  },
@@ -2226,7 +2226,7 @@
   "branch_commit_image": "",
   "run_items": "zsa14",
   "source_levers_line": "254",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/zsa14/sa14sum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/zsa14/sa14sum.txt",
   "needs_check": "needs-check",
   "notes": "Newcomer matched -18.6 ms, but ~10 decode steps after each newcomer +0.7 ms each (loan-recall refill), c16 +0.5 %. LEVERS exact column 'exact (staging only)', no identity result. Setting names from L253."
  },
@@ -2272,7 +2272,7 @@
   "branch_commit_image": "ds41-int14c 678c176 (off bf8f557), image ds41-int14c-678c176f-579d0bc2-l a7ca6bcdf07b",
   "run_items": "...-ref12zzzzzz-yzint14c (34ec9b64), zref14, zrq14",
   "source_levers_line": "256, 257",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt, gpu02/exl3-test/runs/xdsm/ref14/r14sum.txt, gpu02/exl3-test/runs/xdsm/zrq14/zq14sum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt, node/exl3-test/runs/xdsm/ref14/r14sum.txt, node/exl3-test/runs/xdsm/zrq14/zq14sum.txt",
   "needs_check": "",
   "notes": "Identity gate 10/10 incl. staggered. c8 +0.16 % measured (window-biased), steady-state model +1.36 % (inferred), 1u +0.48 %, 136k 25.03 -> 24.57 s. zrq14 in-process vs int12: c1 +3.24 %, c4 +1.57 %, 1u +0.29 %."
  },
@@ -2295,7 +2295,7 @@
   "branch_commit_image": "ds41-nc 919a74b (image ds41-nc-919a74bf-579d0bc2-l 1d6b4f9f0d82), int14c fc13eaf",
   "run_items": "...-ref12zzzzzz-yync (05a1feff, folded), yzint14c",
   "source_levers_line": "258, 257",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt",
   "needs_check": "",
   "notes": "First read -7.05 % / -37.6 ms a newcomer was a P12SPLIT edge-step artefact. Strict staggered A9 alone 20/20. Any c16 share unsplit."
  },
@@ -2318,7 +2318,7 @@
   "branch_commit_image": "ds41-nc 919a74b, int14c fc13eaf",
   "run_items": "yzint14c",
   "source_levers_line": "258, 257",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt, gpu02/exl3-test/runs/xdsm/gpbench/gpsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt, node/exl3-test/runs/xdsm/gpbench/gpsum.txt",
   "needs_check": "",
   "notes": "A11 cold 1100 / 1300 identical, BI covered by int14's staggered ALL 20/20. 8 ranged entries from P0."
  },
@@ -2341,7 +2341,7 @@
   "branch_commit_image": "ds41-swl 29c003e (image ds41-swl-29c003e8-579d0bc2-l d8b15f6c393f), int14c ab7eb84",
   "run_items": "...-ref12zzzzzz-yswl (a1559358)",
   "source_levers_line": "259",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yswl/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yswl/summary.txt",
   "needs_check": "",
   "notes": "Switched essay 79.18 -> 79.81 tok/s (+0.8 %), starved_slab 600 -> 26. Identity across 4 arms IDENTICAL, BI via int14 staggered ALL. In int14 ALL: switched essay +2.90 %."
  },
@@ -2364,7 +2364,7 @@
   "branch_commit_image": "ds41-swl 29c003e, int14c ab7eb84",
   "run_items": "...-ref12zzzzzz-yswl (a1559358)",
   "source_levers_line": "259",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yswl/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yswl/summary.txt",
   "needs_check": "",
   "notes": "With L1, one c8 block. L1G100: c8 187.1 (+1.2 %). Switched +0.8 %."
  },
@@ -2387,7 +2387,7 @@
   "branch_commit_image": "ds41-a4 24c2558 + b449f09 + 578d007 (image ds41-a4-578d0077-90b1fef5-l 6a553ab0db9a), table d55ad354",
   "run_items": "...-ref12zzzzzz-yd2m, yzint14c",
   "source_levers_line": "260, 257",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yd2m/x1/ydsum.txt, gpu02/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yd2m/x1/ydsum.txt, node/exl3-test/runs/xdsm/yzint14c/x1/yzsum.txt",
   "needs_check": "",
   "notes": "P0 bench: c8 M 8 0 us saved (D2 already optimal), c16 M 16 -748 us a step. c16 CAP48 296.7 -> 304.7 (+2.70 %). Emulator 32904 cases 0 fail."
  },
@@ -2410,7 +2410,7 @@
   "branch_commit_image": "image ds41-int13-c633a474 6da1e1c5bcdb, gate fn4-x3-sp3 5f0352a8, int14c 678c176",
   "run_items": "XPUSH int13 screen (xpush)",
   "source_levers_line": "261,257",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/xpush/x1/xpsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/xpush/x1/xpsum.txt",
   "needs_check": "",
   "notes": "AR bench 1024 rows 867.1 -> 667.6 us (-23.0 %), c8 agg 184.7 -> 185.2 (+0.32 %), newcomer step -0.72 %, c16 agg -0.27 %, cold 64k -1.76 %. Identity 11/11. Adopted in the int14 base (L257)."
  },
@@ -2433,7 +2433,7 @@
   "branch_commit_image": "ds41-ll c6ef5cb + 1b68d34, image ds41-ll-1b68d342-90b1fef5-l 8cb19c36b0f0, selftest fix d450be5",
   "run_items": "yll (P0 selftest)",
   "source_levers_line": "262,271",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yll/l1/yllsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yll/l1/yllsum.txt",
   "needs_check": "",
   "notes": "pct computed. T8 62.2 -> 280.3, T48 96.0 -> 1929.9 us, back-to-back T1 12.7 -> 99.1. Bytes 36/36 + 54/54 + 2x1000 stress clean. Hypothesis: uncombined 8-byte system-scope stores. Summary file holds no speed rows."
  },
@@ -2479,7 +2479,7 @@
   "branch_commit_image": "engine ds41-pfx 8b52bd9, plugin ds41-x3d-pf 90b1fef, image ds41-pfx-8b52bd9e-90b1fef5-l ee17eb2e2200",
   "run_items": "yd2m (arm P), ypfx (staged fallback, not run)",
   "source_levers_line": "263",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/yd2m/x1/ydsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/yd2m/x1/ydsum.txt",
   "needs_check": "",
   "notes": "c8 newcomer step 536.9 -> 533.9 ms (-0.56 %), op time at M 1110 gate_up -6.66 %, down -6.78 %. P0 on-card byte check 20/20 shapes."
  },
@@ -2502,7 +2502,7 @@
   "branch_commit_image": "int11 image 7a2d85b1a13e",
   "run_items": "C4LEV (c4lev)",
   "source_levers_line": "264",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/c4lev/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/c4lev/summary.txt",
   "needs_check": "needs-check",
   "notes": "new = N (all on). F4 60.12 (+0.9 %), E2 59.12 (-0.8 %), GQ 59.69 (+0.1 %), MX12 60.39 (+1.3 %), MX24 59.67 (+0.1 %). Earlier c4 N +7.7 % was prompt mix. Exactness not reported for this screen (only warm-up identity)."
  },
@@ -2548,7 +2548,7 @@
   "branch_commit_image": "plugin gate_up schedule fix 579d0bc, image int10x 04882136 f5d557c1b16d",
   "run_items": "g12b (gate 2, one card), x3d (gate 3, int10x)",
   "source_levers_line": "267",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/x3d/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/x3d/summary.txt",
   "needs_check": "",
   "notes": "LEVERS gives % only (summary: c1 106.0 -> 108.3). c8 +1.97 % (mix match), essay ~+1 % warm, c4 inconclusive (order artefact), 64k -1.4 % (noise). One card: 408/408 bytes, gate_up -7.3 %, down -9.0 %. K2 layers only."
  },
@@ -2571,7 +2571,7 @@
   "branch_commit_image": "image int11b 84f682aa cd436f2952ec",
   "run_items": "1ub (XP screen)",
   "source_levers_line": "268",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/1ub/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/1ub/summary.txt",
   "needs_check": "",
   "notes": "code -6.2 %, c4 -1.2 %, prefetched copies used ~9-10 %. Summary: essay 77.98 -> 74.12, identity 20/20 IDENTICAL. Earlier XPOFF (prefetch off) was in the base because copies did nothing at DS width 5120."
  },
@@ -2640,7 +2640,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 all-switch screen, C4LEV",
   "source_levers_line": "272,242,264,243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Values from L242: code +0.89 %, per-op one launch vs two -11.5..-27 %, gq_pair 60/60 byte-identical on card. c4 16-row step +0.1 % (C4LEV). L272 itself lists it as not built."
  },
@@ -2663,7 +2663,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 all-switch screen, C4LEV, ref12 info pair",
   "source_levers_line": "273,242,264,243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "needs-check",
   "notes": "pct = MX12, one pair (L242), MX24 essay +1.40 %, code -0.74 %, MX12 code +2.68 %. c4 16-row step MX12 +1.3 %, MX24 +0.1 %. ref12 MX12 info pair confounded. Left at 0, final status not recorded."
  },
@@ -2686,7 +2686,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 all-switch screen, C4LEV",
   "source_levers_line": "274,290,242,264,243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Values from L242: code +1.55 %, c4 16-row step -0.8 % (C4LEV). Audit pricing (L290): est. 1u +1.8 %, c4 +1.4 %, c8 +0.8 %. Identity: all int11 levers vs off 20/20."
  },
@@ -2709,7 +2709,7 @@
   "branch_commit_image": "ds41-d3 e37a7b8, rows-gated ds41-int12-f4g 08dbd94",
   "run_items": "INT11 all-switch screen, C4LEV",
   "source_levers_line": "275,242,264",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Values from L242: code -2.37 %. c4 16-row step +0.9 %, >16 rows +1.5 % (C4LEV). The rows-gated variant was dropped without its own run."
  },
@@ -2778,7 +2778,7 @@
   "branch_commit_image": "",
   "run_items": "INT11 all-switch screen",
   "source_levers_line": "278,242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "needs-check",
   "notes": "L242 summary line C40 +2.09 %, C30 +2.16 %, but coordinator read essay ~+0.5 %, code -2..-3 % -> keep 50. Primary pct ambiguous. Output-exact by design (verify count only), identity not stated."
  },
@@ -2893,7 +2893,7 @@
   "branch_commit_image": "ds41-pskl20 25aab56, image ds41-pskl20-25aab56c 8cb93efecb40",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-pskl20",
   "source_levers_line": "285,307",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/pskl20/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/pskl20/summary.txt",
   "needs_check": "",
   "notes": "Identity strict 26/26 (alone / load / hits). LD (with PSK-DS) 34.47 s (-6.3 %), 64k -4.0 %, mb c8 inert (175.3 vs 174.1). In stack5 S5 pins (L307)."
  },
@@ -2916,7 +2916,7 @@
   "branch_commit_image": "ds41-pskl20 25aab56, image ds41-pskl20-25aab56c 8cb93efecb40",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-pskl20",
   "source_levers_line": "286,307",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/pskl20/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/pskl20/summary.txt",
   "needs_check": "",
   "notes": "64k -2.4 %, c8 +0.0 % (newcomer dspark_ctx only 3-4 ms of a 0.6 s step). Drafter answers + drafted / accepted counts EQUAL. In stack5 S5 pins (PF)."
  },
@@ -2939,7 +2939,7 @@
   "branch_commit_image": "ds41-pskcr e9e529d, image ds41-pskcr-e9e529d2 a4e6c7642702",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-scr, scr2",
   "source_levers_line": "287,296",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/pskcr2/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/pskcr2/summary.txt",
   "needs_check": "",
   "notes": "Identity 33/33. -9.5 % at 78k. One-step replays slower than the one-chunk fallback (40960: 2.63 vs 2.48 s), three-step case faster (1.72 vs 3.71 s). S5T (tail-only + CR) = new DS base (L296)."
  },
@@ -2962,7 +2962,7 @@
   "branch_commit_image": "ds41-pskcr2 d4540a8, image ds41-pskcr2-d4540a8e e2dfc7e040b8",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-v-scr3",
   "source_levers_line": "287",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/pskcr3/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/pskcr3/summary.txt",
   "needs_check": "needs-check",
   "notes": "LEVERS has no scr3 result. Summary only: at most one replay a chain, chR turn-1 hit TTFT B 4.03 -> C 2.49 s (-38.2 %), identity 38/38 IDENTICAL."
  },
@@ -2985,7 +2985,7 @@
   "branch_commit_image": "ds41-int9b f119c56, image 185ca99c71ca",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-qkbench, 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b",
   "source_levers_line": "288,273,243",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i9b/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i9b/summary.txt",
   "needs_check": "",
   "notes": "64k % from L273 (i9b). Bench: pair 1874.7 -> 1384.1 us = -1.28 s a 136k prefill (audit range 0.47-1.46 s). Fused form loses at decode (+83 % at 1 row) -> prefill only. Bench also in kbench2/kbsum2.txt."
  },
@@ -3008,7 +3008,7 @@
   "branch_commit_image": "ds41-e1 920438e + d4b1b32, image ds41-e1-920438e7 06ed161fe151",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-reng",
   "source_levers_line": "289",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/e1/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/e1/summary.txt",
   "needs_check": "",
   "notes": "Identity 23/23 (alone / load / hits + cross-start). deepq 33.54 -> 32.94 (-1.79 %), 64k code -1.27 %, 16k code +1.05 % (small loss). +0.19 GiB / rank activation arena."
  },
@@ -3031,7 +3031,7 @@
   "branch_commit_image": "ds41-int9b f119c56, image 185ca99c71ca",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-qkbench, 57-p4zyzzzzz-ds-r00zzz-cz-x-kvrzzzz-i9b",
   "source_levers_line": "291",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i9b/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i9b/summary.txt",
   "needs_check": "needs-check",
   "notes": "Bench est. 136k (PSK off) 4.47 -> 4.05 s. In-server result not in LEVERS, i9b summary: cold 64k 12.03 -> 11.87 s (-1.33 %) 'borderline -- park'. Not in ref12 pins."
  },
@@ -3054,7 +3054,7 @@
   "branch_commit_image": "ds41-int9b f119c56",
   "run_items": "qkbench, i9b",
   "source_levers_line": "291",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i9b/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i9b/summary.txt",
   "needs_check": "",
   "notes": "The engine already launches the score at the bucketed live width, so NI saves only the gap to the bucket (<= ~0.05 s at 136k). i9b summary: 64k +0.04 %, c8 +0.08 % (noise)."
  },
@@ -3077,7 +3077,7 @@
   "branch_commit_image": "",
   "run_items": "qkbench",
   "source_levers_line": "291",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/kbench2/kbsum2.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/kbench2/kbsum2.txt",
   "needs_check": "",
   "notes": "Bytes matched on the tested data, but kbench2's IXF8 stress line differs (96 / 34 words) and one rebased exponent per 128-vector cannot hold four ue8m0 scales. F8B (9.0 ms, -42 %) not exact by construction. Score->top-k fusion max ~0.31 s, not built."
  },
@@ -3100,7 +3100,7 @@
   "branch_commit_image": "ds41-dst a088567 / 7bf74f2 / b890cee",
   "run_items": "r00zzz-c-dst (02dfda66)",
   "source_levers_line": "292",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/dst/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/dst/summary.txt",
   "needs_check": "needs-check",
   "notes": "Budget 1088 vs 2112: TPOT-in p90 268 vs 491 ms (-45 %), turnover TTFT max +24 %. c4 tok/s per cell unreliable. Exact only under sched_bi_chunk 3/4 (bi_chunk 0 cells differed 4/120). No adoption decision recorded."
  },
@@ -3123,7 +3123,7 @@
   "branch_commit_image": "ds41-dst 7bf74f2, slot fix 3f7fc59",
   "run_items": "r00zzz-c-dst, tdst2",
   "source_levers_line": "292,293",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/dst/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/dst/summary.txt",
   "needs_check": "needs-check",
   "notes": "pct computed, N 1280 (N 2112: 5.7 s). Long TTFT 30.92-31.06 vs 21.33 s (+45 %). Never acts without decode rows. Recycled-slot bug fixed 3f7fc59. Not in stack5 pins, no explicit verdict."
  },
@@ -3146,7 +3146,7 @@
   "branch_commit_image": "ds41-noa 0f0294b + 3f7fc59, image ds41-noa-0f0294be a615f42d9f3a",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-tdst2",
   "source_levers_line": "293,307",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/dst2/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/dst2/summary.txt",
   "needs_check": "needs-check",
   "notes": "LEVERS has no tdst2 result. Summary only: D3 15738 -> D3+NOA 1591 ms (-89.9 %), turnover p50 -77.7 %, long TTFT +28.1 %, mixed step +15.0 %, long and newcomers vs alone IDENTICAL."
  },
@@ -3169,7 +3169,7 @@
   "branch_commit_image": "ds41-int10b bafca0c, int11 beb243b",
   "run_items": "INT11 all-switch screen",
   "source_levers_line": "294,242",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/i11u/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/i11u/summary.txt",
   "needs_check": "",
   "notes": "Spaced H500 -1.83 %, clustered -0.19 / -0.60 %, TTFT +0.2..+0.5 s. c8 hold 500 vs 0 IDENTICAL 20/20. Estimate had been +4..+8 % with deliberate co-batching."
  },
@@ -3192,7 +3192,7 @@
   "branch_commit_image": "ds41-sahb 647830e + 95a901e, image ds41-sahb-647830e8 911c696ea104",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-usahb",
   "source_levers_line": "296",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/sahb/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/sahb/report.txt",
   "needs_check": "",
   "notes": "Screen: newcomer step B 613.4 / 577.7 ms, pick 1 588.0, pick 2 570.8, pick 0 798.7 (loss). Staging and streaming share the link. Report values re-judged offline. Identity from summary (20/20)."
  },
@@ -3215,7 +3215,7 @@
   "branch_commit_image": "ds41-sahb 647830e, image ds41-sahb-647830e8 911c696ea104",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-usahb",
   "source_levers_line": "296",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/sahb/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/sahb/report.txt",
   "needs_check": "",
   "notes": "1u essay 72.4 -> 68.7 (-5 %). SA+HB together -1.7 % c8. Host-pool units were already equal across ranks (424.6 / 424.2 / 416.9 / 425)."
  },
@@ -3238,7 +3238,7 @@
   "branch_commit_image": "int9 0cb6fd31 (S5T pins)",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-x-kvrz-sp",
   "source_levers_line": "296",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/sp/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/sp/summary.txt",
   "needs_check": "",
   "notes": "+0.4 % = noise, like for like the full-plan step costs ~0.42 ms / row stage-all vs ~0.47 with pick. c8 is set by co-batching (decode share +3-4 %) at a TTFT cost. Identity IDENTICAL everywhere."
  },
@@ -3261,7 +3261,7 @@
   "branch_commit_image": "",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-ncprof",
   "source_levers_line": "297,295",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/ncprof/report.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/ncprof/report.txt",
   "needs_check": "",
   "notes": "c4 41.0 -> 43.5 tok/s (+6.1 %), weak contrast (only 611 drafted a run). draft_depth0 2 forces depth 0 everywhere and loses 1u drafting (code +8.7 % with it). DP0 itself (depth 0 only during a prefill) not built."
  },
@@ -3284,7 +3284,7 @@
   "branch_commit_image": "ds41-dlw df86048, image ds41-dlw-df860485-5c13e555-l 867d4364fb7e",
   "run_items": "57-p4zyzzzzz-ds-iejzz-dlw, iejzzb-dlwb",
   "source_levers_line": "298,276",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/dlw/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/dlw/summary.txt",
   "needs_check": "",
   "notes": "q6_K 128.0 (+2.1 %), essay / edit within +-0.8 %, c4 / c8 +0.3..+0.8 % (noise), acceptance unchanged. Freed 0.21 / 0.26 GiB went to the KV cache. Identity on 28k copy + 20 greedy."
  },
@@ -3330,7 +3330,7 @@
   "branch_commit_image": "ds41-vram 92746a8, image ds41-vram-92746a84-5c13e555-l",
   "run_items": "hxz-vramstack, vramstack5",
   "source_levers_line": "299",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/vramstack/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/vramstack/summary.txt",
   "needs_check": "",
   "notes": "NST 5 essay +1.9 %, code +3.7 %, edit +6.6 %, c4 +2.4 %, NST 0 c8 +5.2 %, 136k -0.3 %, units +142..+154 (est. 145) but ms per unit ~45-62 % of the sweep slope."
  },
@@ -3353,7 +3353,7 @@
   "branch_commit_image": "ds41-kvfp8 7367bc8 + a64aa1c, image ds41-kvfp8-a64aa1c0",
   "run_items": "hszzzzzzzzzb-small2 (KVWIN follow-up start)",
   "source_levers_line": "299,301",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/small/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/small/summary.txt",
   "needs_check": "",
   "notes": "n 2: +28 units (2777 vs 2749), c4 -2.3 %, essay -0.9 %, 136k 52.76 s. Exact by construction check + emulator 679 checks."
  },
@@ -3399,7 +3399,7 @@
   "branch_commit_image": "ds41-small 2b03903, image ds41-small-2b039035",
   "run_items": "hszzzzzzzzzb-small2 (xsm)",
   "source_levers_line": "301,300",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/small/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/small/summary.txt",
   "needs_check": "",
   "notes": "code -1.0 %, c4 +0.4 %, c8 -0.6 %, 136k -0.14 %. Identity 23/23. The same levers are part of the adopted NST 5 set (DS-L301-b)."
  },
@@ -3422,7 +3422,7 @@
   "branch_commit_image": "ds41-small 2b03903, image ds41-small-2b039035",
   "run_items": "hszzzzzzzzzb-small2 (xsm)",
   "source_levers_line": "301",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/small/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/small/summary.txt",
   "needs_check": "",
   "notes": "code +3.3 %, edit +1.4 %, c4 +2.0 %, c8 -0.3 %. Ctx refill check: essay acceptance -4.2 %. Stamped c4 conf 1 vs 0: tok a step +15.9 %, tok/s +2.7 %, step +103 ms -> rows-1 gate keeps c4 off it."
  },
@@ -3491,7 +3491,7 @@
   "branch_commit_image": "image ds41-int2-745ce760",
   "run_items": "hx-stack",
   "source_levers_line": "303",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/stack/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/stack/summary.txt",
   "needs_check": "",
   "notes": "Target 90 (+38.5 % needed). NST 5 essay 61.0, code 104.4, edit 156.6, c4 NST 0 136.9 / NST 5 120.9, c8 171.1 / 155.3, 136k NST 0 51.48 s."
  },
@@ -3514,7 +3514,7 @@
   "branch_commit_image": "",
   "run_items": "hxzzy-stack2",
   "source_levers_line": "304",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/stack2/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/stack2/summary.txt",
   "needs_check": "",
   "notes": "NST 5 code 119.0, edit 169.1, c4 128.9, c8 172.9, NST 0 essay 66.8, c4 138.5, c8 180.3, 136k 50.34 s. NST 5 trails NST 0 at c4 / c8 by -6.9 / -4.1 %."
  },
@@ -3537,7 +3537,7 @@
   "branch_commit_image": "ds41-int4 cea53a4, image ds41-int4-cea53a40-5c13e555-l 482004322f11",
   "run_items": "57-p4zyzzzzz-ds-iejzzzszzzzzz-bi-g-stack3 (xs3)",
   "source_levers_line": "305",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/stack3/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/stack3/summary.txt",
   "needs_check": "",
   "notes": "base A, new P (bi 2). Identity 25/25 incl. loaded vs alone. NST 5 essay 73.9 / 74.0 / 72.9, NST 0 c8 184.6 -> 174.3 (-5.6 %), 136k 50.03 s. T1 S vs A: code +8.7 %, c4 +5.2 %, c8 -5.7 %."
  },
@@ -3560,7 +3560,7 @@
   "branch_commit_image": "ds41-int7-0391a6ec b54f9224a056",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-b-stack4",
   "source_levers_line": "306",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/stack4/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/stack4/summary.txt",
   "needs_check": "needs-check",
   "notes": "LEVERS has no result. Summary only: best S 136k 33.52 s (MET), essay T0 73.3, c4 145.8, c8 173.3, LF arm essay -15.3 %, one identity compare NOT IDENTICAL. Status inferred: stack5 builds on it."
  },
@@ -3583,7 +3583,7 @@
   "branch_commit_image": "image ds41-int8-7e033848 d75ba2d615b3",
   "run_items": "57-p4zyzzzzz-ds-r00zzz-cz-uzzzz-stack5",
   "source_levers_line": "307,296",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/stack5/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/stack5/summary.txt",
   "needs_check": "needs-check",
   "notes": "LEVERS has no result row. Summary only: best 135k S5T 26.63 s (MET), essay T0 S5 73.6, T1 S5 82.8, c4 S5 150.7, c8 S5T 173.6."
  },
@@ -3606,7 +3606,7 @@
   "branch_commit_image": "ds41-bi 5e71e4d + d7ea2ab, image ds41-bi-d7ea2abd-5c13e555-l afee60bf2f35",
   "run_items": "57-p4zyzzzzzzzzzz-bi-c-fixab",
   "source_levers_line": "308",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/bifix/li-nst0-summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/bifix/li-nst0-summary.txt",
   "needs_check": "",
   "notes": "NST 0: loaded vs alone 20/20, c4 run-to-run 20/20. c1 -0.08 %, c4 -0.95 %, pf -7.17 % (+13.4 ms a mixed step). NST 5 still 6/20 differ. Contained in ds41_bi 2 and later 6."
  },
@@ -3629,7 +3629,7 @@
   "branch_commit_image": "ds41-bi 38c1331, image ds41-bi-38c1331b-5c13e555-l 17ce4ba5d945",
   "run_items": "57-p4zyzzzzz-ds-iejzzzszzzzzzz-bi-d-parm",
   "source_levers_line": "308,265",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/biparm/li-stack-summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/biparm/li-stack-summary.txt",
   "needs_check": "",
   "notes": "NST 5: alone vs d0, loaded vs alone, c4 run-to-run all 20/20. vs bi 0 about -1.3 % c8 (cross-run). No reference change needed. In the base ('bi 2', L265, S5 pins)."
  },
@@ -3652,7 +3652,7 @@
   "branch_commit_image": "ds41-bi 2d9a1dc, image ds41-bi-2d9a1dc9-5c13e555-l 5e6dd42e24c9",
   "run_items": "57-p4zyzzzzz-ds-iejzzzszzzzzzz-bi-e-cheap",
   "source_levers_line": "308,258",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/bicheap/li-nst0-summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/bicheap/li-nst0-summary.txt",
   "needs_check": "needs-check",
   "notes": "pct computed. Cost vs bi 0 at NST 0: c8 -4.46 %, pf -7.89 %. Adopted only via ds41_bi 6 (= mode 4 + one MoE AR, A9, L258) in int14, stack3 used bi 2."
  },
@@ -3813,7 +3813,7 @@
   "branch_commit_image": "ds41-gpf 27fa441 / edc9a9b, image ds41-gpf-27fa441b",
   "run_items": "hszzzzzzz-gpbench, gpfab, gpfab2, gpfab3",
   "source_levers_line": "310",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/gpbench/gpsum.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/gpbench/gpsum.txt",
   "needs_check": "",
   "notes": "One reading each. Fresh prefill 128k x1.020, c8 x1.0005, c4 x1.008, f32 forms x1.16-1.74. K-split across waves impossible (each output is one serial fma chain): no exact gg form passes ~x1.1."
  },
@@ -3882,7 +3882,7 @@
   "branch_commit_image": "ds41-walk be5bf4c / 0281f7c, image ds41-walk-0281f7cc",
   "run_items": "hszzzzzzzzz-walk2 (xwk)",
   "source_levers_line": "314",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/walk2/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/walk2/summary.txt",
   "needs_check": "",
   "notes": "code +7.0 %, edit -1.0 %, c4 +5.1 %, c8 +3.7 %, fixed window 5 tok/step +30 %. Identity incl. oracle. Summary empty (harness flagged blocks). First run crashed on an 8-byte all_gather, fixed."
  },
@@ -3905,7 +3905,7 @@
   "branch_commit_image": "eecd93a, image ds41-walk-eecd93af",
   "run_items": "hxzz-walk3 (xwk3)",
   "source_levers_line": "314",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/walk3/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/walk3/summary.txt",
   "needs_check": "",
   "notes": "+-5.8 %, code +1.9 %."
  },
@@ -4250,7 +4250,7 @@
   "branch_commit_image": "image ds41-int-c05de277",
   "run_items": "hszzz-nvlat",
   "source_levers_line": "339,170",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/nvlat/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/nvlat/summary.txt",
   "needs_check": "",
   "notes": "28k +11.6 %, c8 +3.8 %, 28k TTFT +7.2 %. Cause: ds41_attn_dec_kernel's packed form re-unpacks every key twice. With NVG (DS-L339-b) decode ~bf16 speed, prefill +6.6-7.2 % remains."
  },
@@ -4273,7 +4273,7 @@
   "branch_commit_image": "ds41-nvlat b12aca4, image ds41-nvlat-b12aca4d",
   "run_items": "hszzzzz-nvg (xng)",
   "source_levers_line": "339",
-  "source_run_summary": "gpu02/exl3-test/runs/xdsm/nvg/summary.txt",
+  "source_run_summary": "node/exl3-test/runs/xdsm/nvg/summary.txt",
   "needs_check": "",
   "notes": "60.5 -> 66.8 tok/s, 28k -9.6 %, c8 38.7 -> 37.4 ms (-3.4 %), vs bf16 latent c1 +0.6 %, c8 +1.1 % (~94 % of the cost recovered). Prefill unchanged."
  },
@@ -4411,7 +4411,7 @@
   "branch_commit_image": "",
   "run_items": "107, 118",
   "source_levers_line": "26",
-  "source_run_summary": "gpu02/exl3-test/runs/fn4/bb-fn4-k4nA/results.json",
+  "source_run_summary": "node/exl3-test/runs/fn4/bb-fn4-k4nA/results.json",
   "needs_check": "needs-check",
   "notes": "pct computed from B/A. CI [0.850-0.988] vs k4n, acceptance 0.354 -> 0.471, mb +0.4..+1.7 %. Forced-mode cc later judged invalid with MTP (line 55), natural result not recorded, date not stated. Summary = BetterBench of arm k4nA."
  },
@@ -4434,7 +4434,7 @@
   "branch_commit_image": "fn4-pmin 47e859a",
   "run_items": "108",
   "source_levers_line": "27",
-  "source_run_summary": "gpu02/exl3-test/runs/fn4/bb-fn4-k4nP5/results.json, gpu02/exl3-test/runs/fn4/bb-fn4-k4nP7/results.json, gpu02/exl3-test/runs/fn4/bb-fn4-k4nP9/results.json",
+  "source_run_summary": "node/exl3-test/runs/fn4/bb-fn4-k4nP5/results.json, node/exl3-test/runs/fn4/bb-fn4-k4nP7/results.json, node/exl3-test/runs/fn4/bb-fn4-k4nP9/results.json",
   "needs_check": "needs-check",
   "notes": "cc 0.957 / 1.001 / 0.984 (n.s.), mb c16 +2.0 % at 0.7. Which BetterBench figure (-7..-9 %) is not named, date not stated."
  },
@@ -4871,7 +4871,7 @@
   "branch_commit_image": "image -fnx3",
   "run_items": "116, 118",
   "source_levers_line": "51, 120",
-  "source_run_summary": "gpu02/exl3-test/runs/fn4/bb-fn4-e4/results.json, gpu02/exl3-test/runs/fn4/bb-fn4-e4A/results.json",
+  "source_run_summary": "node/exl3-test/runs/fn4/bb-fn4-e4/results.json, node/exl3-test/runs/fn4/bb-fn4-e4A/results.json",
   "needs_check": "needs-check",
   "notes": "-4..-7 % as written for c4-c16, c4/c8 484.8/697.0 vs iq4r 517-522/728-730, prefill -3..-4 %, cc vs k4n 1.006. Row says CANDIDATE, the EXL3 line later became the Qwen dev line (E7, S9). Date not stated."
  },
@@ -5561,7 +5561,7 @@
   "branch_commit_image": "image c16-x3 dbc9bf3ea172",
   "run_items": "122, 148",
   "source_levers_line": "128",
-  "source_run_summary": "gpu02/exl3-test/runs/fn4/bb-fn4-x3stk/results.json",
+  "source_run_summary": "node/exl3-test/runs/fn4/bb-fn4-x3stk/results.json",
   "needs_check": "",
   "notes": "Base = 122's e4r on the 1.17 DS core. c4/c8 520.7/723.2, prefill 8131.5 / 8240.6 / 8140.1, mb pf 6079.6, BetterBench 256.0, copy exact (3.523 s). iq4r stack 3: 1022.5 / 8479.9 / 8554.0 / 8482.5."
  },
@@ -6872,7 +6872,7 @@
   "branch_commit_image": "c16-x3sp21 (61027e1253c1)",
   "run_items": "231-fn-s9soak",
   "source_levers_line": "387, TESTING.md:135",
-  "source_run_summary": "gpu02/exl3-test/runs/fn4-extract/231-s9soak-result-lines.txt",
+  "source_run_summary": "node/exl3-test/runs/fn4-extract/231-s9soak-result-lines.txt",
   "needs_check": "",
   "notes": "a2 control IDENTICAL 20/20, ~62 % of probes in flight, junction 55-70 C, every card at the 210 W cap (log lines)."
  },
@@ -6917,7 +6917,7 @@
   "date": "2026-11-12",
   "branch_commit_image": "",
   "run_items": "r00zzz-cz-a-postmove (first post-move item)",
-  "source_levers_line": "3, 236, 240, 348, gpu02/bench/runs/rocm-bw/gpu02-4cards-1102-1707.txt:25-26, gpu02/bench/runs/rocm-bw/gpu02-4cards-risers-1113.txt:11-12",
+  "source_levers_line": "3, 236, 240, 348, node/bench/runs/rocm-bw/4cards-1102-1707.txt:25-26, node/bench/runs/rocm-bw/4cards-risers-1113.txt:11-12",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "pct computed. D2H 75.6 -> 110.6 GB/s (+46.3 %). R9700-CAPABILITIES:133 summarises the move as 61.5 -> 106.2. Before the move, cards 83:00 and 86:00 shared root complex 80 (17.3 + 17.3 GB/s vs ~28 alone, LEVERS:236 / :348). A loose riser later dropped a card off the bus (LEVERS:240)."
@@ -7032,7 +7032,7 @@
   "date": "2026-11-02",
   "branch_commit_image": "",
   "run_items": "bw-fresh 15.30, queue-fresh, ballast-bw",
-  "source_levers_line": "gpu02/bench/runs/rocm-bw/gpu02-fresh-1031-1616.txt:9-11, :120-122, gpu02/bench/runs/rocm-bw/gpu02-7302p-1102-1530.txt:9-11, :120-122",
+  "source_levers_line": "node/bench/runs/rocm-bw/fresh-1031-1616.txt:9-11, :120-122, node/bench/runs/rocm-bw/7302p-1102-1530.txt:9-11, :120-122",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "pct computed. Same mixed DIMM set before and after. D2H 42.3 -> 42.9, STREAM triad 8 threads 27.6 -> 27.8 GB/s. The DIMM change (HW-dimm-8x64) moved these numbers, the CPU swap did not."
@@ -7055,7 +7055,7 @@
   "date": "2026-11-02",
   "branch_commit_image": "",
   "run_items": "",
-  "source_levers_line": "hardware-tuning-gpu02.md (Memory: one interleave set)",
+  "source_levers_line": "hardware-tuning.md (Memory: one interleave set)",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Diagnostic step: 4 identical 32 GB DIMMs formed one 4-channel set. 2-card DMA 55.4 / 55.3 GB/s (PCIe limit). Too little capacity for production, superseded by 8 x 64 GB (HW-dimm-8x64). Numbers from the Finnish results log, cited per line in the doc."
@@ -7078,7 +7078,7 @@
   "date": "2026-11-02",
   "branch_commit_image": "",
   "run_items": "fresh-all.sh 4x64-1102-1612",
-  "source_levers_line": "gpu02/bench/runs/rocm-bw/gpu02-7302p-1102-1530.txt:9-11, :120-122, gpu02/bench/runs/rocm-bw/gpu02-4x64-1102-1612.txt:9-11, :120-122",
+  "source_levers_line": "node/bench/runs/rocm-bw/7302p-1102-1530.txt:9-11, :120-122, node/bench/runs/rocm-bw/4x64-1102-1612.txt:9-11, :120-122",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "pct computed. 4 x 64 GB alone. D2H 42.9 -> 55.3, STREAM triad 8 threads 27.8 -> 51.6 GB/s. Superseded by 8 x 64 GB (HW-dimm-8x64)."
@@ -7101,7 +7101,7 @@
   "date": "2026-11-02",
   "branch_commit_image": "",
   "run_items": "fresh-all.sh 8x64-1102-1632",
-  "source_levers_line": "gpu02/bench/runs/rocm-bw/gpu02-7302p-1102-1530.txt:9-11, :120-122, gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt:9-11, :120-122, gpu02/bench/runs/logs/queue-fresh-7302p-1102-1530.log:16, :35, gpu02/bench/runs/logs/fresh-all-8x64-1102-1632.log:16, :35",
+  "source_levers_line": "node/bench/runs/rocm-bw/7302p-1102-1530.txt:9-11, :120-122, node/bench/runs/rocm-bw/8x64-1102-1632.txt:9-11, :120-122, node/bench/runs/logs/queue-fresh-7302p-1102-1530.log:16, :35, node/bench/runs/logs/fresh-all-8x64-1102-1632.log:16, :35",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "pct computed. Base = the mixed DIMM set on the 7302P. Triad 16 / 32 threads 27.1 / 26.8 -> 84.1 / 82.8. 2-card H2D / D2H / both 45.1 / 42.9 / 39.7 -> 55.4 / 55.3 / 71.5 GB/s. Radiance TP2 c16 (mean of 2 runs) 1.14.0 402.65 -> 438.2 (+8.8 %), 1.15.1 411.35 -> 444.25 (+8.0 %)."
@@ -7124,7 +7124,7 @@
   "date": "2026-11-04",
   "branch_commit_image": "",
   "run_items": "chainAB4, chainAB5 (fXYB24 / fB24 seeds 1-3)",
-  "source_levers_line": "hardware-tuning-gpu02.md (The shared-root pair penalty)",
+  "source_levers_line": "hardware-tuning.md (The shared-root pair penalty)",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Server pairs chosen so that only one server had the shared quadrant 80. Superseded by the riser move (HW-L3). Numbers from the Finnish results log, cited per line in the doc."
@@ -7147,7 +7147,7 @@
   "date": "2026-10-31",
   "branch_commit_image": "",
   "run_items": "",
-  "source_levers_line": "gpu02/host/fanflat.sh:2-5",
+  "source_levers_line": "node/host/fanflat.sh:2-5",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Per card: a flat duty up to 85 C hotspot, linear to 50 % at 100 C. A reboot restores the acoustic curve (od-apply.sh)."
@@ -7170,7 +7170,7 @@
   "date": "2026-10-31",
   "branch_commit_image": "",
   "run_items": "",
-  "source_levers_line": "hardware-tuning-gpu02.md (Fans)",
+  "source_levers_line": "hardware-tuning.md (Fans)",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Quiet fan limits at c16. GDDR6 memory, not the junction, was the limiting part. Replaced by the flat curve (HW-fan-flat-curve). Numbers from the Finnish results log, cited per line in the doc."
@@ -7193,7 +7193,7 @@
   "date": "2026-11-05",
   "branch_commit_image": "",
   "run_items": "",
-  "source_levers_line": "gpu02/host/fanguard.sh:3-6",
+  "source_levers_line": "node/host/fanguard.sh:3-6",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Every 10 s: +2 % fan for a card whose memory >= 92 C or hotspot >= 95 C, at most 40 %, then a 120 s hold. -2 % after 30 min at <= 85 C memory, never below the base."
@@ -7769,7 +7769,7 @@
   "branch_commit_image": "",
   "run_items": "144, 144b",
   "source_levers_line": "127",
-  "source_run_summary": "gpu02/exl3-test/runs/fn-exl3ctr/verdicts.txt, gpu02/exl3-test/runs/fn-exl3ctr2/verdicts.txt",
+  "source_run_summary": "node/exl3-test/runs/fn-exl3ctr/verdicts.txt, node/exl3-test/runs/fn-exl3ctr2/verdicts.txt",
   "needs_check": "",
   "notes": "Only GRBM_GUI_ACTIVE, SQ_BUSY_CYCLES, SQ_WAVES read on gfx1201 (rocprofiler-sdk 1.4.1). Timing: M64 gate_up pf_gemm 175.7 us (240 VGPRs) + pf_map 5.7 + pf_prep 10.7 -> E8, summaries confirm these."
  },
@@ -8297,7 +8297,7 @@
   "date": "2026-11-02",
   "branch_commit_image": "",
   "run_items": "",
-  "source_levers_line": "hardware-tuning-gpu02.md (Check the address map), gpu02/bench/df-map.sh",
+  "source_levers_line": "hardware-tuning.md (Check the address map), node/bench/df-map.sh",
   "source_run_summary": "",
   "needs_check": "",
   "notes": "Mixed 384 GB: four ranges, each on one channel pair. 8 x 64 GB: UMC 0-7 share 0-513.25 GiB. The printed interleave code is 3 for both 4 and 8 channels, so count the UMCs that share a range."

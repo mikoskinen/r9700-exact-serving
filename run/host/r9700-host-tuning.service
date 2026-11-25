@@ -1,0 +1,12 @@
+[Unit]
+Description=Host tuning for 4x R9700 serving (deep CPU idle states off, governor performance)
+After=systemd-sysctl.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/r9700-host-tuning apply
+ExecStop=/usr/local/sbin/r9700-host-tuning revert
+
+[Install]
+WantedBy=multi-user.target

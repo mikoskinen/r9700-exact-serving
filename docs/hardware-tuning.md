@@ -2,7 +2,7 @@
 
 This note covers the host and PCIe changes on `gpu02`, which has an AMD EPYC 7302P (Rome, 16 cores) on
 an ASRock Rack ROMED8-2T board, 512 GB of DDR4-2933 and four AMD Radeon AI PRO R9700 cards on PCIe 4.0
-[R1, F220]. It's written in English from the raw measurement files in `gpu02/bench/` and from the original
+[R1, F220]. It's written in English from the raw measurement files in `node/bench/` and from the original
 Finnish results log. A number taken only from that log is cited as "gpu02-results-1031 (Finnish, not
 published)" with its line. A number from a file in this repository is cited with its path and line.
 
@@ -41,7 +41,7 @@ results drift between runs until the DIMMs were changed.
 ## Check the address map
 
 After any DIMM change, read the data-fabric DRAM address map instead of trusting the DIMM count.
-[`gpu02/bench/df-map.sh`](../gpu02/bench/df-map.sh) prints the DF address-map registers of each memory
+[`node/bench/df-map.sh`](../node/bench/df-map.sh) prints the DF address-map registers of each memory
 controller (UMC 0-7) and prints which channels serve which address range (run it with sudo, its
 comments are in Finnish). On the mixed set it showed four ranges of 64 to 128 GiB, each served by one
 channel pair [F171-177]. On 8 x 64 GB all eight UMCs share 0 to 513.25 GiB [F221]. The interleave
@@ -105,8 +105,8 @@ without it and 2 of 2 fast with it (LEVERS.md:22). The cause was the host: the c
 latency 400 us) together with the schedutil governor, which was the default [H1, F6]. Disabling every C-state with an exit latency of 100 us or more and
 setting the `performance` governor at boot fixed it, and the Flash-Next TP4 c8 throughput went from
 ~630 to ~750 tok/s (LEVERS.md:22). The fix is a oneshot systemd unit,
-[`gpu02-host-tuning.service`](../gpu02/host/gpu02-host-tuning.service), which runs
-[`gpu02-host-tuning`](../gpu02/host/gpu02-host-tuning) (line 9 selects the states by latency). A sysctl
+[`gpu02-host-tuning.service`](../node/host/gpu02-host-tuning.service), which runs
+[`gpu02-host-tuning`](../node/host/gpu02-host-tuning) (line 9 selects the states by latency). A sysctl
 file keeps `kernel.numa_balancing=0` [H2].
 
 Disabling "Global C-state Control" in the BIOS wasn't enough on its own. After the CPU swap, Linux still
@@ -120,7 +120,7 @@ maximum is 330 W (R9700-CAPABILITIES-20261112.md:58). With a cap active, an unde
 instead of lowering power. On the xeon, -90 mV gave about +200 MHz average sclk at 210 W
 (R9700-CAPABILITIES-20261112.md:69, xeon-bench/od-tuning.md:26), and -70 / -90 mV gave byte-identical
 output there. gpu02 stays at -50 mV. Raising the cap to 330 W with 45 % fans gave +5-7 % at a junction
-temperature of 98 C (LEVERS.md:34), and that wasn't pursued. [`od-apply.sh`](../gpu02/host/od-apply.sh)
+temperature of 98 C (LEVERS.md:34), and that wasn't pursued. [`od-apply.sh`](../node/host/od-apply.sh)
 applies the overdrive settings at boot [F132].
 
 ## Fans
@@ -131,8 +131,8 @@ below, and with an 1800 rpm limit its memory reached 96 C and tripped the test [
 fan control also kept speeding up and slowing down, with 83 and 61 jumps of more than 150 rpm in an hour
 on the two cards [F135]. A flat curve removed the jumps (0 in the next 30 min) [F135-139].
 
-The flat curve is set per card with [`fanflat.sh`](../gpu02/host/fanflat.sh): a fixed duty up to 85 C
-hotspot, then linear to 50 % at 100 C (lines 2-5). [`fanguard.sh`](../gpu02/host/fanguard.sh) runs
+The flat curve is set per card with [`fanflat.sh`](../node/host/fanflat.sh): a fixed duty up to 85 C
+hotspot, then linear to 50 % at 100 C (lines 2-5). [`fanguard.sh`](../node/host/fanguard.sh) runs
 beside it and adds 2 % to a card whose memory is at 92 C or more, or whose hotspot is at 95 C or more,
 up to 40 %. It steps back down after 30 min at 85 C memory or less (lines 3-6).
 
@@ -160,15 +160,15 @@ comes from such a file or from the results log that recorded them.
 
 ## Sources
 
-- [R1] [gpu02/host/hostfacts-20261113.txt](../gpu02/host/hostfacts-20261113.txt): CPU, board, RAM, cards, cpuidle states, governor, numa_balancing (read-only queries on 13.11.2026).
-- [B1] [gpu02/bench/runs/rocm-bw/gpu02-7302p-1102-1530.txt](../gpu02/bench/runs/rocm-bw/gpu02-7302p-1102-1530.txt) (7302P, mixed DIMMs).
-- [B2] [gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt](../gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt) (7302P, 8 x 64 GB).
-- [B3] [gpu02/bench/runs/rocm-bw/gpu02-fresh-1031-1616.txt](../gpu02/bench/runs/rocm-bw/gpu02-fresh-1031-1616.txt) (7282, mixed DIMMs).
-- [B4] [gpu02/bench/runs/rocm-bw/gpu02-4cards-1102-1707.txt](../gpu02/bench/runs/rocm-bw/gpu02-4cards-1102-1707.txt) (4 cards before the riser move).
-- [B5] [gpu02/bench/runs/rocm-bw/gpu02-4cards-risers-1113.txt](../gpu02/bench/runs/rocm-bw/gpu02-4cards-risers-1113.txt) (4 cards after the riser move, header line in Finnish).
-- [P1] [P2] [P3] [gpu02/bench/runs/pair-dma-q1103/](../gpu02/bench/runs/pair-dma-q1103/): X_83+86-dma-1.txt, Y_c3+03-dma-1.txt, ALL4-dma-1.txt.
-- [L1] [gpu02/bench/runs/logs/queue-fresh-7302p-1102-1530.log](../gpu02/bench/runs/logs/queue-fresh-7302p-1102-1530.log), [L2] [gpu02/bench/runs/logs/fresh-all-8x64-1102-1632.log](../gpu02/bench/runs/logs/fresh-all-8x64-1102-1632.log). Line 16 is the 1.14.0 c16 arm and line 35 the 1.15.1 c16 arm, two runs each.
-- [H1] [gpu02/host/gpu02-host-tuning](../gpu02/host/gpu02-host-tuning) (line 9 selects the states, line 14 restores schedutil on revert) and the C2 latency in [R1]. [H2] [gpu02/host/90-gpu02-numa.conf](../gpu02/host/90-gpu02-numa.conf).
+- [R1] [node/host/hostfacts-20261113.txt](../node/host/hostfacts-20261113.txt): CPU, board, RAM, cards, cpuidle states, governor, numa_balancing (read-only queries on 13.11.2026).
+- [B1] [node/bench/runs/rocm-bw/7302p-1102-1530.txt](../node/bench/runs/rocm-bw/7302p-1102-1530.txt) (7302P, mixed DIMMs).
+- [B2] [node/bench/runs/rocm-bw/8x64-1102-1632.txt](../node/bench/runs/rocm-bw/8x64-1102-1632.txt) (7302P, 8 x 64 GB).
+- [B3] [node/bench/runs/rocm-bw/fresh-1031-1616.txt](../node/bench/runs/rocm-bw/fresh-1031-1616.txt) (7282, mixed DIMMs).
+- [B4] [node/bench/runs/rocm-bw/4cards-1102-1707.txt](../node/bench/runs/rocm-bw/4cards-1102-1707.txt) (4 cards before the riser move).
+- [B5] [node/bench/runs/rocm-bw/4cards-risers-1113.txt](../node/bench/runs/rocm-bw/4cards-risers-1113.txt) (4 cards after the riser move, header line in Finnish).
+- [P1] [P2] [P3] [node/bench/runs/pair-dma-q1103/](../node/bench/runs/pair-dma-q1103/): X_83+86-dma-1.txt, Y_c3+03-dma-1.txt, ALL4-dma-1.txt.
+- [L1] [node/bench/runs/logs/queue-fresh-7302p-1102-1530.log](../node/bench/runs/logs/queue-fresh-7302p-1102-1530.log), [L2] [node/bench/runs/logs/fresh-all-8x64-1102-1632.log](../node/bench/runs/logs/fresh-all-8x64-1102-1632.log). Line 16 is the 1.14.0 c16 arm and line 35 the 1.15.1 c16 arm, two runs each.
+- [H1] [node/host/gpu02-host-tuning](../node/host/gpu02-host-tuning) (line 9 selects the states, line 14 restores schedutil on revert) and the C2 latency in [R1]. [H2] [node/host/90-gpu02-numa.conf](../node/host/90-gpu02-numa.conf).
 - [F*] gpu02-results-1031 (Finnish, not published), the line numbers given.
 - [G*] gpu01-results-1030 (Finnish, not published), the Threadripper comparison machine, the line numbers given.
 - LEVERS.md, R9700-CAPABILITIES-20261112.md and xeon-bench/od-tuning.md are in this `docs/` folder.

@@ -1,4 +1,4 @@
-# tp8 loop P30 (b), PREFILL round 15: the newcomer's dense GEMMs at int8 -- every GGUF dense linear of layers all (q6_K / q5_K / q8_0 in the 2.25 file) decoded
+# The dense GEMMs of every layer at int8: every GGUF dense linear (q6_K / q5_K / q8_0 in the 2.25 file) decoded
 # and requantised by rad-sidecar --requant to int8 codes + a bf16 scale a [1 x 128] (i8*bf16[1x128]: deepseek41 lw() serves it as an IQR view, gemm_nt_q i8a8 after quant_act_i8g)
 blk.0.attn_kv.weight  rtn  codes=i8 group=128 scale=bf16
 blk.0.attn_output_a.g0.weight  rtn  codes=i8 group=128 scale=bf16

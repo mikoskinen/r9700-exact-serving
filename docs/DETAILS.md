@@ -3,7 +3,7 @@
 This repository is the investigation history of serving two large mixture-of-experts models locally
 with **exact** output: DeepSeek V4.1 Flash (EXL3, 2.25 bits per weight) and Qwen Flash-Next (EXL3,
 4.05 bits per weight). The models run on four AMD Radeon AI PRO R9700 cards (RDNA4, gfx1201, 32 GB
-each). The host, `gpu02`, has an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board with 512 GB
+each). The host has an AMD EPYC 7302P (Rome) on an ASRock Rack ROMED8-2T board with 512 GB
 of RAM in 8 x 64 GB DIMMs [H0]. The engine is a fork of [radiance](https://codeberg.org/StillDeadcode/radiance)
 with the [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) extension. The setup is the local
 backend for Claude Code through a LiteLLM proxy.
@@ -31,6 +31,34 @@ the card default of 300 W with no voltage offset. The four cards run tensor para
 decoding is greedy (temperature 0). In "mb cN", a microbenchmark runs N concurrent streams and the
 aggregate tok/s counts their generated tokens.
 
+### The README's Results section, 25.11.2026
+
+Stock power on every card of the machines that ran the model: a 300 W cap with no voltage offset,
+read back on every card at each start. The flat fan curve started at 90 %.
+
+**Qwen, decode and prefill** (image `qwen-7d70dccc`, the README's benchmark command): two starts on one
+machine. The cards cooled to 45 °C or less before each start. A decode value is the mean of eight
+blocks (gens window of 2), four in each start. Prefill is the second start's first cold read at each
+depth. Both starts answer the README's check request with the text in [Check the answer](../README.md#check-the-answer).
+The 20 short identity prompts give the same answers alone in both starts and one at a time beside 7,
+15, 23 and 31 decode streams with a fresh 8,192- to 16,384-token prefill into each probe, and alone
+again at the end. The 12 long prompts of 372 to 5,934 tokens give the same answers alone in both
+starts and beside 7, 15, 23 and 31 decode streams.
+
+**Qwen, AgentX** (image `qwen-7d70dccc` with no environment beyond the two variables in the README):
+one point, agentx-harness 1.0.14, the 256k trace set, 32 sessions, one warm-up request a session and a
+20-minute window. The server forced the draft acceptance to the AgentX curve with the two variables. No request failed. Before the start the cards read 25-28 °C at the junction and 36-50 °C on the memory.
+
+**DeepSeek, decode and prefill** (image `deepseek-tp8-6b0bda62`, the README's two-machine commands
+without the AgentX variables): one start. The cards cooled to 45 °C or less before the start and
+before each decode load. Every decode load runs twice and the value is the mean of the two. 1 request
+is one read of each prompt after a warm-up read. Prefill is one cold prompt after a prefix-cache reset at
+each depth. The 20 identity prompts, the check request, the two 1-request prompts and the three cold prompts give the same answers as the two-machine reference of this command at 210 W.
+
+**DeepSeek, AgentX** (image `deepseek-tp8-6b0bda62`, the README's two-machine commands with the AgentX
+variables on the leader): one start, agentx-harness 1.0.14, the full trace set, 32 sessions, one
+warm-up request a session and a 20-minute window after a prefix-cache reset. The leader forced the draft acceptance to the AgentX curve with the two variables. No request failed.
+
 ### DeepSeek V4.1 Flash (EXL3 2.25 bpw), 15.11.2026
 
 | load point | stock 300 W [S1] | 210 W [S2] | target | how it was measured |
@@ -55,7 +83,7 @@ Each column comes from one server start of the image cbea3b0178df
 and `run/switches.sh`. The start log reports a KV cache of 6.01 GiB a card with room for 4,427,562
 tokens, 4.2 sessions of 1,048,576 tokens. The cards cool to 45 °C or less before the start and before
 each speed section. The stock start sets every card to the values of `run/power.sh 300` and checks
-that every card reports them. Three seconds later the fan guard in `gpu02/host/fanguard.sh` lowers the
+that every card reports them. Three seconds later the fan guard in `node/host/fanguard.sh` lowers the
 flat fan value from 90 to 88 %, where it stays until the end of the run [S1][S17]. In both starts the
 79 runtime switches read back as expected before each section and at the end. The 20 identity probes
 give the same answers alone, all at once, one at a time beside 16 decode streams with a fresh
@@ -181,7 +209,7 @@ these names [S12].
 
 Measured through this chain (Claude Code -> LiteLLM -> local engine), the TBLite agentic test set (60
 tasks, the sonnet alias at medium effort) scored 65.4 % mean reward for Qwen Flash-Next on the earlier
-2-card xeon server, against 52.0 %, 43.8 % and 42.2 % for three other local models (Ornith-1.5-35B,
+2-card server, against 52.0 %, 43.8 % and 42.2 % for three other local models (Ornith-1.5-35B,
 Sage-A1.5 and Sabi-Noema) [S13]. The
 production servers are two 2-card tensor-parallel servers (DP2) serving Qwen Flash-Next with the lossy
 `wht6` wire [S11][S14]. The exact 4-card lines in this repository are the optimisation work, and the
@@ -190,7 +218,7 @@ DeepSeek line targets a 1M-token context [S16].
 ## Hardware tips (EPYC Rome + 4 GPUs)
 
 The largest gains this month came from the host. The full write-up, with the raw measurement files, is
-[hardware-tuning-gpu02.md](hardware-tuning-gpu02.md) [H1]. The main points, with before and
+[hardware-tuning.md](hardware-tuning.md) [H1]. The main points, with before and
 after values:
 
 | change | before | after |
@@ -201,7 +229,7 @@ after values:
 | **One card per IO-die quadrant:** two cards in one quadrant share a root port of about 36 GB/s. Risers moved three cards so that each quadrant has one. | 4 cards at once: H2D 61.3 GB/s, D2H 75.6 GB/s. Same-quadrant pair: 35.3 / 37.9 GB/s against 55.8 / 55.3 for other pairs. | H2D 105.3 GB/s, D2H 110.6 GB/s |
 | **The shared-quadrant penalty** showed in serving before the move: a TP2 server on the shared pair against one on separate quadrants, in an 8-agent replay. | shared pair 193 tok/s, decode -21 %, prefill -42 % | separate pair 253 tok/s |
 | **Host C-states and governor:** cpuidle C2 (400 us exit latency) with schedutil made fresh starts slow at random. Disable every C-state with an exit latency of 100 us or more and set `performance` at boot (systemd unit), with `kernel.numa_balancing=0`. The BIOS C-state switch alone didn't remove C2. | Flash-Next TP4 mb c8 ~630 tok/s in a slow start | ~750 tok/s, TP2 1-user step 17.7 -> 17.1 ms |
-| **Power cap and undervolt:** 210 W per card (default 300, max 330) with -50 mV VDDGFX. Under a cap an undervolt raises clocks: -90 mV gave ~+200 MHz on the xeon. 330 W gave only +5-7 % at 98 C junction and wasn't pursued. | | |
+| **Power cap and undervolt:** 210 W per card (default 300, max 330) with -50 mV VDDGFX. Under a cap an undervolt raises clocks: -90 mV gave ~+200 MHz on a 2-card server. 330 W gave only +5-7 % at 98 C junction and wasn't pursued. | | |
 | **Fans:** GDDR6 memory, not the junction, is the hot part on an open bench. With an 1800 rpm limit one card's memory reached 96 C. The acoustic control jumped by more than 150 rpm 83 times an hour on one card, and a flat curve (fixed duty to 85 C hotspot, linear to 50 % at 100 C) removed that. A guard script adds +2 % at memory >= 92 C or hotspot >= 95 C. | | |
 | **PCIe settings:** 8-bit extended tags, relaxed ordering, MPS 256 / MRRS 512. 10-bit tags are a dead end, because the Rome root ports support neither completer nor requester. PCIe DPM pinning was never isolated. SDMA vs blit copies don't change the H2D limit. | | |
 | **Seat risers firmly** (a loose riser made a card fall off the bus on wake from idle) and **check link widths after a BIOS reset** (a cleared CMOS left a slot at x4 on the Threadripper machine, and an x8 pair gave 54-57 % of an x16 pair's prefill). | | |
@@ -306,8 +334,8 @@ its own history.
 
 | branch prefix | upstream | contents |
 |---|---|---|
-| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 136 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit d3874235, which `deepseek/current` contains. |
-| `qwen/` | radiance main (451b136) | 29 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's Qwen images are built from engine commits ff94ef27 (the results) and d3024e38 (the Claude Code command) of `qwen/qfn-on-ds`, which `qwen/current` contains. |
+| `deepseek/` | radiance (Codeberg StillDeadcode/radiance, Apache 2.0) | 136 branches, where `ds41-*` are DeepSeek V4.1 Flash levers (one branch per lever) and `ds41-int*` are integration stacks. The README's DeepSeek image is built from engine commit d3874235, which `deepseek/current` contains. Image `deepseek-tp8-6b0bda62` (the README's Results) is built from engine commit 6b0bda62, which isn't on a branch of this repository. |
+| `qwen/` | radiance main (451b136) | 29 branches, where `fn4-*` are Qwen Flash-Next TP4 levers. S9 with the prefill stack is `qwen/fn4-x3-stack`. The README's image `qwen-ff94ef27` is built from engine commit ff94ef27 of `qwen/qfn-on-ds`, which `qwen/current` contains. Image `qwen-7d70dccc` (the README's Results and Qwen for Claude Code) is built from engine commit 7d70dccc, which isn't on a branch of this repository. |
 | `exl3/` | radiance-exl3 (GitHub Dyluhn/radiance-exl3, Apache 2.0) | 31 branches of EXL3 kernel work for both lines. The README's DeepSeek image uses EXL3 commit 4a67be32, which `exl3/current` contains, and both Qwen images use `exl3/qfn-x3gd`. |
 
 Upstream release tags carry the same prefixes, for example `radiance/v1.15.1` and `exl3/v1.3.0`. The registry
@@ -321,13 +349,13 @@ The registry row (column `branch_commit_image`) and its status do.
 | [LEVERS.md](LEVERS.md) | The raw lever log. Every lever's numbers, reference and status, as written during the work. |
 | [TESTING.md](TESTING.md) | Test method rules and the reasons for them. |
 | [R9700-CAPABILITIES-20261112.md](R9700-CAPABILITIES-20261112.md) | What the R9700 / RDNA4 and this host can and can't do. |
-| []() (other) | Design notes and audits for both lines, xeon benchmark notes, and the Claude Code quality-test setup (`tbench/`). |
-| [gpu02/exl3-test/queue*/](../gpu02/exl3-test/) | Test queue items. Each `NN-*.sh` is one measured item, `DRYRUN=1` prints its commands. `queue/done/` has the items that ran. |
-| [gpu02/exl3-test/tools/](../gpu02/exl3-test/tools/), top-level `*.sh` / `*.py` | Harness scripts: identity compare, microbenchmarks, profile summaries, watchdog. |
-| [gpu02/exl3-test/runs/](../gpu02/exl3-test/runs/) | Per-run summaries such as `*sum*.txt`, `identity.txt` and `results.json`, without the raw logs and dumps. `runs/queue-changes.log` records every queue change. |
-| [gpu02/host/](../gpu02/host/) | The host tuning service (C-states, governor), the NUMA sysctl, the fan and overdrive scripts, and the host facts read on 13.11.2026. |
-| [gpu02/bench/](../gpu02/bench/) | Host and PCIe bandwidth tools and their raw results (`runs/rocm-bw/`, `runs/logs/`). |
-| `gpu02/exl3-test/runs/ds41-exl3.log.gz` | The full RESULT log of the gpu02 test queue (5.11.-13.11.2026), compressed. |
+| []() (other) | Design notes and audits for both lines, 2-card server benchmark notes, and the Claude Code quality-test setup (`tbench/`). |
+| [node/exl3-test/queue*/](../node/exl3-test/) | Test queue items. Each `NN-*.sh` is one measured item, `DRYRUN=1` prints its commands. `queue/done/` has the items that ran. |
+| [node/exl3-test/tools/](../node/exl3-test/tools/), top-level `*.sh` / `*.py` | Harness scripts: identity compare, microbenchmarks, profile summaries, watchdog. |
+| [node/exl3-test/runs/](../node/exl3-test/runs/) | Per-run summaries such as `*sum*.txt`, `identity.txt` and `results.json`, without the raw logs and dumps. `runs/queue-changes.log` records every queue change. |
+| [node/host/](../node/host/) | The host tuning service (C-states, governor), the NUMA sysctl, the fan and overdrive scripts, and the host facts read on 13.11.2026. |
+| [node/bench/](../node/bench/) | Host and PCIe bandwidth tools and their raw results (`runs/rocm-bw/`, `runs/logs/`). |
+| `node/exl3-test/runs/ds41-exl3.log.gz` | The full RESULT log of the test queue (5.11.-13.11.2026), compressed. |
 | [registry/](../registry/) | The change registry. |
 
 ### Reading a run summary
@@ -350,24 +378,24 @@ ZFUSE BLOCK c8-1-G-B (B, c8 gens): agg 191.7 tok/s, window 42.6 s, 16 requests, 
 
 Line numbers refer to the copies in this repository (`docs/`), as of 13.11.2026.
 
-- [S1] gpu02/exl3-test/runs/xdsm/hero-ds-1115-300w-stock/ (the stock 300 W start): u1.jsonl:2-4 and :6-8 (1 request, prose), :10-12 (1 request, code), mb.jsonl:3-4 (c4), :6-7 (c8), :8-9 (c16), :10-11 (c24), :12-13 (c32), cold.jsonl:4, :3, :1 and :2 (prefill 16k, 64k, 128k and 136k: prompt_tokens and ttft), run.log:3 (the power setting read back on every card) and its COOL lines, fn/ (the switch read-backs), identity.txt (the identity compares), start-lines.txt:1767 (the KV cache), docker-inspect.json and ../hero-ds-1115-300w-stock.out (the start command and image), hero-sum.txt (every value with the lines it comes from, written by gpu02/exl3-test/queue-ar/hero/hero-sum.py), targets docs/LEVERS.md:150.
-- [S2] gpu02/exl3-test/runs/xdsm/hero-ds-1115-210w/ (the 210 W start), with the same files and line numbers as [S1], except that run.log:1 has the caps and offsets read back before the start.
+- [S1] node/exl3-test/runs/xdsm/hero-ds-1115-300w-stock/ (the stock 300 W start): u1.jsonl:2-4 and :6-8 (1 request, prose), :10-12 (1 request, code), mb.jsonl:3-4 (c4), :6-7 (c8), :8-9 (c16), :10-11 (c24), :12-13 (c32), cold.jsonl:4, :3, :1 and :2 (prefill 16k, 64k, 128k and 136k: prompt_tokens and ttft), run.log:3 (the power setting read back on every card) and its COOL lines, fn/ (the switch read-backs), identity.txt (the identity compares), start-lines.txt:1767 (the KV cache), docker-inspect.json and ../hero-ds-1115-300w-stock.out (the start command and image), hero-sum.txt (every value with the lines it comes from, written by node/exl3-test/queue-ar/hero/hero-sum.py), targets docs/LEVERS.md:150.
+- [S2] node/exl3-test/runs/xdsm/hero-ds-1115-210w/ (the 210 W start), with the same files and line numbers as [S1], except that run.log:1 has the caps and offsets read back before the start.
 - [S3] docs/LEVERS.md:374 (item 223 S9 vs S8, BI cost, item 225 identity sets), target docs/LEVERS.md:14.
 - [S7] docs/LEVERS.md:9 (exact = byte-identical), :367 (batch invariance is part of exactness).
-- [S8] docs/LEVERS.md:250, gpu02/exl3-test/runs/xdsm/zsoak16/soaksum.txt, docs/TESTING.md:131.
+- [S8] docs/LEVERS.md:250, node/exl3-test/runs/xdsm/zsoak16/soaksum.txt, docs/TESTING.md:131.
 - [S10] docs/TESTING.md:121.
 - [S11] docs/LEVERS.md:62 (production's `--tp-wire wht6`), docs/R9700-CAPABILITIES-20261112.md:105 (wht6 is lossy).
 - [S12] docs/tbench/README.md:91-95 (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, the opus / sonnet / haiku defaults), docs/tbench/TBLITE.md:5, :108-111 (the sonnet alias at medium effort, the haiku alias at low effort).
-- [S13] docs/tbench/TBLITE.md:107 (engines on the xeon), docs/tbench/runs/night1021-flash-prod-v60-n16/summary.md (65.4 %), docs/tbench/runs/tblite-ornith-20261024-1921/summary-tbsummary.md (52.0 %), tblite-sage-20261024-1814 (43.8 %), tblite-sabi-20261024-2037 (42.2 %).
+- [S13] docs/tbench/TBLITE.md:107 (engines on the 2-card server), docs/tbench/runs/night1021-flash-prod-v60-n16/summary.md (65.4 %), docs/tbench/runs/tblite-ornith-20261024-1921/summary-tbsummary.md (52.0 %), tblite-sage-20261024-1814 (43.8 %), tblite-sabi-20261024-2037 (42.2 %).
 - [S14] docs/LEVERS.md:341-349 (production DP2 = 2 x TP2, Flash-Next line).
 - [S15] registry DS-L172, docs/LEVERS.md:172.
 - [S16] docs/LEVERS.md:150 (DeepSeek targets, context 1M).
-- [S17] gpu02/exl3-test/runs/log-extract/od-changes-lines-261-292.txt (lines 261-292 of the gpu02 power and fan change log: the stock setting of each stock column, the fan guard's steps from 90 to 88 % and, in the Qwen column, to 86 % on every card, and the restore after each column), gpu02/host/fanguard.sh:5-6 (the 2 % step down).
-- [S18] gpu02/exl3-test/runs/xdsm/hero-ds-1115-210w/: identity.txt:8-23 (the eight soak cycles against the answers alone and against the stored answers, 20 of 20 each), marks.jsonl (the start and end of each soak window, 32.9 minutes in total), run.log:84-109 and id/soak-*.txt (streams, prefill offset and tokens, background requests and errors of each cycle).
-- [S19] gpu02/exl3-test/runs/xdsm/hero-qwen-1122-300w-stock/ (the two stock 300 W starts, s1/ and s2/): mb.jsonl of each start (the decode blocks and their `agg_dec_tps` field, where a cell is the mean of the first four blocks at that load in both starts), s2/blocks.jsonl:1 (the first prefill block, label `*-pf`, whose `pf` field has the prompt tokens, the TTFT and the tok/s of each depth), run.log:1 of each start (the cap, voltage offset and fan curve read back on every card), its COOL line (the cool-down), its `mb` lines and IDENTITY lines (every cell and identity compare), s2/run.log:42-61 (the soak cycles) and :130 (the fan guard's step to 86 %), each start's check-answer.json, start-lines.txt, switches-sh.txt, docker-inspect.json, the switch read-backs in fn/, every answer file in id/ and identity.txt, want-switches.json and repo/run/ (the switch and env files the starts used), target docs/LEVERS.md:14.
-- [S20] gpu02/exl3-test/runs/xdsm/hero-qwen-1122-210w/ (the two 210 W starts), with the same files as [S19], except the fan guard line.
-- [H0] gpu02/host/hostfacts-20261113.txt (CPU, board, RAM, cards), gpu02/bench/runs/rocm-bw/gpu02-8x64-1102-1632.txt (the 8 x 64 GB set).
-- [H1] docs/hardware-tuning-gpu02.md, which cites every number in the hardware table to a raw file in gpu02/bench/runs/, a script in gpu02/host/, LEVERS.md or R9700-CAPABILITIES-20261112.md. A few numbers (CPU read, the address map, the TP2 c16 for the CPU swap, the fan tests, the 8-agent pair replay, the Threadripper link-width lesson) come only from the original Finnish results logs, which aren't published, and the doc says so per number.
+- [S17] node/exl3-test/runs/log-extract/od-changes-lines-261-292.txt (lines 261-292 of the power and fan change log: the stock setting of each stock column, the fan guard's steps from 90 to 88 % and, in the Qwen column, to 86 % on every card, and the restore after each column), node/host/fanguard.sh:5-6 (the 2 % step down).
+- [S18] node/exl3-test/runs/xdsm/hero-ds-1115-210w/: identity.txt:8-23 (the eight soak cycles against the answers alone and against the stored answers, 20 of 20 each), marks.jsonl (the start and end of each soak window, 32.9 minutes in total), run.log:84-109 and id/soak-*.txt (streams, prefill offset and tokens, background requests and errors of each cycle).
+- [S19] node/exl3-test/runs/xdsm/hero-qwen-1122-300w-stock/ (the two stock 300 W starts, s1/ and s2/): mb.jsonl of each start (the decode blocks and their `agg_dec_tps` field, where a cell is the mean of the first four blocks at that load in both starts), s2/blocks.jsonl:1 (the first prefill block, label `*-pf`, whose `pf` field has the prompt tokens, the TTFT and the tok/s of each depth), run.log:1 of each start (the cap, voltage offset and fan curve read back on every card), its COOL line (the cool-down), its `mb` lines and IDENTITY lines (every cell and identity compare), s2/run.log:42-61 (the soak cycles) and :130 (the fan guard's step to 86 %), each start's check-answer.json, start-lines.txt, switches-sh.txt, docker-inspect.json, the switch read-backs in fn/, every answer file in id/ and identity.txt, want-switches.json and repo/run/ (the switch and env files the starts used), target docs/LEVERS.md:14.
+- [S20] node/exl3-test/runs/xdsm/hero-qwen-1122-210w/ (the two 210 W starts), with the same files as [S19], except the fan guard line.
+- [H0] node/host/hostfacts-20261113.txt (CPU, board, RAM, cards), node/bench/runs/rocm-bw/8x64-1102-1632.txt (the 8 x 64 GB set).
+- [H1] docs/hardware-tuning.md, which cites every number in the hardware table to a raw file in node/bench/runs/, a script in node/host/, LEVERS.md or R9700-CAPABILITIES-20261112.md. A few numbers (CPU read, the address map, the TP2 c16 for the CPU swap, the fan tests, the 8-agent pair replay, the Threadripper link-width lesson) come only from the original Finnish results logs, which aren't published, and the doc says so per number.
 - [M1] docs/TESTING.md:119. [M2] docs/TESTING.md:120. [M3] docs/TESTING.md:121. [M4] docs/TESTING.md:59, :119.
 - [M5] docs/LEVERS.md:248, :225. [M6] docs/TESTING.md:125. [M7] docs/TESTING.md:126. [M8] docs/TESTING.md:127.
 - [M9] docs/TESTING.md:43, docs/LEVERS.md:30.
@@ -378,8 +406,8 @@ This repository has two licenses:
 
 - **CC BY 4.0** ([LICENSE-docs.md](../LICENSE-docs.md)) covers the documents and data: `README.md`,
   `docs/`, `registry/` (except `registry/build.py`), and the run summaries and logs under
-  `gpu02/exl3-test/runs/` and `gpu02/bench/runs/`.
+  `node/exl3-test/runs/` and `node/bench/runs/`.
 - **Apache 2.0** ([LICENSE](../LICENSE)) covers the scripts and tools: `registry/build.py`, everything under
-  `gpu02/exl3-test/` outside `runs/`, and `gpu02/host/` and `gpu02/bench/` outside `runs/`.
+  `node/exl3-test/` outside `runs/`, and `node/host/` and `node/bench/` outside `runs/`.
 
 The engine repositories are forks of Apache 2.0 projects and keep their own LICENSE and NOTICE files.

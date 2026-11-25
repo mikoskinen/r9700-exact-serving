@@ -3,8 +3,228 @@
 This repository is written for AI coding agents more than for people. Hand it to your agent when you
 set up or tune a similar system.
 
-Update 22.11.2026: Qwen prefills 16k- to 128k-token prompts at over 10,000 tok/s and decodes 1,326
-tok/s at 32 concurrent requests on 210 W cards, and its answers stay identical under load.
+## Results
+
+Every number in this section is at stock power: 300 W a card with no voltage offset, set with
+`sudo run/power.sh 300` after the [host setup](#host-setup). The cards cool to 45 °C or less before
+each decode and prefill measurement.
+
+### Qwen Flash-Next, one machine
+
+Decode is tok/s summed over the concurrent requests. Prefill is one cold prompt, prompt tokens divided
+by the time to first token, with that time in brackets.
+
+| Measure | Value |
+|---|---|
+| 1 request | 295 tok/s |
+| 4 requests | 656 tok/s |
+| 8 requests | 919 tok/s |
+| 16 requests | 1,222 tok/s |
+| 24 requests | 1,360 tok/s |
+| 32 requests | 1,467 tok/s |
+| Prefill 16k (15,536 tokens) | 10,530 tok/s (1.48 s) |
+| Prefill 64k (53,800 tokens) | 10,633 tok/s (5.06 s) |
+| Prefill 128k (119,540 tokens) | 10,615 tok/s (11.26 s) |
+
+Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc`:
+
+```bash
+sudo run/power.sh 300
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro --env-file run/qwen/qwen.env \
+  -e RADIANCE_IMAGE_DEFAULTS=/opt/radiance/share/radiance/bench/defaults.env \
+  -e RADIANCE_IMAGE_SWITCHES=/opt/radiance/share/radiance/bench/switches.json \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 8192 \
+  --prefill-span 4 --prefill-interleave 0 --prefix-resume exact \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768
+```
+
+[run/qwen/bench.env](run/qwen/bench.env) and [run/qwen/bench-switches.json](run/qwen/bench-switches.json)
+list what the two `RADIANCE_IMAGE_*` variables select.
+
+AgentX: [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) 1.0.14, Claude Code trace set
+`semianalysis_cc_traces_weka_062126_256k`, 32 concurrent sessions, thinking on, one warm-up request a
+session, then a 20-minute window.
+
+| Measure | Value |
+|---|---|
+| Output speed of a request, p50 | 22.72 tok/s |
+| Output, all requests | 457.4 tok/s |
+| Requests in the window | 905 |
+| Time to first token p50 / p90 / p99 | 0.65 / 3.40 / 10.55 s |
+| Time between output tokens p50 / p90 / p99 | 44.0 / 75.9 / 125.8 ms |
+| Prompt tokens read from the prefix cache | 94.36 % |
+| Prompt / output tokens a request, mean | 82,949 / 622 |
+| Failed requests | 0 |
+
+Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc`, server:
+
+```bash
+sudo run/power.sh 300
+docker run -d --name qwen --init --network host \
+  --device /dev/kfd --device /dev/dri \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
+  -v ~/models/flashnext-exl3:/models:ro \
+  -e RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47 -e RADIANCE_SPEC_DECODE_METRICS=1 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
+  --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
+  --host 0.0.0.0 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
+  --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 4096 \
+  --prefill-span 2 --prefill-interleave 0 --prefix-resume exact \
+  --placement all_vram --gpu-headroom-mib 108 --kv-cache-dtype fp8 --ngram-placement ram \
+  --prefix-cache-mib 61440 --prefix-cache-ttl 28800 --checkpoint-slots 1024 --checkpoint-policy keep-all \
+  --num-speculative-tokens 4 --reasoning-effort medium --reasoning-effort-map high=xhigh \
+  --thinking-token-budget 16000 --default-max-tokens 32768 \
+  --keep-alive-timeout 1800 --vision-tower-placement ram --kv-resident 32768
+```
+
+Client:
+
+```bash
+AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endpoint /v1/chat/completions \
+  --model qwen3.8-flash-next --tokenizer TOKENIZER_DIR --concurrency 32 \
+  --public-dataset semianalysis_cc_traces_weka_062126_256k --benchmark-duration 1200 \
+  --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"enable_thinking":true}}'
+```
+
+### DeepSeek V4.1 Flash, two machines
+
+Decode is tok/s summed over the concurrent requests, and 1 request is one request on a prose prompt
+and on a code prompt. Prefill is one cold prompt, prompt tokens divided by the time to first token,
+with that time in brackets.
+
+| Measure | Value |
+|---|---|
+| 1 request, prose / code | 114 / 233 tok/s |
+| 4 requests | 482 tok/s |
+| 8 requests | 619 tok/s |
+| 16 requests | 871 tok/s |
+| 24 requests | 935 tok/s |
+| 32 requests | 998 tok/s |
+| Prefill 16k (15,777 tokens) | 13,258 tok/s (1.19 s) |
+| Prefill 64k (65,650 tokens) | 16,964 tok/s (3.87 s) |
+| Prefill 128k (131,137 tokens) | 17,532 tok/s (7.48 s) |
+
+Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62`, on each machine
+after the [host setup](#host-setup) and the [model weights](#model-weights), with the sidecars from
+[run/deepseek-tp8/mk-twin-sidecar.sh](run/deepseek-tp8/mk-twin-sidecar.sh) and then
+[run/deepseek-tp8/mk-w8s-sidecar.sh](run/deepseek-tp8/mk-w8s-sidecar.sh) in `MODEL_DIR`, and an
+address each on the RDMA link between the machines (`LEADER_IP`, `FOLLOWER_IP`). The follower first:
+
+```bash
+sudo run/power.sh 300
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek-fol --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-follower.env \
+  -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8091 --keep-alive-timeout 1800 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$LEADER_IP":29517 --node-link verbs --pp-rank 1
+```
+
+Then the leader:
+
+```bash
+sudo run/power.sh 300
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-leader.env \
+  -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8090 --keep-alive-timeout 1800 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$FOLLOWER_IP":29517 --node-link verbs --pp-rank 0 \
+  --draft-short-from 12
+run/switches.sh run/deepseek-tp8/claude-code-switches.json
+curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
+```
+
+AgentX: [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) 1.0.14, Claude Code trace set
+`semianalysis_cc_traces_weka_062126` (contexts up to 990k tokens), 32 concurrent sessions, thinking on,
+one warm-up request a session, then a 20-minute window.
+
+| Measure | Value |
+|---|---|
+| Output speed of a request, p50 | 24.59 tok/s |
+| Output, all requests | 490.2 tok/s |
+| Requests in the window | 833 |
+| Time to first token p50 / p90 / p99 | 0.83 / 3.46 / 18.16 s |
+| Time between output tokens p50 / p90 / p99 | 40.7 / 80.7 / 127.6 ms |
+| Prompt tokens read from the prefix cache | 94.23 % |
+| Prompt / output tokens a request, mean | 100,750 / 724 |
+| Failed requests | 0 |
+
+Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62`, the same machines and
+files. The follower runs the follower command above with
+`--env-file run/deepseek-tp8/claude-code-agentx-follower.env` after the other two `--env-file` options. The
+leader:
+
+```bash
+sudo run/power.sh 300
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-leader.env \
+  --env-file run/deepseek-tp8/claude-code-agentx-leader.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8090 --keep-alive-timeout 1800 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$FOLLOWER_IP":29517 --node-link verbs --pp-rank 0 \
+  --draft-short-from 12
+run/switches.sh run/deepseek-tp8/claude-code-switches.json
+curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
+```
+
+Client:
+
+```bash
+AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://127.0.0.1:8090 --endpoint /v1/chat/completions \
+  --model deepseek-v4.1-flash --tokenizer TOKENIZER_DIR --concurrency 32 \
+  --public-dataset semianalysis_cc_traces_weka_062126 --benchmark-duration 1200 \
+  --warmup-requests-per-lane 1 --extra-inputs '{"chat_template_kwargs":{"thinking":true,"reasoning_effort":"high"}}'
+```
+
+## About this repository
 
 This repository documents how two large mixture-of-experts models run locally in EXL3 format on four
 AMD Radeon AI PRO R9700 cards as the backend for Claude Code. A prompt gets byte-identical output
@@ -23,7 +243,7 @@ output from a coding agent.
     [radiance-exl3](https://github.com/Dyluhn/radiance-exl3) plugin, tensor parallel over the four cards
   - A LiteLLM proxy between Claude Code and the engine
 
-## Results
+## One machine at both power settings
 
 All values are tok/s, summed over all concurrent requests. Stock is the card default of 300 W with no
 voltage offset, and the everyday setting caps each card at 210 W with a -50 mV voltage offset.
@@ -54,16 +274,16 @@ images, so the host doesn't need it. The host needs:
 - `amdgpu.ppfeaturemask=0xffffffff ttm.pages_limit=104857600` on the kernel command line, which allows
   the voltage offset and lets the driver pin up to 400 GiB of host memory
 - 512 GB of RAM, because Qwen pins about 166 GiB and DeepSeek about 276 GiB of host memory
-- the CPU settings in `gpu02/host/`, which turn off deep idle states, set the performance governor and
+- the CPU settings in `run/host/`, which turn off deep idle states, set the performance governor and
   turn off NUMA balancing. Without them, decode on this host was 15 to 18 % slower.
 
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
 cd r9700-exact-serving
-sudo install -m 755 gpu02/host/gpu02-host-tuning /usr/local/sbin/
-sudo install -m 644 gpu02/host/gpu02-host-tuning.service /etc/systemd/system/
-sudo install -m 644 gpu02/host/90-gpu02-numa.conf /etc/sysctl.d/
-sudo systemctl daemon-reload && sudo systemctl enable --now gpu02-host-tuning.service && sudo sysctl --system
+sudo install -m 755 run/host/r9700-host-tuning /usr/local/sbin/
+sudo install -m 644 run/host/r9700-host-tuning.service /etc/systemd/system/
+sudo install -m 644 run/host/90-r9700-numa.conf /etc/sysctl.d/
+sudo systemctl daemon-reload && sudo systemctl enable --now r9700-host-tuning.service && sudo sysctl --system
 sudo run/power.sh 300    # or 210 for the 210 W columns
 ```
 
@@ -97,13 +317,13 @@ run/switches.sh run/qwen/switches-ff94ef27.json
 
 The server is ready in about two minutes. [run/switches.sh](run/switches.sh) waits for it, then sets
 the runtime switches of the batch-invariant kernel set and checks that each one took effect. The
-result runs on gpu02 also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
+result runs also set the rank order with `ROCR_VISIBLE_DEVICES`, putting the cards at PCI
 bus 03, c4, 83 and 48 on ranks 0 to 3.
 
 ### Qwen for Claude Code
 
 This command is for 24 to 32 concurrent Claude Code sessions with up to 262,144 tokens of context
-each. Image `qwen-d3024e38` carries its start environment and runtime switches as defaults, so the
+each. Image `qwen-7d70dccc` carries its start environment and runtime switches as defaults, so the
 command needs no environment file and no switch call.
 [run/qwen/claude-code.env](run/qwen/claude-code.env) and [run/qwen/switches.json](run/qwen/switches.json)
 list what the image sets.
@@ -114,7 +334,7 @@ docker run -d --name qwen --init --network host \
   --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
   --security-opt seccomp=unconfined --ulimit memlock=-1 --user $(id -u):$(id -g) \
   -v ~/models/flashnext-exl3:/models:ro \
-  ghcr.io/mikoskinen/r9700-exact-serving:qwen-d3024e38 \
+  ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc \
   --model /models/qwen3.8-flash-next-exl3.rad --served-model-name qwen3.8-flash-next \
   --host 127.0.0.1 --port 8090 --tp 4 --tp-wire exact --tp-wire-min-kb 128 \
   --max-num-seqs 32 --max-model-len 262144 --max-num-batched-tokens 4096 \
@@ -128,26 +348,7 @@ docker run -d --name qwen --init --network host \
 
 The server is ready in about two minutes. The KV cache is kept in host memory and streamed to the
 cards. It holds 7,077,888 tokens, which is 27 full-length sessions, and the engine uses about 346 GiB
-of host memory.
-
-Measured with [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) 1.0.14, which
-replays Claude Code traces: the 256k trace set (`semianalysis_cc_traces_weka_062126_256k`) with
-thinking on, 32 concurrent sessions, one warm-up request a session and then a 20-minute window, on
-one machine with the four cards at 210 W and -50 mV. As the AgentX rules require, the server forced
-the draft acceptance to AgentX's curve for this model, 1.65 / 2.06 / 2.32 / 2.47 tokens a step at 1 /
-2 / 3 / 4 draft tokens, with `-e RADIANCE_DRAFT_FORCE_AL=1:1.65,2:2.06,3:2.32,4:2.47
--e RADIANCE_SPEC_DECODE_METRICS=1` added to the command above, and with `--host 0.0.0.0` for the
-harness, which ran on another machine. In that mode the answers are not the model's own. No request
-failed.
-
-| Measure | 32 sessions |
-|---|---|
-| Output speed of a request, p50 | 19.38 tok/s |
-| Output, all requests | 398.7 tok/s |
-| Time to first token p50 / p90 / p99 | 0.85 / 5.28 / 22.45 s |
-| Time between output tokens p50 / p90 / p99 | 51.6 / 82.5 / 133.6 ms |
-| Prompt tokens read from the prefix cache | 94.27 % |
-| Prompt / output tokens a request, mean | 82,367 / 588 |
+of host memory. [Results](#results) has its AgentX numbers at 300 W.
 
 At temperature 0 this command gives each prompt the same answer alone and beside 31 other requests
 while new prompts of 14,672 tokens arrive: 20 short prompts, four prompts of 945 to 1,001 tokens, and
@@ -209,8 +410,9 @@ Prefill is one cold prompt of 16k, 64k or 128k tokens, in prompt tokens divided 
 token, with that time in brackets.
 
 **210 W a card with a -50 mV voltage offset.** Two machines run image `deepseek-tp8-9061bc79` with
-the commands below. The one-machine column is the DeepSeek 210 W column of [Results](#results), which
-runs the [DeepSeek](#deepseek) command.
+the commands below. The one-machine column is the DeepSeek 210 W column of
+[One machine at both power settings](#one-machine-at-both-power-settings), which runs the
+[DeepSeek](#deepseek) command.
 
 | Measure | Two machines, tok/s | One machine, tok/s | Two / one |
 |---|---|---|---|
@@ -223,24 +425,6 @@ runs the [DeepSeek](#deepseek) command.
 | Prefill 16k | 12,326 (1.28 s) | 4,640 (3.40 s) | 2.66x |
 | Prefill 64k | 15,594 (4.21 s) | 5,800 (11.32 s) | 2.69x |
 | Prefill 128k | 16,130 (8.13 s) | 5,810 (22.58 s) | 2.78x |
-
-**Stock: 300 W a card, no voltage offset.** Both columns run image `deepseek-tp8-0735a8e2`: two
-machines with the start commands in the
-[README](https://github.com/mikoskinen/r9700-exact-serving/blob/c89e403db4e127099125355a109ddeb39428b6a7/README.md#deepseek-on-two-machines)
-and the [run files](https://github.com/mikoskinen/r9700-exact-serving/tree/c89e403db4e127099125355a109ddeb39428b6a7/run/deepseek-tp8)
-of commit c89e403d, one machine with the one-machine command below.
-
-| Measure | Two machines, tok/s | One machine, tok/s | Two / one |
-|---|---|---|---|
-| 1 request | 104.3 prose / 208.7 code | 110.2 prose / 201.8 code | 0.95x / 1.03x |
-| c4 | 433.8 | 260.5 | 1.67x |
-| c8 | 566.6 | 309.4 | 1.83x |
-| c16 | 752.7 | 360.7 | 2.09x |
-| c24 | 854.3 | 374.3 | 2.28x |
-| c32 | 926.2 | 406.2 | 2.28x |
-| Prefill 16k | 12,932 (1.22 s) | 5,139 (3.07 s) | 2.52x |
-| Prefill 64k | 16,620 (3.95 s) | 7,581 (8.66 s) | 2.19x |
-| Prefill 128k | 17,278 (7.59 s) | 8,050 (16.29 s) | 2.15x |
 
 **[BetterBench](https://github.com/GGZ14/BetterBench) 0.6.1 at stock 300 W** on image
 `deepseek-tp8-0735a8e2`, with its default settings (temperature 0.7, 20 runs a task category, 48
@@ -377,7 +561,7 @@ answers with 9 preemptions by recompute as without any, in two runs.
 
 ## Host tuning
 
-Measurements are in [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md).
+Measurements are in [docs/hardware-tuning.md](docs/hardware-tuning.md).
 
 - The machine had 4 x 32 GB and 4 x 64 GB DIMMs, which split the eight memory channels into two sets.
   With 8 x 64 GB all channels are in one interleave set, and CPU read bandwidth went from 35.9 to
@@ -445,20 +629,21 @@ The `main` branch has:
 
 - [docs/DETAILS.md](docs/DETAILS.md): the long version of this page, with a source for every number and
   the LiteLLM setup for Claude Code.
-- [docs/hardware-tuning-gpu02.md](docs/hardware-tuning-gpu02.md): the host, memory and PCIe tuning.
+- [docs/hardware-tuning.md](docs/hardware-tuning.md): the host, memory and PCIe tuning.
 - [docs/LEVERS.md](docs/LEVERS.md): the working log of every change and its numbers.
 - [docs/TESTING.md](docs/TESTING.md): the test method rules and the reasons for them.
 - [registry/](registry/): one row per tested change, rejected ones included.
-- [gpu02/](gpu02/): the test scripts, the host tuning scripts and the run summaries.
-- [run/](run/): the power script, the environment files and the runtime switches that
-  [Run it](#run-it) and [DeepSeek on two machines](#deepseek-on-two-machines) use.
+- [node/](node/): the test scripts, the host tuning scripts and the run summaries.
+- [run/](run/): the power script, the host tuning files, the environment files and the runtime switches
+  that [Results](#results), [Run it](#run-it) and [DeepSeek on two machines](#deepseek-on-two-machines) use.
 - [results/betterbench/](results/betterbench/): the BetterBench reports of
   [DeepSeek on two machines](#deepseek-on-two-machines).
 
 The engine code is on the `deepseek/`, `qwen/` and `exl3/` branches. The DeepSeek image was built from
 `deepseek/current` with `exl3/current`, the Qwen images from `qwen/qfn-on-ds` with `exl3/qfn-x3gd`
-(engine commit ff94ef27 for the image in [Qwen](#qwen), d3024e38 for the image in
-[Qwen for Claude Code](#qwen-for-claude-code)). The two-machine image `deepseek-tp8-9061bc79` was
+(engine commit ff94ef27 for the image in [Qwen](#qwen)). Images `qwen-7d70dccc` and
+`deepseek-tp8-6b0bda62` in [Results](#results) are built from engine commits 7d70dccc and 6b0bda62,
+which aren't on a branch of this repository. The two-machine image `deepseek-tp8-9061bc79` was
 built from `deepseek/ds41-pp-dev-pf` with `exl3/ds41-swk` compiled with `-DEXL3R4D_X6_SGB=1 -DEXL3R4D_X5_SUM=3
 -DEXL3R4D_SWK_DMOVE=2 -DEXL3R4D_X6_PRE=2 -DEXL3R4D_X15_INSUM=1 -DEXL3R4D_X17_PIN=1
 -DEXL3R4D_X17_FORM=1` (HIP) and `-DEXL3R4D_DK_MAX=64` (C), and image `deepseek-tp8-0735a8e2` from
@@ -470,7 +655,7 @@ an earlier build, kept for the record.
 
 - **CC BY 4.0** ([LICENSE-docs.md](LICENSE-docs.md)) covers the documents and data: `README.md`,
   `docs/`, `registry/` (except `registry/build.py`), `results/`, and the run summaries and logs under
-  `gpu02/exl3-test/runs/` and `gpu02/bench/runs/`.
+  `node/exl3-test/runs/` and `node/bench/runs/`.
 - **Apache 2.0** ([LICENSE](LICENSE)) covers the scripts and tools: `registry/build.py`, everything under
-  `gpu02/exl3-test/` outside `runs/`, `gpu02/host/` and `gpu02/bench/` outside `runs/`, and `run/`. The engine
+  `node/exl3-test/` outside `runs/`, `node/host/` and `node/bench/` outside `runs/`, and `run/`. The engine
   branches are forks of Apache 2.0 projects and keep their own LICENSE and NOTICE files.

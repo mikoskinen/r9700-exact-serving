@@ -24,7 +24,7 @@ The raw source is [../docs/LEVERS.md](../docs/LEVERS.md), the working lever log 
 It is dense: one LEVERS row can run to thousands of characters. Each registry row points back to it
 through `source_levers_line`, the line number in that file. Rows that come from other files (host and
 hardware notes, TESTING.md rules) give a `file:line` pointer in that column instead.
-`source_run_summary` points to a run summary under `../gpu02/exl3-test/runs/` when one was copied into
+`source_run_summary` points to a run summary under `../node/exl3-test/runs/` when one was copied into
 this repository.
 
 The values were taken from the sources as written, with semicolons changed to commas. Where a value was missing or ambiguous, it was left
@@ -46,7 +46,7 @@ agent help and spot-checked, so the LEVERS.md line remains the reference for any
 | levers_status | The original status words from LEVERS.md. |
 | date | The last measurement date (2026). |
 | branch_commit_image | Engine branch, commit or container image, where known. Branches are in the engine repositories. |
-| run_items | Queue item names or numbers, with the scripts under `../gpu02/exl3-test/queue*/`. |
+| run_items | Queue item names or numbers, with the scripts under `../node/exl3-test/queue*/`. |
 | needs_check | `needs-check` when a value is missing or ambiguous. |
 
 ## Status

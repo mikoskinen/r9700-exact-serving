@@ -1,0 +1,3 @@
+# The drafter's Markov table (dspark.markov_w2, plain bf16 in the model file) as int8 codes with one bf16 scale a
+# 256-wide row, written as a twin beside the bf16 table.
+dspark.markov_w2.weight  rtn  codes=i8 group=256 scale=bf16

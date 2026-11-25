@@ -1,5 +1,5 @@
 #!/bin/bash
-# gpu03: rad-convert the official release body (sparse release dir: headers + non-trunk-expert tensors) with the
+# rad-convert the official release body (sparse release dir: headers + non-trunk-expert tensors) with the
 # current container's recipe, --reuse of the current container for everything not in CHANGED (the EXL3 experts),
 # --imatrix the body imatrix (Unsloth's + the plugin's fused entries, experts' entries dropped).
 #   ob-convert.sh CHANGED_LIST OUTNAME [extra rad-convert args]

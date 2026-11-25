@@ -24,7 +24,7 @@ IMG=${IMG:-ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-0735a8e2}
 CPUS=${CPUS:-16}
 HERE=$(cd "$(dirname "$0")" && pwd)
 RCP=p30-i8-all.recipe
-[ "$(md5sum < "$HERE/$RCP" | cut -c1-8)" = 6ca81f90 ] || { echo "$HERE/$RCP is not the published recipe"; exit 1; }
+[ "$(md5sum < "$HERE/$RCP" | cut -c1-8)" = 31e9c5fa ] || { echo "$HERE/$RCP is not the published recipe"; exit 1; }
 [ -s "$MODEL_DIR/$MODEL_FILE" ] || { echo "no model file $MODEL_DIR/$MODEL_FILE"; exit 1; }
 [ -s "$MODEL_DIR/$DLW" ] || { echo "no drafter sidecar $MODEL_DIR/$DLW"; exit 1; }
 [ -e "$MODEL_DIR/$OUT" ] && [ "${FORCE:-0}" != 1 ] && { echo "$MODEL_DIR/$OUT exists (FORCE=1 overwrites)"; exit 1; }
