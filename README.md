@@ -52,6 +52,7 @@ AgentX, 32 sessions:
 | Time between output tokens p50 | 44.0 ms | 40.7 ms |
 | Prompt tokens read from the prefix cache | 94.36 % | 94.23 % |
 | Prompt / output tokens a request, mean | 82,949 / 622 | 100,750 / 724 |
+| KV cache | 7,077,888 tokens | 20,502,774 tokens |
 
 ## Models
 
@@ -84,8 +85,6 @@ docker run -d --name qwen --init --network host \
   --thinking-token-budget 16000 --default-max-tokens 32768 \
   --keep-alive-timeout 1800 --vision-tower-placement ram --kv-resident 32768
 ```
-
-Ready in about two minutes. It uses about 346 GiB of host memory, and the KV cache holds 7,077,888 tokens.
 
 ### DeepSeek V4.1 Flash, 8x R9700 (2 nodes)
 
@@ -145,8 +144,6 @@ docker run -d --name deepseek --init --network host \
 run/switches.sh run/deepseek-tp8/claude-code-switches.json
 curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
 ```
-
-The KV cache holds 20,502,774 tokens.
 
 ### DeepSeek V4.1 Flash, 4x R9700
 
