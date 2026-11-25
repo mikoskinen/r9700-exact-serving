@@ -61,6 +61,9 @@ AgentX, 32 sessions:
 
 ## Run
 
+These commands are tuned for 32 concurrent Claude Code sessions: up to 262,144 tokens of context a
+session on Qwen Flash-Next and up to 1,048,576 on DeepSeek V4.1 Flash.
+
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
 cd r9700-exact-serving
