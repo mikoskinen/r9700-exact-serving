@@ -22,8 +22,7 @@ output from a coding agent.
 
 ## Results
 
-Every number in this section is at stock power: 300 W a card with no voltage offset, set with
-`sudo run/power.sh 300` after the [host setup](#host-setup).
+Stock power: 300 W a card, no voltage offset.
 
 ### Qwen Flash-Next, one machine
 
@@ -38,8 +37,6 @@ Every number in this section is at stock power: 300 W a card with no voltage off
 | Prefill 16k (15,536 tokens) | 10,530 tok/s (1.48 s) |
 | Prefill 64k (53,800 tokens) | 10,633 tok/s (5.06 s) |
 | Prefill 128k (119,540 tokens) | 10,615 tok/s (11.26 s) |
-
-Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc`:
 
 ```bash
 sudo run/power.sh 300
@@ -61,12 +58,7 @@ docker run -d --name qwen --init --network host \
   --thinking-token-budget 16000 --default-max-tokens 32768
 ```
 
-[run/qwen/bench.env](run/qwen/bench.env) and [run/qwen/bench-switches.json](run/qwen/bench-switches.json)
-list what the two `RADIANCE_IMAGE_*` variables select.
-
-AgentX: [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) 1.0.14, Claude Code trace set
-`semianalysis_cc_traces_weka_062126_256k`, 32 concurrent sessions, thinking on, one warm-up request a
-session, then a 20-minute window.
+#### AgentX, 32 sessions
 
 | Measure | Value |
 |---|---|
@@ -79,7 +71,7 @@ session, then a 20-minute window.
 | Prompt / output tokens a request, mean | 82,949 / 622 |
 | Failed requests | 0 |
 
-Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:qwen-7d70dccc`, server:
+Server:
 
 ```bash
 sudo run/power.sh 300
@@ -124,11 +116,15 @@ AIPERF_HTTP_KEEPALIVE_TIMEOUT=300 agentx profile --url http://SERVER:8090 --endp
 | Prefill 64k (65,650 tokens) | 16,964 tok/s (3.87 s) |
 | Prefill 128k (131,137 tokens) | 17,532 tok/s (7.48 s) |
 
-Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62`, on each machine
-after the [host setup](#host-setup) and the [model weights](#model-weights), with the sidecars from
-[run/deepseek-tp8/mk-twin-sidecar.sh](run/deepseek-tp8/mk-twin-sidecar.sh) and then
-[run/deepseek-tp8/mk-w8s-sidecar.sh](run/deepseek-tp8/mk-w8s-sidecar.sh) in `MODEL_DIR`, and an
-address each on the RDMA link between the machines (`LEADER_IP`, `FOLLOWER_IP`). The follower first:
+Once on each machine:
+
+```bash
+export MODEL_DIR=~/models/ds41-exl3 LEADER_IP=LEADER_RDMA_ADDRESS FOLLOWER_IP=FOLLOWER_RDMA_ADDRESS
+run/deepseek-tp8/mk-twin-sidecar.sh
+run/deepseek-tp8/mk-w8s-sidecar.sh
+```
+
+Follower:
 
 ```bash
 sudo run/power.sh 300
@@ -152,7 +148,7 @@ docker run -d --name deepseek-fol --init --network host \
   --pp-nodes 2 --pp-cut 10,32 --pp-peer "$LEADER_IP":29517 --node-link verbs --pp-rank 1
 ```
 
-Then the leader:
+Leader:
 
 ```bash
 sudo run/power.sh 300
@@ -179,9 +175,7 @@ run/switches.sh run/deepseek-tp8/claude-code-switches.json
 curl -s -X POST http://127.0.0.1:8090/reset_prefix_cache
 ```
 
-AgentX: [agentx-harness](https://github.com/SemiAnalysisAI/agentx-harness) 1.0.14, Claude Code trace set
-`semianalysis_cc_traces_weka_062126` (contexts up to 990k tokens), 32 concurrent sessions, thinking on,
-one warm-up request a session, then a 20-minute window.
+#### AgentX, 32 sessions
 
 | Measure | Value |
 |---|---|
@@ -194,10 +188,31 @@ one warm-up request a session, then a 20-minute window.
 | Prompt / output tokens a request, mean | 100,750 / 724 |
 | Failed requests | 0 |
 
-Run settings, image `ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62`, the same machines and
-files. The follower runs the follower command above with
-`--env-file run/deepseek-tp8/claude-code-agentx-follower.env` after the other two `--env-file` options. The
-leader:
+Follower:
+
+```bash
+sudo run/power.sh 300
+mkdir -p /dev/shm/ds41ng
+docker run -d --name deepseek-fol --init --network host \
+  --device /dev/kfd --device /dev/dri --device /dev/infiniband \
+  --group-add $(getent group render | cut -d: -f3) --group-add $(getent group video | cut -d: -f3) \
+  --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --user $(id -u):$(id -g) \
+  -v "$MODEL_DIR":/models:ro -v /dev/shm/ds41ng:/ngram -v "$PWD/run/deepseek":/cfg:ro \
+  --env-file run/deepseek-tp8/claude-code.env --env-file run/deepseek-tp8/claude-code-follower.env \
+  --env-file run/deepseek-tp8/claude-code-agentx-follower.env -e ROCR_VISIBLE_DEVICES=0,1,2,3 \
+  ghcr.io/mikoskinen/r9700-exact-serving:deepseek-tp8-6b0bda62 \
+  --model /models/deepseek-v4.1-flash-1017-exl3-2.25bpw.rad --mm-max-patches 0 \
+  --served-model-name deepseek-v4.1-flash --tp 4 --tp-wire exact \
+  --placement expert_tiered --host-pool-mib 0 --ngram-placement ram=/ngram \
+  --max-num-seqs 32 --max-model-len 1048576 --max-num-batched-tokens 4160 \
+  --kv-cache-dtype bf16 --checkpoint-interval 2048 --num-speculative-tokens 5 \
+  --prefix-cache-mib 86016 --prefix-cache-ttl 28800 --checkpoint-slots 512 --checkpoint-policy keep-all \
+  --prefill-span 2 --prefill-interleave 8 --live --draft-window adaptive --draft-coupling on \
+  --gpu-headroom-mib 256 --pp-lanes 4 --host 127.0.0.1 --port 8091 --keep-alive-timeout 1800 \
+  --pp-nodes 2 --pp-cut 10,32 --pp-peer "$LEADER_IP":29517 --node-link verbs --pp-rank 1
+```
+
+Leader:
 
 ```bash
 sudo run/power.sh 300
