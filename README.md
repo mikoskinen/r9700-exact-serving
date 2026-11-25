@@ -60,10 +60,6 @@ AgentX, 32 sessions:
 
 ## Run
 
-### Host setup
-
-Docker, and `ttm.pages_limit=104857600` on the kernel command line.
-
 ```bash
 git clone https://github.com/mikoskinen/r9700-exact-serving.git
 cd r9700-exact-serving
