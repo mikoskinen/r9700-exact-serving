@@ -55,35 +55,8 @@ AgentX, 32 sessions:
 
 ## Models
 
-Qwen runs from a ready file, [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
-(120.5 GB):
-
-```bash
-hf download Dyluhn/qwen3.8-flash-next-exl3 qwen3.8-flash-next-exl3.rad --local-dir ~/models/flashnext-exl3
-cd ~/models/flashnext-exl3
-echo "187ae8186cc1f2ba8bce96565592af7fc6f6ec91c9ece6b4d352eaf0432ee26f  qwen3.8-flash-next-exl3.rad" | sha256sum -c
-```
-
-DeepSeek runs from [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
-(273.2 GB in six parts) and two small files that the engine loads with it. The download needs about
-322 GB of free disk while the parts are joined:
-
-```bash
-hf download mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad --local-dir ~/models/ds41-exl3
-cd ~/models/ds41-exl3
-for p in deepseek-v4.1-flash-1017-exl3-2.25bpw.rad.part-0[0-5]; do
-  cat "$p" >> deepseek-v4.1-flash-1017-exl3-2.25bpw.rad && rm "$p"
-done
-sha256sum -c SHA256SUMS
-```
-
-The DeepSeek file has the routed experts of the `2.25bpw` branch of
-[turboderp/DeepSeek-V4.1-Flash-1017-exl3](https://huggingface.co/turboderp/DeepSeek-V4.1-Flash-1017-exl3),
-and every other weight, the vision tower included, is converted from the official release
-[deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017).
-To build the file yourself, follow
-[Build it yourself](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad#build-it-yourself)
-on the model card, which uses the scripts and inputs in [run/deepseek/build/](run/deepseek/build/).
+- Qwen Flash-Next, EXL3 4.05 bpw: [Dyluhn/qwen3.8-flash-next-exl3](https://huggingface.co/Dyluhn/qwen3.8-flash-next-exl3)
+- DeepSeek V4.1 Flash, EXL3 2.25 bpw: [mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad](https://huggingface.co/mikoskinen/DeepSeek-V4.1-Flash-1017-exl3-2.25bpw-rad)
 
 ## Run
 
